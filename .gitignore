@@ -1,3 +1,18 @@
+# Build artifacts
 /target
+
+# Secrets — never commit real credentials; .env.example stays tracked
 .env
 *.local.env
+
+# Session-scoped scratch notes (see AGENTS.md workflow) — never meant for VCS
+*.tmp.md
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
