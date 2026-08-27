@@ -1,0 +1,18 @@
+[package]
+name = "adapter-cli"
+description = "Throwaway M0 interface adapter: stdin lines ↔ Order/Response over the Harness API (SPEC §9 M0)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "adapter-cli"
+path = "src/main.rs"
+
+[dependencies]
+contract.workspace = true
+tokio = { workspace = true }
+reqwest.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

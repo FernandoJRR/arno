@@ -1,0 +1,84 @@
+# One service per part (SPEC §5.7, STACK.md §6). Secrets come from env vars —
+# create a `.env` beside this file (excluded from VCS) with at least:
+#   HARNESS_API_CLIENT_TOKENS=<client>:<token>[,...]
+# Ollama stays on the host and is reached via host-gateway.
+name: arno
+
+services:
+  harness:
+    build:
+      context: .
+      dockerfile: docker/harness.Dockerfile
+      args:
+        HARNESS_API_PORT: ${HARNESS_API_PORT:-8080}
+    image: arno-harness
+    # Published to localhost only, for host-side adapters (e.g. adapter-cli)
+    # — not exposed beyond the host (SPEC decision #2; tune BIND vars via
+    # .env when you expose through a VPN).
+    ports:
+      - "127.0.0.1:${HARNESS_API_PORT:-8080}:${HARNESS_API_PORT:-8080}"
+    environment:
+      HARNESS_API_CLIENT_TOKENS: ${HARNESS_API_CLIENT_TOKENS:?set in .env}
+      HARNESS_API_BIND: ${HARNESS_API_BIND:-0.0.0.0:${HARNESS_API_PORT:-8080}}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+      MCP_SERVERS: linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp
+      # Non-owned name on purpose: anything HARNESS_*-prefixed is rejected by
+      # the harness's own strict env validator (SPEC §5.7), even if unread.
+      HEALTHCHECK_PORT: ${HARNESS_API_PORT:-8080}
+      # RUST_LOG: debug
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mcp-linux:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${HEALTHCHECK_PORT:-8080}/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  mcp-linux:
+    build:
+      context: .
+      dockerfile: docker/linux-mcp.Dockerfile
+      args:
+        MCP_LINUX_PORT: ${MCP_LINUX_PORT:-9001}
+    image: arno-linux-mcp
+    environment:
+      MCP_LINUX_PORT: ${MCP_LINUX_PORT:-9001}
+      MCP_LINUX_BIND: ${MCP_LINUX_BIND:-0.0.0.0:${MCP_LINUX_PORT:-9001}}
+    healthcheck:
+      # Minimal JSON-RPC initialize — empirically verified to return HTTP 200
+      # (a bare ping without a session gets rejected with 422).
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"healthcheck\",\"version\":\"0\"}}}' http://127.0.0.1:$${MCP_LINUX_PORT:-9001}/mcp"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  telegram-adapter:
+    build:
+      context: .
+      dockerfile: docker/telegram-adapter.Dockerfile
+    image: arno-telegram-adapter
+    # Outbound-only long-polling (getUpdates) — no ports published. Exactly
+    # one replica: a second poller on the same bot token gets HTTP 409 from
+    # Telegram (SPEC §5.1) — never scale this service.
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set in .env}
+      ALLOWED_CHAT_IDS: ${ALLOWED_CHAT_IDS:?set in .env}
+      HARNESS_API_URL: http://harness:${HARNESS_API_PORT:-8080}
+      HARNESS_API_TOKEN: "${TELEGRAM_HARNESS_API_TOKEN:?set in .env, matching a telegram: entry in HARNESS_API_CLIENT_TOKENS}"
+    depends_on:
+      harness:
+        condition: service_healthy
+    healthcheck:
+      # No HTTP surface to probe (outbound-only) — process-liveness only
+      # (STACK.md §6).
+      test: ["CMD-SHELL", "pgrep -x adapter-telegram || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

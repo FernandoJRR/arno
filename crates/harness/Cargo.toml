@@ -1,0 +1,48 @@
+[package]
+name = "harness"
+description = "Part B core: Harness API server, FIFO queue, stores, orchestrator, MCP client seam, ModelProvider (STACK.md §3)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+contract.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+subtle.workspace = true
+lru.workspace = true
+async-trait.workspace = true
+# Client-only rmcp set; the mock/test doubles enable the server features via
+# [dev-dependencies] unification. STACK.md §2 records the flag decision.
+rmcp = { version = "3.1", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "transport-child-process",
+] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }
+# Server side for the in-process mock MCP backend (STACK.md §8).
+rmcp = { version = "3.1", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
