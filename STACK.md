@@ -144,15 +144,22 @@ Rule: nothing outside `harness/src/model/` speaks HTTP to a model provider.
    classifies each tool call (read-only → `mcp/` dispatch; destructive → freeze
    `{tool, args}`, mint token, return `needs_confirmation`), enforces
    `ORDER_BUDGET_S` with a clean cancel that reports completed RO side effects.
-4. Safety classification is **config-driven**: `DESTRUCTIVE_TOOLS` lists exact
-   namespaced tool names (`securo.create_transaction`). Unlisted = read-only.
-   Policy moves with config when backends swap (SPEC §4.2).
+4. Safety classification is **adaptive** (M3, SPEC §4.2): `policy.rs` classifies
+   each discovered tool by asking the model to read its name/description/
+   schema once and persisting the verdict (`safe` / `destructive` /
+   `destructive_when{key,value}`); dispatch evaluates the persisted rule
+   synchronously, no model call per order. Unclassified/drifted tools are
+   `destructive` (fail-closed) until a real verdict lands. `DESTRUCTIVE_TOOLS`
+   lists exact namespaced tool names that are the operator's override, always
+   winning — the common case leaves it empty.
 5. `mcp/` holds one rmcp client per configured backend, namespaces tools
    `<server>.<tool>`, presents the merged schema to the orchestrator, and tags
    failures with their backend for `backend_unavailable`.
 6. Redemption path (Order carries `confirmation_token`): validated in `stores/`,
    stored payload dispatched verbatim, token deleted before dispatch, zero model
-   involvement (SPEC §4.3).
+   involvement (SPEC §4.3). `audit.rs` appends the outcome (success or failure)
+   to a hash-chained JSONL file — the harness's own durable record, independent
+   of `stores/`'s in-memory, restart-clears semantics (SPEC §12.1).
 
 ## 6. Deployment topology
 
@@ -161,6 +168,7 @@ HOST (Linux home server)
 ├─ ollama.service                      :11434  (GPU/model access — stays on host)
 └─ docker compose
    ├─ harness         → binds 127.0.0.1:8080   extra_hosts: "host.docker.internal:host-gateway"
+   │                     volume arno-state:/data (tool policy + audit log, M3)
    ├─ telegram-adapter→ outbound-only (getUpdates); single replica (409 rule)
    └─ mcp-linux       → Streamable HTTP on the compose network, localhost-scoped
 ```
@@ -170,6 +178,11 @@ HOST (Linux home server)
 - Secrets enter exclusively as compose/env vars (`env_file` excluded from VCS).
 - Healthchecks: harness `GET /v1/health` (additive route), adapters process-liveness, mcp-linux MCP ping — surfaced to compose (backlog §12.3).
 - Restart policy `unless-stopped`.
+- **`arno-state` (M3, AGENTS.md #7 exceptions):** the one stateful volume in
+  this topology, holding `TOOL_POLICY_PATH` and `AUDIT_LOG_PATH`. Everything
+  else here is legitimately restart-clears; these two must survive a
+  container recreate or the harness's own memory of tool safety and its
+  record of executed writes vanish with it.
 
 ## 7. Config ownership
 
@@ -177,10 +190,10 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS` |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
-| deferred to M2 | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` [CONFIRM], `SECURO_WORKSPACE_ID` |
+| deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
 
 ## 8. Testing strategy
 
@@ -189,12 +202,27 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 - **Mock MCP server**: rmcp-based test double exercising discovery, namespacing, timeout → `backend_unavailable`; doubles as fixture for destructive-gate tests.
 - **Smoke**: adapter-cli against a running harness + mock MCP — the M0 loop, kept green in CI.
 - Model-dependent tests never hit real Ollama: `ModelProvider` gets a scripted fake.
+- **Tool policy (M3, `policy.rs`)**: rule evaluation (including `destructive_when`
+  match/non-match), full precedence (env override > operator-pinned file entry >
+  model verdict > pending-fail-closed), fingerprint-drift re-pending, a corrupt
+  policy file degrading to all-pending rather than panicking, and a classifier
+  fed a scripted `ModelProvider` (clean JSON, code-fenced JSON, malformed output,
+  a down provider, and a down-then-recovered provider proving the retry path).
+- **Audit log (M3, `audit.rs`)**: genesis entry, hash chaining across entries,
+  resuming `seq`/hash on reopen, a tampered or truncated line rejected on
+  reopen, and `ok`/`err` outcome tagging.
+- **Freeze-branch coverage (M3, `api_contract.rs`)**: a wiremock-driven model
+  tool call carrying the classified trigger argument freezes (never dispatched,
+  `needs_confirmation` returned with the args rendered in `text`); the same
+  tool without it dispatches immediately. Every earlier destructive-gate test
+  exercised only the redemption *replay* half by seeding the pending store
+  directly — these are the first to exercise the classify-then-freeze-or-
+  dispatch decision itself.
 
 ## 9. Deliberately deferred
 
 | Item | When | Why |
 |---|---|---|
 | Concrete linux diagnostic tool list | M1 | needs a real box to design against |
-| Securo MCP auth scheme | before M2 | sole remaining open item (SPEC §11) |
 | SSE/WebSocket under `/v1` | when a consumer exists | additive, no rework (SPEC §11.3) |
 | Second ModelProvider impl | when needed | seam exists; do not pre-build |

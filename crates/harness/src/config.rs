@@ -6,10 +6,12 @@
 use crate::model::ollama::ThinkMode;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// A configured MCP backend location (SPEC §4.2). Two transports:
-/// Streamable HTTP (`name:http://host/mcp`) or stdio spawn
+/// Streamable HTTP (`name:http://host/mcp`, optionally
+/// `name:[Header=Value;...]http://host/mcp`) or stdio spawn
 /// (`name:exec:[KEY=VALUE ...] /path/to/bin --flag value`). Leading
 /// `KEY=VALUE` tokens (upper-snake-case keys) become the child's own env
 /// vars, set directly on the spawned process rather than inherited from
@@ -17,9 +19,19 @@ use std::time::Duration;
 /// (`reject_unknown` below), so a backend's config (e.g. mcp-linux's
 /// `MCP_LINUX_TRANSPORT`) can never collide with it. The exec form splits on
 /// whitespace — arguments/values containing spaces are not supported in v1.
+///
+/// The HTTP header form is the generic mechanism authenticated backends
+/// (e.g. Securo, SPEC §11 M2) use to receive credentials: the harness stays
+/// backend-agnostic (AGENTS.md #6) by never knowing a var named `SECURO_*`
+/// — the deployment layer (compose/.env) composes the bearer token into this
+/// `MCP_SERVERS` entry instead. Header values must not contain a comma (the
+/// list separator) — bearer/JWT/base64 tokens never do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendAddr {
-    Http(reqwest::Url),
+    Http {
+        url: reqwest::Url,
+        headers: Vec<(String, String)>,
+    },
     Exec {
         program: String,
         args: Vec<String>,
@@ -47,11 +59,23 @@ pub struct Config {
     pub session_ttl: Duration,
     pub confirm_ttl: Duration,
     pub attach_max_bytes: usize,
-    /// Exact namespaced tool names whose dispatch requires the frozen-payload
-    /// gate (SPEC §11.9). Unlisted tools are treated read-only.
+    /// Exact namespaced tool names that are *always* destructive, regardless
+    /// of arguments (SPEC §11.9). This is now the operator's highest-
+    /// precedence override, not the primary mechanism — see
+    /// [`crate::policy::ToolPolicy`] for the model-driven classifier that
+    /// handles tools unlisted here (M3, SPEC §4.2).
     pub destructive_tools: HashSet<String>,
     /// (server_name, endpoint) pairs from `NAME:endpoint,...`.
     pub mcp_servers: Vec<(String, BackendAddr)>,
+    /// Where the model-classified tool-safety policy persists across restarts
+    /// (SPEC §11, AGENTS.md #7 exception #1).
+    pub tool_policy_path: PathBuf,
+    /// Where the hash-chained audit trail of executed frozen actions persists
+    /// (SPEC §12.1, AGENTS.md #7 exception #2).
+    pub audit_log_path: PathBuf,
+    /// How often the background task retries tools left `Pending` because the
+    /// model was unavailable at boot (SPEC §11 M3).
+    pub tool_policy_retry: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +106,9 @@ impl Config {
             attach_max_bytes: usize_var("ATTACH_MAX_BYTES", 10 * 1024 * 1024)?,
             destructive_tools: list("DESTRUCTIVE_TOOLS")?.into_iter().collect(),
             mcp_servers: servers("MCP_SERVERS")?,
+            tool_policy_path: path_var("TOOL_POLICY_PATH", "./arno-tool-policy.json"),
+            audit_log_path: path_var("AUDIT_LOG_PATH", "./arno-audit.jsonl"),
+            tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
         })
     }
 }
@@ -105,6 +132,9 @@ const KNOWN_VARS: &[&str] = &[
     "CONFIRM_TTL_MIN",
     "ATTACH_MAX_BYTES",
     "DESTRUCTIVE_TOOLS",
+    "TOOL_POLICY_PATH",
+    "TOOL_POLICY_RETRY_S",
+    "AUDIT_LOG_PATH",
 ];
 
 const OWNED_PREFIXES: &[&str] = &[
@@ -118,6 +148,8 @@ const OWNED_PREFIXES: &[&str] = &[
     "CONFIRM_TTL",
     "ATTACH_MAX",
     "DESTRUCTIVE_",
+    "TOOL_POLICY_",
+    "AUDIT_LOG_",
 ];
 
 fn reject_unknown() -> Result<(), ConfigError> {
@@ -194,6 +226,10 @@ fn socket(var: &'static str, default: &str) -> Result<SocketAddr, ConfigError> {
         })
 }
 
+fn path_var(var: &'static str, default: &str) -> PathBuf {
+    PathBuf::from(string_var(var, default))
+}
+
 fn url_var(var: &'static str, default: &str) -> Result<reqwest::Url, ConfigError> {
     let text = string_var(var, default);
     reqwest::Url::parse(text.trim()).map_err(|_| ConfigError::BadValue {
@@ -260,9 +296,14 @@ fn is_env_key(key: &str) -> bool {
 }
 
 /// Comma-separated `name:endpoint` pairs (SPEC §4.2), e.g.
-/// `linux-mcp:http://127.0.0.1:9001/mcp` or
+/// `linux-mcp:http://127.0.0.1:9001/mcp`,
+/// `securo:[Authorization=Bearer tok]http://127.0.0.1:8765/mcp`, or
 /// `linux-mcp:exec:MCP_LINUX_TRANSPORT=stdio /usr/local/bin/mcp-linux`.
 /// Empty allowed until M1.
+///
+/// Error messages below never interpolate the raw `item` for the
+/// header-bearing HTTP form — only the server `name` — so a malformed entry
+/// can't echo a credential to stderr at boot.
 fn servers(var: &'static str) -> Result<Vec<(String, BackendAddr)>, ConfigError> {
     list(var)?
         .into_iter()
@@ -300,6 +341,44 @@ fn servers(var: &'static str) -> Result<Vec<(String, BackendAddr)>, ConfigError>
                     args: parts.map(str::to_owned).collect(),
                     env,
                 }
+            } else if let Some(rest) = endpoint.strip_prefix('[') {
+                let (header_src, url_src) = rest.split_once(']').ok_or(ConfigError::BadValue {
+                    var,
+                    problem: format!("unterminated header block for server {name:?}"),
+                })?;
+                let headers = header_src
+                    .split(';')
+                    .map(|pair| {
+                        let (k, v) = pair.split_once('=').ok_or(ConfigError::BadValue {
+                            var,
+                            problem: format!(
+                                "expected Header=Value in header block for server {name:?}"
+                            ),
+                        })?;
+                        if k.is_empty() {
+                            return Err(ConfigError::BadValue {
+                                var,
+                                problem: format!(
+                                    "empty header name in header block for server {name:?}"
+                                ),
+                            });
+                        }
+                        Ok((k.to_owned(), v.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>, ConfigError>>()?;
+                if !url_src.contains("://") {
+                    return Err(ConfigError::BadValue {
+                        var,
+                        problem: format!(
+                            "expected scheme://… endpoint after header block for server {name:?}"
+                        ),
+                    });
+                }
+                let url = reqwest::Url::parse(url_src).map_err(|_| ConfigError::BadValue {
+                    var,
+                    problem: format!("bad endpoint URL for server {name:?}"),
+                })?;
+                BackendAddr::Http { url, headers }
             } else {
                 if !endpoint.contains("://") {
                     return Err(ConfigError::BadValue {
@@ -313,7 +392,10 @@ fn servers(var: &'static str) -> Result<Vec<(String, BackendAddr)>, ConfigError>
                     var,
                     problem: format!("bad endpoint URL in {item:?}"),
                 })?;
-                BackendAddr::Http(url)
+                BackendAddr::Http {
+                    url,
+                    headers: Vec::new(),
+                }
             };
             Ok((name.to_owned(), addr))
         })
@@ -374,6 +456,9 @@ mod tests {
             "CONFIRM_TTL_MIN",
             "ATTACH_MAX_BYTES",
             "DESTRUCTIVE_TOOLS",
+            "TOOL_POLICY_PATH",
+            "TOOL_POLICY_RETRY_S",
+            "AUDIT_LOG_PATH",
         ]
     }
 
@@ -390,6 +475,38 @@ mod tests {
         assert_eq!(cfg.session_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(cfg.confirm_ttl, Duration::from_secs(600));
         assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(
+            cfg.tool_policy_path,
+            PathBuf::from("./arno-tool-policy.json")
+        );
+        assert_eq!(cfg.audit_log_path, PathBuf::from("./arno-audit.jsonl"));
+        assert_eq!(cfg.tool_policy_retry, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn policy_and_audit_knobs_parse_over_defaults() {
+        let _lock = env_lock();
+        let _clean = CleanEnv::new(&base_vars());
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set("TOOL_POLICY_PATH", "/data/policy.json");
+        set("AUDIT_LOG_PATH", "/data/audit.jsonl");
+        set("TOOL_POLICY_RETRY_S", "60");
+        let cfg = Config::from_env().expect("parses");
+        assert_eq!(cfg.tool_policy_path, PathBuf::from("/data/policy.json"));
+        assert_eq!(cfg.audit_log_path, PathBuf::from("/data/audit.jsonl"));
+        assert_eq!(cfg.tool_policy_retry, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn typo_in_new_knob_names_is_rejected_loudly() {
+        let _lock = env_lock();
+        let mut vars = base_vars();
+        vars.push("TOOL_POLICY_PTAH");
+        let _clean = CleanEnv::new(&vars);
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set("TOOL_POLICY_PTAH", "typo");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("TOOL_POLICY_PTAH"), "{err}");
     }
 
     #[test]
@@ -428,13 +545,55 @@ mod tests {
         assert!(cfg.destructive_tools.contains("securo.create_transaction"));
         assert_eq!(cfg.mcp_servers[0].0, "linux-mcp");
         match &cfg.mcp_servers[0].1 {
-            BackendAddr::Http(url) => {
+            BackendAddr::Http { url, headers } => {
                 assert_eq!(url.as_str(), "http://127.0.0.1:9001/mcp");
+                assert!(headers.is_empty());
             }
             other => panic!("expected http backend, got {other:?}"),
         }
         assert_eq!(cfg.num_ctx, 16_384);
         assert_eq!(cfg.ollama_think, ThinkMode::High);
+    }
+
+    #[test]
+    fn http_backend_with_header_block_carries_credentials() {
+        let _lock = env_lock();
+        let _clean = CleanEnv::new(&base_vars());
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set(
+            "MCP_SERVERS",
+            "securo:[Authorization=Bearer abc=;X-Workspace-Id=ws1]http://h:8765/mcp",
+        );
+        let cfg = Config::from_env().expect("header-form http backend parses");
+        assert_eq!(cfg.mcp_servers[0].0, "securo");
+        match &cfg.mcp_servers[0].1 {
+            BackendAddr::Http { url, headers } => {
+                assert_eq!(url.as_str(), "http://h:8765/mcp");
+                assert_eq!(
+                    headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("Authorization", "Bearer abc="), ("X-Workspace-Id", "ws1")]
+                );
+            }
+            other => panic!("expected http backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_backend_header_block_errors_never_echo_the_raw_item() {
+        let _lock = env_lock();
+        let _clean = CleanEnv::new(&base_vars());
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set(
+            "MCP_SERVERS",
+            "securo:[Authorization=Bearer super-secret-token]not-a-url",
+        );
+        let err = Config::from_env().unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("super-secret-token"), "{msg}");
+        assert!(msg.contains("securo"), "{msg}");
     }
 
     #[test]

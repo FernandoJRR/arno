@@ -22,11 +22,26 @@ services:
       HARNESS_API_BIND: ${HARNESS_API_BIND:-0.0.0.0:${HARNESS_API_PORT:-8080}}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
-      MCP_SERVERS: linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp
+      # Securo (M2) is external — its bearer token is composed into this
+      # entry's header block at deploy time. The harness never reads a
+      # SECURO_*-named var itself (AGENTS.md #6): the generic
+      # `name:[Header=Value;...]url` form is how any authenticated HTTP MCP
+      # backend receives credentials, not a Securo-specific code path.
+      MCP_SERVERS: >-
+        linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp,securo:[Authorization=Bearer ${SECURO_MCP_AUTH:?set in .env}]${SECURO_MCP_URL:?set in .env}
       # Non-owned name on purpose: anything HARNESS_*-prefixed is rejected by
       # the harness's own strict env validator (SPEC §5.7), even if unread.
       HEALTHCHECK_PORT: ${HARNESS_API_PORT:-8080}
+      # M3 (SPEC §11, §12.1): the harness's own memory of what backends have
+      # declared, and its trail of executed writes. Both paths must live on
+      # the volume below — everything else in this compose file is
+      # legitimately restart-clears (AGENTS.md #7); these two are the
+      # deliberate, narrowly-scoped exceptions.
+      TOOL_POLICY_PATH: /data/arno-tool-policy.json
+      AUDIT_LOG_PATH: /data/arno-audit.jsonl
       # RUST_LOG: debug
+    volumes:
+      - arno-state:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -82,3 +97,9 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+
+# The one stateful volume in this topology (M3, SPEC §12.1, AGENTS.md #7):
+# the tool-safety policy and the hash-chained audit log both must survive a
+# container recreate, or "before M3 runs against real books" is never true.
+volumes:
+  arno-state:

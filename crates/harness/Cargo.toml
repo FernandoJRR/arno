@@ -28,6 +28,8 @@ rand.workspace = true
 subtle.workspace = true
 lru.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+chrono.workspace = true
 # Client-only rmcp set; the mock/test doubles enable the server features via
 # [dev-dependencies] unification. STACK.md §2 records the flag decision.
 rmcp = { version = "3.1", default-features = false, features = [

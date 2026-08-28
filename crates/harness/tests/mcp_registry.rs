@@ -12,7 +12,23 @@ use harness::orchestrator::ToolExecutor;
 use std::time::Duration;
 
 fn http(addr: String) -> Vec<(String, BackendAddr)> {
-    vec![("mock".into(), BackendAddr::Http(addr.parse().unwrap()))]
+    vec![(
+        "mock".into(),
+        BackendAddr::Http {
+            url: addr.parse().unwrap(),
+            headers: Vec::new(),
+        },
+    )]
+}
+
+fn http_with_headers(addr: String, headers: Vec<(String, String)>) -> Vec<(String, BackendAddr)> {
+    vec![(
+        "mock".into(),
+        BackendAddr::Http {
+            url: addr.parse().unwrap(),
+            headers,
+        },
+    )]
 }
 
 #[tokio::test]
@@ -124,6 +140,30 @@ async fn unreachable_configured_backend_aborts_startup() {
     assert!(
         err.to_string().contains("connect failed"),
         "error is a connect failure naming the backend: {err}"
+    );
+}
+
+#[tokio::test]
+async fn configured_headers_reach_the_backend_over_the_wire() {
+    // Generic auth mechanism (SPEC §11 M2 — Securo's bearer token rides this
+    // same path): prove a configured header is actually sent, not just parsed.
+    let (url, captured) = mock_mcp::spawn_capturing_header("authorization")
+        .await
+        .expect("capturing mock spawns");
+    let servers = http_with_headers(
+        url,
+        vec![(
+            "Authorization".to_owned(),
+            "Bearer test-token-123".to_owned(),
+        )],
+    );
+    let _reg = McpRegistry::connect(&servers, Duration::from_secs(5))
+        .await
+        .expect("connects");
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("Bearer test-token-123"),
+        "backend must observe the configured Authorization header"
     );
 }
 

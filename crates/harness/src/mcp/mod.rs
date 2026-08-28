@@ -137,8 +137,28 @@ async fn connect_backend(
     match addr {
         // Both transports converge on the same client handle type; everything
         // downstream of this match is transport-agnostic.
-        BackendAddr::Http(url) => {
-            let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url.as_str());
+        BackendAddr::Http { url, headers } => {
+            // Generic header passthrough — this is how an authenticated
+            // backend (e.g. Securo, SPEC §11 M2) receives its bearer token:
+            // the harness never special-cases the backend, only forwards
+            // whatever `MCP_SERVERS` configured (AGENTS.md #6).
+            let mut custom_headers = std::collections::HashMap::new();
+            for (k, v) in headers {
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                    .map_err(|e| ConnectFailure::Connect(Box::new(e)))?;
+                let value = reqwest::header::HeaderValue::from_str(v)
+                    .map_err(|e| ConnectFailure::Connect(Box::new(e)))?;
+                custom_headers.insert(name, value);
+            }
+            let config =
+                rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                    url.as_str(),
+                )
+                .custom_headers(custom_headers);
+            let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
+                reqwest::Client::new(),
+                config,
+            );
             ().serve(transport)
                 .await
                 .map_err(|e| ConnectFailure::Connect(Box::new(e)))

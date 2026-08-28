@@ -95,3 +95,42 @@ pub async fn spawn() -> anyhow::Result<String> {
     });
     Ok(url)
 }
+
+/// Same mock, but records every inbound request's header value for
+/// `header_name` — proves an authenticated `BackendAddr::Http` (e.g. the
+/// Securo bearer token, SPEC §11 M2) actually reaches the wire, not just the
+/// config parser.
+pub async fn spawn_capturing_header(
+    header_name: &'static str,
+) -> anyhow::Result<(String, Arc<std::sync::Mutex<Option<String>>>)> {
+    let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured_for_mw = captured.clone();
+    let service = StreamableHttpService::new(
+        || Ok(MockMcp::new()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr: SocketAddr = listener.local_addr()?;
+    let url = format!("http://{addr}/mcp");
+    tokio::spawn(async move {
+        let router =
+            axum::Router::new()
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let captured = captured_for_mw.clone();
+                        async move {
+                            if let Some(v) = req.headers().get(header_name)
+                                && let Ok(s) = v.to_str()
+                            {
+                                *captured.lock().unwrap() = Some(s.to_owned());
+                            }
+                            next.run(req).await
+                        }
+                    },
+                ));
+        axum::serve(listener, router).await.expect("mock mcp serve")
+    });
+    Ok((url, captured))
+}

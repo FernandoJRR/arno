@@ -57,9 +57,22 @@ impl ToolExecutor for NoBackends {
     }
 }
 
-const SYSTEM_PROMPT: &str = "\
-You are the home-server harness assistant. You interpret orders and answer \
-with the help of the available tools. Be terse and factual.";
+/// Built fresh per order (never baked in at compile time — the harness runs
+/// for days) so the model has real grounding for date-relative reasoning.
+/// Without this, a model asked for "recent" or "this month" data may scope a
+/// `from_date`/`to_date` filter using its own stale training-era belief about
+/// "today" instead of the real date, silently returning zero matches for a
+/// perfectly valid, correctly-dispatched query — observed live against Securo
+/// (SPEC §8: this is a reliability constraint, not a Securo-specific fix).
+fn system_prompt() -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+    format!(
+        "You are the home-server harness assistant called Arno. \
+         Current date and time: {now}. \
+         You interpret orders and answer with the help of the available tools. \
+         Be terse and factual."
+    )
+}
 
 /// Entry point from the queue worker. Contract-level failures map onto the
 /// documented error codes; adapters see exactly one error surface.
@@ -114,7 +127,27 @@ async fn redeem(
         TakeOutcome::Action(action) => {
             // Deleted-before-dispatch already happened inside take(); a failed
             // execution is NOT retried — the safe direction (SPEC §4.3).
-            match st.executor.execute_frozen(&action.tool, &action.args).await {
+            let outcome = st.executor.execute_frozen(&action.tool, &action.args).await;
+            // Audit before reporting the outcome (SPEC §12.1): the write to
+            // Securo (or whichever backend) already happened either way — a
+            // failure to record it is an ops alarm, never a reason to hide
+            // the real execution result from the caller.
+            if let Some(audit) = &st.audit {
+                let record_outcome = match &outcome {
+                    Ok(result) => crate::audit::RecordOutcome::Ok(result),
+                    Err(code) => crate::audit::RecordOutcome::Err(code.as_str()),
+                };
+                if let Err(e) = audit.record(
+                    client_id,
+                    session_id,
+                    &action.tool,
+                    &action.args,
+                    record_outcome,
+                ) {
+                    tracing::error!(error = %e, tool = %action.tool, "audit log write failed");
+                }
+            }
+            match outcome {
                 Ok(result) => Ok(Response {
                     text: format!("Executed `{}`.", action.tool),
                     needs_confirmation: None,
@@ -158,11 +191,12 @@ async fn normal_path(
         let history = st.sessions.snapshot(&key);
         // Budget priority (SPEC §8): schemas → system → newest history first.
         let schemas = st.executor.tool_schemas();
-        let reserved = context::estimate_system(SYSTEM_PROMPT) + context::estimate_schemas(schemas);
+        let prompt = system_prompt();
+        let reserved = context::estimate_system(&prompt) + context::estimate_schemas(schemas);
         let messages = {
             let mut msgs = vec![crate::model::ChatMessage::new(
                 crate::model::Role::System,
-                SYSTEM_PROMPT,
+                prompt,
             )];
             msgs.extend(context::trim(&history, st.cfg.num_ctx, reserved));
             msgs
@@ -189,7 +223,11 @@ async fn normal_path(
             crate::model::CompletionOutput::ToolCalls(calls) => {
                 dispatched_tool_calls += calls.len() as u32;
                 for call in calls {
-                    if st.cfg.destructive_tools.contains(&call.name) {
+                    // Classification is model-authored ahead of time, never
+                    // ahead of this specific order (SPEC §4.2, AGENTS.md #3):
+                    // this is a synchronous lookup against the persisted
+                    // policy, not a model call.
+                    if st.policy.is_destructive(&call.name, &call.args) {
                         // Freeze exact payload + mint token; NEVER dispatch here,
                         // NEVER auto-retry (SPEC §4.3, §8).
                         let token = st.pending.freeze(
@@ -200,9 +238,10 @@ async fn normal_path(
                         );
                         return Ok(Response {
                             text: format!(
-                                "This would run `{}`, which needs your confirmation. \
+                                "This would run `{}` with {}. \
                                  Resend with confirmation_token to execute it.",
-                                call.name
+                                call.name,
+                                render_args(&call.args)
                             ),
                             needs_confirmation: Some(true),
                             confirmation_token: Some(token),
@@ -224,6 +263,22 @@ async fn normal_path(
                 }
             }
         }
+    }
+}
+
+/// Renders a tool call's arguments generically for the confirmation prompt —
+/// informed consent from the mechanical prompt alone (SPEC §4.3), without
+/// depending on the model having already shown a preview earlier in the
+/// conversation. No backend-specific field names (AGENTS.md #1): this is a
+/// plain key=value dump of whatever the tool's own schema produced.
+fn render_args(args: &serde_json::Value) -> String {
+    match args.as_object() {
+        Some(map) if !map.is_empty() => map
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "no arguments".to_owned(),
     }
 }
 

@@ -16,6 +16,17 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// A fresh, never-colliding path under the OS temp dir — tests run in
+/// parallel and each needs its own policy/audit file.
+fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "arno-api-contract-test-{tag}-{}-{n}",
+        std::process::id()
+    ))
+}
+
 fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
     let mut client_tokens = HashMap::new();
     client_tokens.insert("cli".to_owned(), "tok-cli".to_owned());
@@ -38,6 +49,9 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
             .into_iter()
             .collect(),
         mcp_servers: Vec::new(),
+        tool_policy_path: unique_temp_path("policy.json"),
+        audit_log_path: unique_temp_path("audit.jsonl"),
+        tool_policy_retry: Duration::from_secs(300),
     }
 }
 
@@ -95,6 +109,14 @@ fn build_state(
     executor: Arc<dyn ToolExecutor>,
 ) -> SharedState {
     let (order_tx, order_rx) = tokio::sync::mpsc::channel(16);
+    // Same topology as production main(): a fresh policy/audit pair per test,
+    // at the same unique temp paths test_config() already generated.
+    let policy = Arc::new(harness::policy::ToolPolicy::load(
+        cfg.tool_policy_path.clone(),
+        cfg.destructive_tools.clone(),
+    ));
+    let audit =
+        harness::audit::AuditLog::open(&cfg.audit_log_path).expect("audit log opens in tests");
     let state: SharedState = Arc::new(AppState {
         sessions: harness::stores::sessions::SessionStore::new(),
         dedup: harness::stores::dedup::DedupStore::new(),
@@ -103,6 +125,8 @@ fn build_state(
         executor,
         cfg,
         order_tx,
+        policy,
+        audit: Some(audit),
     });
     // Same topology as production main(): a live FIFO worker consumes jobs.
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
@@ -219,6 +243,149 @@ async fn happy_path_round_trips_through_model() {
         body["needs_confirmation"],
         serde_json::Value::Null,
         "absent fields stay absent"
+    );
+}
+
+// ---- adaptive classification at the freeze branch (SPEC §4.2, M3) ----
+//
+// These are the first tests to exercise `normal_path`'s tool-call branch at
+// all: every other test either takes the `Final` shortcut or seeds the
+// pending store directly (`redemption_rig`), bypassing the classify-then-
+// freeze-or-dispatch decision entirely.
+
+fn tool_call_response(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "function": {"name": name, "arguments": arguments}}]
+        },
+        "done": true
+    })
+}
+
+/// A scripted classifier verdict, reused instead of a real Ollama round trip
+/// — the classifier itself is unit-tested in `policy.rs`; here it only needs
+/// to seed one known rule the way `main.rs`'s boot sequence would.
+struct FixedVerdict(&'static str);
+#[async_trait::async_trait]
+impl ModelProvider for FixedVerdict {
+    async fn complete(&self, _req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        Ok(CompletionOutput::Final(self.0.to_owned()))
+    }
+}
+
+fn conditional_tool_schema(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {"name": name, "description": "creates a thing; apply=true persists it", "parameters": {}}
+    })
+}
+
+/// Seeds `state.policy` with a `DestructiveWhen{apply,true}` rule for `name`,
+/// the same way `main.rs` does at boot — reconcile, then classify against a
+/// scripted verdict instead of a live model.
+async fn pin_conditional_on_apply(state: &SharedState, name: &str) {
+    let schema = conditional_tool_schema(name);
+    let pending = state.policy.reconcile(&[schema.clone()]);
+    let verdict = FixedVerdict(
+        r#"{"class":"conditional","key":"apply","equals":true,"reason":"test-pinned"}"#,
+    );
+    state
+        .policy
+        .classify_pending(&verdict, &[schema], &pending)
+        .await;
+}
+
+#[tokio::test]
+async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
+            "securo.propose_create_transaction",
+            serde_json::json!({"apply": true, "amount": 50}),
+        )))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(harness::model::ollama::OllamaProvider::new(
+        server.uri().parse().unwrap(),
+        "qwen3:8b",
+        Duration::from_secs(5),
+        harness::model::ollama::ThinkMode::Off,
+    ));
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"ok": true})));
+    let mut cfg = test_config(server.uri(), Duration::from_secs(10));
+    cfg.destructive_tools.clear(); // exercise the policy classifier, not the env override
+    let state = build_state(cfg, provider, Arc::new(executor.clone()));
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["needs_confirmation"], true);
+    assert!(body["confirmation_token"].is_string());
+    assert!(
+        body["text"].as_str().unwrap().contains("apply=true"),
+        "confirmation text renders the proposed args: {body}"
+    );
+    assert_eq!(
+        executor.calls.lock().unwrap().len(),
+        0,
+        "a matching predicate must freeze, never dispatch"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_not_matching_the_conditional_predicate_dispatches_directly() {
+    let server = MockServer::start().await;
+    // First completion returns a tool call without `apply` (a harmless
+    // preview, per the predicate); the second — reached only if the
+    // orchestrator loops back after dispatch — returns a final answer, so
+    // the test fails loudly (via the assertion below) rather than looping
+    // until `max_tool_calls`.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
+            "securo.propose_create_transaction",
+            serde_json::json!({"amount": 50}),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "here's a preview"},
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(harness::model::ollama::OllamaProvider::new(
+        server.uri().parse().unwrap(),
+        "qwen3:8b",
+        Duration::from_secs(5),
+        harness::model::ollama::ThinkMode::Off,
+    ));
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"preview": true})));
+    let mut cfg = test_config(server.uri(), Duration::from_secs(10));
+    cfg.destructive_tools.clear();
+    let state = build_state(cfg, provider, Arc::new(executor.clone()));
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["text"], "here's a preview");
+    assert_eq!(
+        body["needs_confirmation"],
+        serde_json::Value::Null,
+        "no apply=true present — dispatches without confirmation"
+    );
+    assert_eq!(
+        executor.calls.lock().unwrap().len(),
+        1,
+        "dispatched exactly once"
     );
 }
 

@@ -24,6 +24,8 @@ lru = "0.18"
 clap = { version = "4.6", features = ["derive", "env"] }
 async-trait = "0.1"
 teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 strip = true

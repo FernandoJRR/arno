@@ -1,12 +1,35 @@
-# Home Server Harness — Spec v0.5 (draft)
+# Home Server Harness — Spec v0.7 (draft)
 
-Supersedes v0.4. Restructured around a single principle: **three independently
+Supersedes v0.6. Restructured around a single principle: **three independently
 replaceable parts, joined by two stable contracts.** Any part can be swapped
 without touching the other two. Concrete stack and deployment topology live in
 the companion file `STACK.md`; agent-facing rules in `AGENTS.md`.
 
 > Status: draft for review. Assumptions needing confirmation are marked
 > **[CONFIRM]**. Open decisions are in §11.
+>
+> **Changelog v0.6 → v0.7** — M3 landed: confirmed writes enabled via
+> **adaptive tool classification** rather than the exact-name `DESTRUCTIVE_TOOLS`
+> list originally sketched for it. Live discovery against Securo showed why
+> that couldn't work as the primary mechanism: its 9 `propose_*` write tools
+> are dual-mode *by argument* (`apply=true`), not by name, and enumerating them
+> in config would couple deployment config to one backend's evolving tool
+> list. Instead, the model classifies each newly-discovered/changed tool at
+> boot from its name/description/schema alone — the one thing every MCP tool
+> guarantees — into a persisted, plain-Rust-evaluated rule; unclassified or
+> ambiguous tools fail closed to destructive (§4.2). `DESTRUCTIVE_TOOLS`
+> remains as the operator's highest-precedence override. New: a persistent,
+> hash-chained audit log of executed frozen actions (§12.1) and the tool
+> policy file itself are the harness's first two exceptions to "in-memory
+> stores stay in-memory" (AGENTS.md #7) — this revision is that exception's
+> spec justification. No open items remain blocking M3.
+>
+> **Changelog v0.5 → v0.6** — M2 landed: Securo wired as the second MCP
+> backend (read-only). Resolves the sole open item from v0.5 — Securo
+> authenticates with a bearer token, carried through a new generic
+> header-bearing `MCP_SERVERS` HTTP form (`name:[Header=Value;...]scheme://…`,
+> §5.7) rather than any Securo-specific harness code (AGENTS.md #6). No open
+> items remain blocking M2.
 >
 > **Changelog v0.4 → v0.5** — crate selection pulled forward from M0 planning
 > and resolved in `STACK.md`: rmcp (MCP), axum (Harness API), teloxide (Telegram),
@@ -118,19 +141,62 @@ the contracts guarantee they'll drop in later.
 
 ### 4.2 Contract 2 — MCP (tool boundary)
 
-- The harness is an MCP client. At startup it connects to a configured list of MCP servers, discovers their tools, namespaces them (`linux.get_disk_usage`, `securo.create_transaction`), and presents one merged schema to the orchestrator.
+- The harness is an MCP client. At startup it connects to a configured list of MCP servers, discovers their tools, namespaces them (`linux.get_disk_usage`, `securo.propose_create_transaction`), and presents one merged schema to the orchestrator.
 - **Securo is one entry in that list.** Replacing it with another app is a config change; if the replacement speaks MCP, the harness needs no code change.
 - Any app-specific *policy* (e.g. "bill data goes to Securo") lives in configuration, not in the core — so the policy moves with the config when you swap backends.
+
+**Tool safety classification (M3).** Every discovered tool must be classified
+read-only-safe or destructive before it can be dispatched. Two rejected designs
+are recorded for posterity: an exact-tool-name env list can't express a tool
+that is dual-mode *by argument* (Securo's `propose_*` tools default to a
+harmless preview and only write when called with `apply: true` — one tool
+name, two safety classes); and standard MCP tool annotations
+(`readOnlyHint`/`destructiveHint`) would be ideal but no backend is obliged to
+send them — Securo sends none.
+
+Instead: **the model classifies each tool at discovery**, using only what MCP
+guarantees every tool has — its name, description, and input schema — and
+emits one mechanical, persisted rule: `safe`, `destructive`, or
+`destructive_when {key, value}` (the model derives the triggering argument
+itself; the harness never hardcodes an argument name like `apply`). That rule
+is what dispatch consults, synchronously, in plain Rust — **the model never
+executes the classification decision for a specific order, only authors a
+rule ahead of time** (AGENTS.md #3's "model never executes confirmed actions"
+extends naturally: it also never adjudicates one). Fail-closed throughout: a
+tool the model hasn't classified yet, or whose verdict didn't parse, is
+`destructive` until a real verdict lands. A tool's schema fingerprint
+(sha256 of name+description+parameters) is checked on every reconnect; a
+mismatch means the backend changed the tool's contract, and the tool reverts
+to `destructive`/pending until reclassified — drift detection with no extra
+mechanism. `DESTRUCTIVE_TOOLS` (unchanged exact-name semantics) is the
+operator's override, checked first and always winning. A human can also hand-edit
+the persisted policy file directly and mark an entry `"source":"operator"`,
+which pins it against automatic reclassification. Classification runs at boot;
+if the model is unavailable, affected tools stay `Pending` (destructive) and a
+background task retries them once the model answers again — a transient model
+outage degrades to "everything new is gated," never to "everything new is trusted."
+
+**Known limitation, observed live (§11 decision #11):** fail-closed only
+catches a verdict that doesn't parse — it does not catch a confident, clean,
+*wrong* one. Against the real Securo endpoint, 28 of 29 tools classified
+correctly and one did not, despite an identical schema convention to its
+correctly-classified siblings. Reviewing the generated policy file after a new
+or updated backend's first boot is a real operational step this design
+expects, not a hypothetical one.
 
 ### 4.3 Confirmation semantics (Contract 1 extension)
 
 Destructive tools are never dispatched on the model's word alone. The gate is a
 **frozen-payload replay**, guaranteeing *what the user confirmed is exactly what executes*:
 
-- **Proposal:** the orchestrator selects a destructive tool → it stores the exact
-  `{tool_name, args}` in a pending-action store keyed `(client_id, session_id,
-  confirmation_token)` and returns `needs_confirmation` + a fresh
-  `confirmation_token` (128 bits of CSPRNG output).
+- **Proposal:** the orchestrator selects a destructive tool (§4.2 classification)
+  → it stores the exact `{tool_name, args}` in a pending-action store keyed
+  `(client_id, session_id, confirmation_token)` and returns `needs_confirmation`
+  + a fresh `confirmation_token` (128 bits of CSPRNG output). The response
+  text renders the proposed arguments generically (`key=value, ...`, no
+  backend-specific field names) — informed consent from the mechanical prompt
+  alone, not dependent on the model having already shown a backend's own
+  preview earlier in the conversation.
 - **Redemption:** an Order carrying `confirmation_token` is validated against the
   store (same client, same session, unexpired, unused) and the **stored payload is
   dispatched verbatim over MCP. The model is bypassed entirely at execution time.**
@@ -144,7 +210,10 @@ Destructive tools are never dispatched on the model's word alone. The gate is a
   no implicit "yes" and no natural-language confirmation parsing; only a
   token-bearing Order redeems. Stale pendings simply expire.
 - **Echo:** a successfully executed confirmation includes `{tool, args, result}`
-  in the Response's `structured` field — the seed of the future audit log.
+  in the Response's `structured` field. Every redemption attempt — success or
+  failure — is additionally appended to the persistent, hash-chained audit
+  log (§12.1, M3): the `structured` field is what the caller sees; the audit
+  log is the harness's own durable record, independent of any client.
 
 ---
 
@@ -190,7 +259,20 @@ DEDUP_WINDOW_MIN=60                  # client_msg_id dedup window
 SESSION_TTL_H=24                     # idle session expiry
 CONFIRM_TTL_MIN=10                   # confirmation-token lifetime
 ATTACH_MAX_BYTES=10485760            # inline attachment cap (raw bytes)
+DESTRUCTIVE_TOOLS=                    # exact namespaced tool names always destructive,
+                                      #   regardless of args (§4.2) — the operator's
+                                      #   override on top of the model-driven classifier
+                                      #   below; empty/unset is the common case
+# added at M3 — adaptive tool classification (§4.2):
+TOOL_POLICY_PATH=./arno-tool-policy.json  # persisted, hand-editable classification (AGENTS.md #7 exception)
+AUDIT_LOG_PATH=./arno-audit.jsonl         # hash-chained trail of executed frozen actions (§12.1, AGENTS.md #7 exception)
+TOOL_POLICY_RETRY_S=300               # retry interval for tools left Pending (model was unavailable at boot)
 MCP_SERVERS=linux-mcp:<endpoint>      # endpoint: scheme://… (Streamable HTTP)
+                                      #   or [Header=Value;Header2=Value2]scheme://…
+                                      #   (Streamable HTTP with per-backend request
+                                      #   headers — e.g. an Authorization bearer
+                                      #   token; header values must not contain a
+                                      #   comma, the list separator)
                                       #   or exec:[KEY=VALUE …] <program> [args…] (stdio
                                       #   spawn; leading KEY=VALUE tokens set env vars on
                                       #   the child directly — e.g. exec:MCP_LINUX_TRANSPORT=
@@ -200,10 +282,12 @@ MCP_SERVERS=linux-mcp:<endpoint>      # endpoint: scheme://… (Streamable HTTP)
 # mcp-linux backend:
 MCP_LINUX_TRANSPORT=http              # http|stdio (serve mode of its own binary)
 MCP_LINUX_BIND=127.0.0.1:9001         # ignored in stdio mode
-# added at M2:
-SECURO_MCP_URL=http://127.0.0.1:8765/mcp
-SECURO_MCP_AUTH=...                   # [CONFIRM] how Securo authenticates MCP callers
-SECURO_WORKSPACE_ID=...
+# added at M2 — Securo is external; not a harness-known var. Its bearer token
+# and URL are composed into one MCP_SERVERS entry at the deployment layer
+# (compose/.env interpolation), e.g.:
+#   securo:[Authorization=Bearer <token>]http://host:8765/mcp
+# The harness never reads a var named SECURO_* — the header form above is a
+# generic mechanism, not Securo-specific code (§5.2, AGENTS.md #6).
 
 # Telegram adapter (separate process/config)
 TELEGRAM_BOT_TOKEN=...
@@ -270,7 +354,7 @@ Adapters set their Harness-API HTTP timeout above `ORDER_BUDGET_S`.
 - **M0 — Core + a throwaway CLI adapter.** Stand up the Harness API and an Ollama round-trip, and drive it from a 20-line CLI adapter. *Building the CLI adapter first forces the interface contract to be real from day one — the cheapest guarantee that Telegram never gets welded to the core.*
 - **M1 — Telegram adapter + linux-mcp (RO).** Real orders over Telegram, real read-only answers (disk, services, ports). Validates the full loop at zero write risk.
 - **M2 — Securo MCP (read).** Add Securo as a second backend; read finance data. Validates multi-backend aggregation and the tool contract.
-- **M3 — First confirmed write.** Enable one Securo write (create a transaction) behind the frozen-payload confirmation gate (§4.3).
+- **M3 — First confirmed write.** Enable Securo writes behind the frozen-payload confirmation gate (§4.3), gated by adaptive tool classification (§4.2) rather than a hand-enumerated tool list — the live tool surface (9 dual-mode `propose_*` tools) made a static list unsafe as the primary mechanism.
 - **Later — prove the decoupling for real:** a second interface adapter (Android/TUI), a backend swap in place of Securo, OCR via attachments, Docker MCP.
 
 Each milestone is independently useful.
@@ -301,7 +385,7 @@ Each milestone is independently useful.
 
 ## 11. Decisions
 
-### Resolved (v0.4–v0.5)
+### Resolved (v0.4–v0.7)
 
 | # | Question | Outcome | Notes |
 |---|---|---|---|
@@ -312,14 +396,14 @@ Each milestone is independently useful.
 | 6 | Process management | **Docker containers** | Compose, one service per part; deployment notes in §5.7, topology in STACK.md §6 |
 | 7 | Model runtime seam | **ModelProvider trait** | Ollama = first adapter impl over native `/api/chat` (per-request `num_ctx`; compat `/v1` can't set context or `tool_choice`); providers swap without touching the orchestrator (STACK.md §4) |
 | 8 | linux-mcp implementation | **Rust + rmcp server** | workspace member `mcp-linux`; concrete diagnostics tool list still picked at M1 |
-| 9 | Destructive-tool classification | **Config-driven list** | `DESTRUCTIVE_TOOLS` names exact namespaced tools; unlisted = read-only; policy moves with config on swap (§4.2) |
+| 9 | Destructive-tool classification | **Superseded by #11 (M3)** | Originally a config-driven exact-name list; live Securo discovery showed dual-mode (by-argument) write tools an exact-name list can't express — see #11 |
+| 10 | Securo MCP auth | **Bearer token, via a generic header mechanism** | Resolves the former `[CONFIRM]` tag in §5.7. `MCP_SERVERS` gained a header-bearing HTTP form (`name:[Header=Value;...]scheme://…`); Securo's token rides `Authorization` through it. The harness never reads a `SECURO_*` var — the token is composed in at the deployment layer (compose/.env), keeping the core backend-agnostic (§5.2, AGENTS.md #6). Verified against the live Securo MCP server: `initialize` + `tools/list` succeeded (29 tools discovered) through this exact code path. Workspace scoping needs no separate var or header — confirmed live that no Securo tool takes a workspace parameter; the bearer JWT's own `ws_id` claim scopes every call server-side. |
+| 11 | Tool safety classification (M3) | **Model-classified at discovery, persisted, plain-Rust-evaluated** | Rejected: exact-name env list (can't express dual-mode-by-argument tools, and drifts open as a backend's tool list evolves); standard MCP annotations (no backend obligated to send them — Securo sends none). Adopted: the model reads each tool's name/description/schema once at discovery and emits a persisted rule (`safe`/`destructive`/`destructive_when{key,value}`); dispatch evaluates the rule synchronously, never calling the model per order (§4.2). Fail-closed: unclassified/ambiguous/drifted tools are `destructive` until a real verdict lands; a background task retries tools left pending after a model outage. `DESTRUCTIVE_TOOLS` survives as the operator's override. This required the two AGENTS.md #7 persistence exceptions (tool policy file, audit log) — see #12. **Live-verified** against the real Securo endpoint (`qwen3:4b-instruct-2507-q4_K_M`): boot classified all 29 real tools in ~24s, correctly landing 20 `safe` / 9 `destructive_when{apply,true}` — matching manual inspection exactly, with zero Securo-specific harness code. **One tool was initially misclassified** (`propose_update_recurring_transaction` → `safe`, though its schema is byte-identical in convention to its 8 correctly-classified siblings) — hand-corrected via the operator-pin escape hatch (`"source":"operator"` in the policy file) once found. This is the concrete, observed shape of the accepted risk: fail-closed catches unparseable/ambiguous verdicts, **not** a confidently wrong one — the model reasoned about the `apply` mechanism correctly in its own stated `reason` text but still emitted the wrong `class` label. Operator review of the generated policy file after first boot against a new/updated backend is a real operational step, not optional hardening. Separately live-verified: with Ollama unreachable, boot still succeeds with all 29 tools `pending` (`safe=0 destructive=0 conditional=0 pending=29`) rather than blocking; the background retry task fires correctly on `TOOL_POLICY_RETRY_S` against the real endpoint. |
+| 12 | Audit log persistence | **Hash-chained append-only JSONL, `AUDIT_LOG_PATH`** | Backlog #1 required this "before M3 runs against real books"; AGENTS.md #7 requires a spec revision before any persistent store — this is that revision. Each executed frozen action (success or failure) is appended with a hash covering its own content plus the previous entry's hash; a corrupt/tampered file aborts boot rather than silently starting a fresh chain, since tamper-evidence is the entire point. |
 
 ### Still open
 
-1. **Securo MCP auth** *(resolves the [CONFIRM] tag in §5.7)*
-   - *Unknowns:* deployed with MCP enabled? Auth scheme (token / workspace header / localhost trust)?
-   - *Action:* dig through Securo docs before M2.
-   - *Defer cost:* blocks M2 only.
+None blocking M3.
 
 **Resolved since v0.2** (folded into this revision):
 - Attachment mechanism → dual-field schema, inline base64 in v1, upload endpoint later (§4.1).
@@ -334,9 +418,11 @@ Each milestone is independently useful.
 
 None of these block M0–M1.
 
-1. **Audit log** — §4.3's structured echo is only the seed; design storage (append-only file/journal), retention, and tamper-evidence before M3 runs against real books.
+1. ~~**Audit log**~~ — **Resolved in M3** (§11 decision #12): hash-chained append-only JSONL, `AUDIT_LOG_PATH`. Retention/rotation remains explicitly out of scope (ops concern, not a harness feature).
 2. **Log hygiene** — tool results and model context contain finance data; define which components may log payloads vs codes-only, plus rotation and secret handling.
 3. **Contract tests + mock MCP server** — golden tests for the Harness API and a stub backend exercising discovery/namespacing/timeouts; health/readiness endpoints surfaced as Docker healthchecks (§11.6).
 4. **Prompt-injection stance** — record the accepted-risk rationale (read-only v1 + frozen-payload gate) and revisit when attachments/OCR land.
-5. **M3 dry-run** — the first confirmed write targets a test workspace (`SECURO_WORKSPACE_ID` pointing at a sandbox), never production books.
+5. **M3 dry-run** — the first confirmed write targets a sandbox, never production books. Since M2 confirmed workspace scoping lives entirely in the bearer JWT's `ws_id` claim (no separate `SECURO_WORKSPACE_ID` var), the sandbox boundary for M3 must be a *separate token* minted against a test workspace — not a config var the harness plumbs through.
 6. **Correlation ID** — Response carries no `order_id`; required once SSE/WS push or async orders exist (ties to §11.3).
+7. ~~**Securo `propose_*` tools are mutating, not read-only**~~ — **Resolved in M3** (§11 decision #11): the model classifies each tool at discovery from its schema alone, deriving the `apply`-argument condition itself rather than the harness hardcoding it. All 9 `propose_*` tools now correctly gate on `apply: true`; preview calls (no `apply`) dispatch freely, matching Securo's own preview/apply contract exactly instead of either double-confirming previews or leaving applies unguarded.
+8. **Runtime client registration** — today every adapter's token is static config: harness reads the whole map from `HARNESS_API_CLIENT_TOKENS`, each adapter carries its own copy of just its own secret (§5.7, §7 layer 2). An alternative is registering clients against a *running* harness (admin action: supply `client_id` + token, paste the same token into the adapter). Deferred, not rejected — it does not remove the two-places-one-secret duplication (the adapter still receives the secret out of band), and it costs three things this design currently avoids: a **persisted** token store (violates §4.1's in-memory-only rule — otherwise every restart de-registers every adapter), an **authenticated admin surface** to mint tokens (which needs its own bootstrap credential from env, so the env var comes back), and a **revocation/rotation** story. Worth building when adapters become dynamic — third-party clients, per-device tokens, self-service onboarding, or rotation without downtime — at which point it is a designed feature (admin auth, persistence, TTL, revocation), not a config tweak.
