@@ -73,6 +73,9 @@ pub struct Config {
     /// Where the hash-chained audit trail of executed frozen actions persists
     /// (SPEC §12.1, AGENTS.md #7 exception #2).
     pub audit_log_path: PathBuf,
+    /// Where the hash-chained conversation/tool-call transcript persists
+    /// (SPEC §12.2, AGENTS.md #7 exception #3).
+    pub transcript_log_path: PathBuf,
     /// How often the background task retries tools left `Pending` because the
     /// model was unavailable at boot (SPEC §11 M3).
     pub tool_policy_retry: Duration,
@@ -108,6 +111,7 @@ impl Config {
             mcp_servers: servers("MCP_SERVERS")?,
             tool_policy_path: path_var("TOOL_POLICY_PATH", "./arno-tool-policy.json"),
             audit_log_path: path_var("AUDIT_LOG_PATH", "./arno-audit.jsonl"),
+            transcript_log_path: path_var("TRANSCRIPT_LOG_PATH", "./arno-transcript.jsonl"),
             tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
         })
     }
@@ -135,6 +139,7 @@ const KNOWN_VARS: &[&str] = &[
     "TOOL_POLICY_PATH",
     "TOOL_POLICY_RETRY_S",
     "AUDIT_LOG_PATH",
+    "TRANSCRIPT_LOG_PATH",
 ];
 
 const OWNED_PREFIXES: &[&str] = &[
@@ -150,6 +155,7 @@ const OWNED_PREFIXES: &[&str] = &[
     "DESTRUCTIVE_",
     "TOOL_POLICY_",
     "AUDIT_LOG_",
+    "TRANSCRIPT_LOG_",
 ];
 
 fn reject_unknown() -> Result<(), ConfigError> {
@@ -459,6 +465,7 @@ mod tests {
             "TOOL_POLICY_PATH",
             "TOOL_POLICY_RETRY_S",
             "AUDIT_LOG_PATH",
+            "TRANSCRIPT_LOG_PATH",
         ]
     }
 
@@ -480,6 +487,10 @@ mod tests {
             PathBuf::from("./arno-tool-policy.json")
         );
         assert_eq!(cfg.audit_log_path, PathBuf::from("./arno-audit.jsonl"));
+        assert_eq!(
+            cfg.transcript_log_path,
+            PathBuf::from("./arno-transcript.jsonl")
+        );
         assert_eq!(cfg.tool_policy_retry, Duration::from_secs(300));
     }
 
@@ -490,10 +501,15 @@ mod tests {
         set("HARNESS_API_CLIENT_TOKENS", "cli:s");
         set("TOOL_POLICY_PATH", "/data/policy.json");
         set("AUDIT_LOG_PATH", "/data/audit.jsonl");
+        set("TRANSCRIPT_LOG_PATH", "/data/transcript.jsonl");
         set("TOOL_POLICY_RETRY_S", "60");
         let cfg = Config::from_env().expect("parses");
         assert_eq!(cfg.tool_policy_path, PathBuf::from("/data/policy.json"));
         assert_eq!(cfg.audit_log_path, PathBuf::from("/data/audit.jsonl"));
+        assert_eq!(
+            cfg.transcript_log_path,
+            PathBuf::from("/data/transcript.jsonl")
+        );
         assert_eq!(cfg.tool_policy_retry, Duration::from_secs(60));
     }
 

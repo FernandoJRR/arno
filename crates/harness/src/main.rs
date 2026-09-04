@@ -55,6 +55,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let audit = harness::audit::AuditLog::open(&cfg.audit_log_path)
         .map_err(|e| anyhow::anyhow!("audit log open failed: {e}"))?;
 
+    // Same fail-loud posture for the conversation/tool-call transcript
+    // (SPEC §12.2) — a separate file from the audit log by design (§12.2).
+    let transcript = harness::transcript::TranscriptLog::open(&cfg.transcript_log_path)
+        .map_err(|e| anyhow::anyhow!("transcript log open failed: {e}"))?;
+
     // Adaptive tool-safety classification (SPEC §4.2, M3): reconcile the
     // persisted policy against what's actually discovered, then classify
     // anything unknown/changed right now. A down model provider leaves those
@@ -85,6 +90,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         order_tx: order_tx.clone(),
         policy,
         audit: Some(audit),
+        transcript: Some(transcript),
     });
     drop(order_tx); // router holds its clone; keep only one producer handle alive in state
 

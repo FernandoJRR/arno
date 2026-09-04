@@ -13,9 +13,14 @@ ARG HARNESS_API_PORT=8080
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 arno
+    && useradd --system --uid 10001 arno \
+    && mkdir -p /data \
+    && chown arno:arno /data
 COPY --from=build /build/target/release/harness /usr/local/bin/harness
 USER arno
+# /data is the arno-state volume (TOOL_POLICY_PATH, AUDIT_LOG_PATH) — Docker
+# would otherwise create the mount point as root, and the non-root arno user
+# couldn't write to it.
 # HARNESS_API_PORT stays a build-time ARG only — the harness process itself
 # rejects any unrecognized HARNESS_*-prefixed runtime env var (SPEC §5.7).
 ENV HARNESS_API_BIND=0.0.0.0:${HARNESS_API_PORT}

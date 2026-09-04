@@ -155,6 +155,17 @@ fn message_body(m: &ChatMessage) -> Value {
             "content": m.content,
             "tool_call_id": m.tool_call_id,
         }),
+        // The assistant's own prior request — round-trips the same shape
+        // `parse_output` reads a completion's tool calls from, so the model
+        // sees exactly what it asked for on a later turn, not just the result.
+        Role::Assistant if m.tool_calls.is_some() => json!({
+            "role": "assistant",
+            "content": m.content,
+            "tool_calls": m.tool_calls.as_ref().unwrap().iter().map(|c| json!({
+                "id": c.id,
+                "function": { "name": c.name, "arguments": c.args },
+            })).collect::<Vec<_>>(),
+        }),
         role => json!({ "role": role.as_str(), "content": m.content }),
     }
 }
@@ -250,5 +261,31 @@ mod tests {
         assert_eq!(body["model"], "qwen3:8b");
         assert_eq!(body["options"]["num_ctx"], 4096);
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn assistant_tool_calls_serialize_in_native_wire_shape() {
+        let msg = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "securo.list_transactions".into(),
+            args: json!({"limit": 5}),
+        }]);
+        let body = message_body(&msg);
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["content"], "");
+        assert_eq!(body["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            body["tool_calls"][0]["function"]["name"],
+            "securo.list_transactions"
+        );
+        assert_eq!(body["tool_calls"][0]["function"]["arguments"]["limit"], 5);
+    }
+
+    #[test]
+    fn plain_assistant_message_has_no_tool_calls_field() {
+        let msg = ChatMessage::new(Role::Assistant, "hello");
+        let body = message_body(&msg);
+        assert_eq!(body["content"], "hello");
+        assert!(body.get("tool_calls").is_none());
     }
 }

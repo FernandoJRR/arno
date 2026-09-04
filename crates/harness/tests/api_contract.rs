@@ -51,6 +51,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         mcp_servers: Vec::new(),
         tool_policy_path: unique_temp_path("policy.json"),
         audit_log_path: unique_temp_path("audit.jsonl"),
+        transcript_log_path: unique_temp_path("transcript.jsonl"),
         tool_policy_retry: Duration::from_secs(300),
     }
 }
@@ -117,6 +118,8 @@ fn build_state(
     ));
     let audit =
         harness::audit::AuditLog::open(&cfg.audit_log_path).expect("audit log opens in tests");
+    let transcript = harness::transcript::TranscriptLog::open(&cfg.transcript_log_path)
+        .expect("transcript log opens in tests");
     let state: SharedState = Arc::new(AppState {
         sessions: harness::stores::sessions::SessionStore::new(),
         dedup: harness::stores::dedup::DedupStore::new(),
@@ -127,6 +130,7 @@ fn build_state(
         order_tx,
         policy,
         audit: Some(audit),
+        transcript: Some(transcript),
     });
     // Same topology as production main(): a live FIFO worker consumes jobs.
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
@@ -287,7 +291,7 @@ fn conditional_tool_schema(name: &str) -> serde_json::Value {
 /// scripted verdict instead of a live model.
 async fn pin_conditional_on_apply(state: &SharedState, name: &str) {
     let schema = conditional_tool_schema(name);
-    let pending = state.policy.reconcile(&[schema.clone()]);
+    let pending = state.policy.reconcile(std::slice::from_ref(&schema));
     let verdict = FixedVerdict(
         r#"{"class":"conditional","key":"apply","equals":true,"reason":"test-pinned"}"#,
     );
@@ -387,6 +391,196 @@ async fn tool_call_not_matching_the_conditional_predicate_dispatches_directly() 
         1,
         "dispatched exactly once"
     );
+}
+
+#[tokio::test]
+async fn second_completion_sees_the_models_own_prior_tool_call() {
+    // Regression test for a real conversation-quality bug: the assistant's
+    // own tool-call request must be replayed back to it on the next
+    // completion, not just the orphaned result (orchestrator/mod.rs,
+    // model/mod.rs's `ChatMessage::assistant_tool_calls`).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
+            "securo.list_transactions",
+            serde_json::json!({}),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "done"},
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(harness::model::ollama::OllamaProvider::new(
+        server.uri().parse().unwrap(),
+        "qwen3:8b",
+        Duration::from_secs(5),
+        harness::model::ollama::ThinkMode::Off,
+    ));
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
+    let mut cfg = test_config(server.uri(), Duration::from_secs(10));
+    cfg.destructive_tools.clear();
+    let state = build_state(cfg, provider, Arc::new(executor));
+    pin_conditional_on_apply(&state, "securo.list_transactions").await;
+
+    let (status, _) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let received = server.received_requests().await.expect("recording enabled");
+    assert_eq!(received.len(), 2, "one call round, one final round");
+    let second_body: serde_json::Value = received[1].body_json().expect("valid json body");
+    let messages = second_body["messages"].as_array().expect("messages array");
+    let assistant_tool_call_msg = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+        .expect("the model's own prior tool call must be present in the next request");
+    assert_eq!(
+        assistant_tool_call_msg["tool_calls"][0]["function"]["name"], "securo.list_transactions",
+        "not just present, but naming the tool it actually called"
+    );
+    // And the matching result is still there too, right after it.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("total")),
+        "the result travels alongside the request, not orphaned: {messages:#?}"
+    );
+}
+
+#[tokio::test]
+async fn tool_error_triggers_a_situational_retry_nudge_on_the_next_completion() {
+    // Ollama's `tool_choice` is a documented no-op on the runtime this
+    // project targets (verified live) — the harness cannot force a retry
+    // tool call. Instead, a failed dispatch should inject a fresh,
+    // situational instruction (maximally recent for the next completion)
+    // rather than relying solely on the static system prompt.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
+            "securo.propose_create_transaction",
+            serde_json::json!({"amount": 50}),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "retrying"},
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(harness::model::ollama::OllamaProvider::new(
+        server.uri().parse().unwrap(),
+        "qwen3:8b",
+        Duration::from_secs(5),
+        harness::model::ollama::ThinkMode::Off,
+    ));
+    // The tool "dispatches" (not destructive — no `apply`) but the backend
+    // itself reports an application-level failure, same shape as Securo's
+    // own `{"error": "..."}` validation responses observed live.
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(
+        serde_json::json!({"error": "group_id and splits must be provided together"}),
+    ));
+    let mut cfg = test_config(server.uri(), Duration::from_secs(10));
+    cfg.destructive_tools.clear();
+    let state = build_state(cfg, provider, Arc::new(executor));
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+
+    let (status, _) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let received = server.received_requests().await.expect("recording enabled");
+    let second_body: serde_json::Value = received[1].body_json().expect("valid json body");
+    let messages = second_body["messages"].as_array().expect("messages array");
+    let last = messages.last().expect("at least one message");
+    assert_eq!(
+        last["role"], "user",
+        "nudge lands as the most recent message, right after the erroring result"
+    );
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("did not succeed"),
+        "nudge content present: {last}"
+    );
+}
+
+#[tokio::test]
+async fn transcript_records_user_tool_call_result_and_final_answer_in_order() {
+    let server = MockServer::start().await;
+    // First completion: a dispatchable (no `apply`) tool call. Second: the
+    // final answer, reached after the orchestrator loops back with the tool
+    // result — same two-mock shape as the sibling dispatch test above.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
+            "securo.list_transactions",
+            serde_json::json!({}),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "you have 8 transactions"},
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(harness::model::ollama::OllamaProvider::new(
+        server.uri().parse().unwrap(),
+        "qwen3:8b",
+        Duration::from_secs(5),
+        harness::model::ollama::ThinkMode::Off,
+    ));
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
+    let mut cfg = test_config(server.uri(), Duration::from_secs(10));
+    cfg.destructive_tools.clear();
+    let transcript_path = cfg.transcript_log_path.clone();
+    let state = build_state(cfg, provider, Arc::new(executor));
+    pin_conditional_on_apply(&state, "securo.list_transactions").await;
+
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["text"], "you have 8 transactions");
+
+    let contents = std::fs::read_to_string(&transcript_path).unwrap();
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "user_message",
+            "tool_call",
+            "tool_result",
+            "assistant_final"
+        ],
+        "the full conversational event stream, in order: {lines:#?}"
+    );
+    assert_eq!(lines[1]["tool"], "securo.list_transactions");
+    assert_eq!(lines[2]["result"]["total"], 8);
+    assert_eq!(lines[3]["text"], "you have 8 transactions");
+    // Hash chain integrity, exercised end-to-end through the real dispatch path.
+    for w in lines.windows(2) {
+        assert_eq!(w[1]["prev_hash"], w[0]["hash"]);
+    }
 }
 
 #[tokio::test]

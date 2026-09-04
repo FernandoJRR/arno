@@ -62,15 +62,16 @@ Adapters must not depend on `harness`; `harness` must not depend on adapters.
    SPEC §5.7 and STACK.md §7.
 7. **In-memory stores stay in-memory** (sessions, dedup LRU, pending actions) —
    restart-clears is accepted behavior, not a gap. Persistence proposals need a
-   spec revision first. **Two narrowly-scoped exceptions exist (M3, SPEC §11,
-   §12.1):** the tool-safety policy (`crates/harness/src/policy.rs`) and the
-   hash-chained audit log (`crates/harness/src/audit.rs`). Both are the
-   harness's own memory of what backends have declared and what it has
-   actually done to real financial data — losing either on restart would
-   silently re-open trust assumptions or erase the evidence tamper-evidence
-   exists to preserve, rather than fail closed. Do not add other persistent
-   stores without going through the same process (a spec revision, not a
-   quiet implementation detail).
+   spec revision first. **Three narrowly-scoped exceptions exist (M3, SPEC
+   §11, §12.1, §12.2):** the tool-safety policy (`crates/harness/src/policy.rs`),
+   the hash-chained audit log (`crates/harness/src/audit.rs`), and the
+   hash-chained conversation/tool-call transcript (`crates/harness/src/transcript.rs`).
+   All three are the harness's own memory of what backends have declared and
+   what it has actually done or said in real financial conversations —
+   losing any of them on restart would silently re-open trust assumptions or
+   erase the only evidence of what actually happened, rather than fail
+   closed. Do not add other persistent stores without going through the same
+   process (a spec revision, not a quiet implementation detail).
 
 ## Conventions
 

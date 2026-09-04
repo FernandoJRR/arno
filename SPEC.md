@@ -1,12 +1,27 @@
-# Home Server Harness — Spec v0.7 (draft)
+# Home Server Harness — Spec v0.8 (draft)
 
-Supersedes v0.6. Restructured around a single principle: **three independently
+Supersedes v0.7. Restructured around a single principle: **three independently
 replaceable parts, joined by two stable contracts.** Any part can be swapped
 without touching the other two. Concrete stack and deployment topology live in
 the companion file `STACK.md`; agent-facing rules in `AGENTS.md`.
 
 > Status: draft for review. Assumptions needing confirmation are marked
 > **[CONFIRM]**. Open decisions are in §11.
+>
+> **Changelog v0.7 → v0.8** — Persistent conversation/tool-call transcript
+> added (`crates/harness/src/transcript.rs`, `TRANSCRIPT_LOG_PATH`), the third
+> AGENTS.md #7 exception. Prompted by a real gap found live: debugging a
+> transaction-history bug showed there was no record anywhere of what tools
+> got called or what the model said — `docker logs` carries only boot lines,
+> and `SessionStore` is in-memory and wiped on restart. Deliberately a
+> separate file from the audit log (`audit.rs`): that log's narrow,
+> auditor-facing scope is "what write actually executed"; this is the
+> broader, noisier conversational narrative — every user message, assistant
+> answer, tool call request/result, and confirmation freeze/redeem, each a
+> typed, greppable event. Same hash-chaining/fail-loud-on-corruption posture
+> as the audit log. This resolves backlog #2 ("log hygiene") for this
+> specific artifact: it holds tool args/results verbatim by design, same as
+> the audit log; `tracing::` output still may never carry payloads.
 >
 > **Changelog v0.6 → v0.7** — M3 landed: confirmed writes enabled via
 > **adaptive tool classification** rather than the exact-name `DESTRUCTIVE_TOOLS`
@@ -266,6 +281,7 @@ DESTRUCTIVE_TOOLS=                    # exact namespaced tool names always destr
 # added at M3 — adaptive tool classification (§4.2):
 TOOL_POLICY_PATH=./arno-tool-policy.json  # persisted, hand-editable classification (AGENTS.md #7 exception)
 AUDIT_LOG_PATH=./arno-audit.jsonl         # hash-chained trail of executed frozen actions (§12.1, AGENTS.md #7 exception)
+TRANSCRIPT_LOG_PATH=./arno-transcript.jsonl  # hash-chained conversation/tool-call transcript (§12.2, AGENTS.md #7 exception)
 TOOL_POLICY_RETRY_S=300               # retry interval for tools left Pending (model was unavailable at boot)
 MCP_SERVERS=linux-mcp:<endpoint>      # endpoint: scheme://… (Streamable HTTP)
                                       #   or [Header=Value;Header2=Value2]scheme://…
@@ -400,6 +416,7 @@ Each milestone is independently useful.
 | 10 | Securo MCP auth | **Bearer token, via a generic header mechanism** | Resolves the former `[CONFIRM]` tag in §5.7. `MCP_SERVERS` gained a header-bearing HTTP form (`name:[Header=Value;...]scheme://…`); Securo's token rides `Authorization` through it. The harness never reads a `SECURO_*` var — the token is composed in at the deployment layer (compose/.env), keeping the core backend-agnostic (§5.2, AGENTS.md #6). Verified against the live Securo MCP server: `initialize` + `tools/list` succeeded (29 tools discovered) through this exact code path. Workspace scoping needs no separate var or header — confirmed live that no Securo tool takes a workspace parameter; the bearer JWT's own `ws_id` claim scopes every call server-side. |
 | 11 | Tool safety classification (M3) | **Model-classified at discovery, persisted, plain-Rust-evaluated** | Rejected: exact-name env list (can't express dual-mode-by-argument tools, and drifts open as a backend's tool list evolves); standard MCP annotations (no backend obligated to send them — Securo sends none). Adopted: the model reads each tool's name/description/schema once at discovery and emits a persisted rule (`safe`/`destructive`/`destructive_when{key,value}`); dispatch evaluates the rule synchronously, never calling the model per order (§4.2). Fail-closed: unclassified/ambiguous/drifted tools are `destructive` until a real verdict lands; a background task retries tools left pending after a model outage. `DESTRUCTIVE_TOOLS` survives as the operator's override. This required the two AGENTS.md #7 persistence exceptions (tool policy file, audit log) — see #12. **Live-verified** against the real Securo endpoint (`qwen3:4b-instruct-2507-q4_K_M`): boot classified all 29 real tools in ~24s, correctly landing 20 `safe` / 9 `destructive_when{apply,true}` — matching manual inspection exactly, with zero Securo-specific harness code. **One tool was initially misclassified** (`propose_update_recurring_transaction` → `safe`, though its schema is byte-identical in convention to its 8 correctly-classified siblings) — hand-corrected via the operator-pin escape hatch (`"source":"operator"` in the policy file) once found. This is the concrete, observed shape of the accepted risk: fail-closed catches unparseable/ambiguous verdicts, **not** a confidently wrong one — the model reasoned about the `apply` mechanism correctly in its own stated `reason` text but still emitted the wrong `class` label. Operator review of the generated policy file after first boot against a new/updated backend is a real operational step, not optional hardening. Separately live-verified: with Ollama unreachable, boot still succeeds with all 29 tools `pending` (`safe=0 destructive=0 conditional=0 pending=29`) rather than blocking; the background retry task fires correctly on `TOOL_POLICY_RETRY_S` against the real endpoint. |
 | 12 | Audit log persistence | **Hash-chained append-only JSONL, `AUDIT_LOG_PATH`** | Backlog #1 required this "before M3 runs against real books"; AGENTS.md #7 requires a spec revision before any persistent store — this is that revision. Each executed frozen action (success or failure) is appended with a hash covering its own content plus the previous entry's hash; a corrupt/tampered file aborts boot rather than silently starting a fresh chain, since tamper-evidence is the entire point. |
+| 13 | Conversation/tool-call transcript persistence | **Separate hash-chained append-only JSONL, `TRANSCRIPT_LOG_PATH`** | Rejected: folding this into the audit log — that log's narrow, auditor-facing scope ("what write executed") would blur into a much noisier general narrative (every read, every chat turn). Adopted: a structurally similar but separate module (`crates/harness/src/transcript.rs`) with its own tagged `Event` enum (`user_message`/`assistant_final`/`tool_call`/`tool_result`/`confirmation_requested`/`confirmation_redeemed`), same hash-chain-and-abort-on-corruption posture as the audit log. `confirmation_requested` is recorded here even though `audit.rs` only ever sees a *redeemed* write — this is the only durable record that a write was ever proposed at all, confirmed or not. This is the third AGENTS.md #7 exception (see #12 in AGENTS.md) and resolves backlog #2 ("log hygiene") for this artifact: verbatim tool args/results are stored by design, same posture as the audit log. |
 
 ### Still open
 
@@ -419,7 +436,7 @@ None blocking M3.
 None of these block M0–M1.
 
 1. ~~**Audit log**~~ — **Resolved in M3** (§11 decision #12): hash-chained append-only JSONL, `AUDIT_LOG_PATH`. Retention/rotation remains explicitly out of scope (ops concern, not a harness feature).
-2. **Log hygiene** — tool results and model context contain finance data; define which components may log payloads vs codes-only, plus rotation and secret handling.
+2. ~~**Log hygiene**~~ — **Resolved in v0.8** (§11 decision #13): two components are explicitly allowed to hold tool args/results verbatim — the audit log (executed writes only) and the transcript (the full conversation/tool-call narrative). Every other component, especially `tracing::` output, still may only log codes and tool names, never payloads (AGENTS.md's existing convention, unchanged). Rotation/secret handling for both files remains explicitly out of scope (ops concern, not a harness feature).
 3. **Contract tests + mock MCP server** — golden tests for the Harness API and a stub backend exercising discovery/namespacing/timeouts; health/readiness endpoints surfaced as Docker healthchecks (§11.6).
 4. **Prompt-injection stance** — record the accepted-risk rationale (read-only v1 + frozen-payload gate) and revisit when attachments/OCR land.
 5. **M3 dry-run** — the first confirmed write targets a sandbox, never production books. Since M2 confirmed workspace scoping lives entirely in the bearer JWT's `ws_id` claim (no separate `SECURO_WORKSPACE_ID` var), the sandbox boundary for M3 must be a *separate token* minted against a test workspace — not a config var the harness plumbs through.

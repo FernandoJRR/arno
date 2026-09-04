@@ -7,6 +7,7 @@ use crate::orchestrator::ToolExecutor;
 use crate::policy::ToolPolicy;
 use crate::queue::OrderJob;
 use crate::stores::{dedup::DedupStore, pending::PendingStore, sessions::SessionStore};
+use crate::transcript::TranscriptLog;
 use std::sync::Arc;
 
 pub struct AppState {
@@ -25,6 +26,9 @@ pub struct AppState {
     /// Always present in production (`main.rs` opens it unconditionally);
     /// `None` only in tests that don't exercise the redemption path.
     pub audit: Option<AuditLog>,
+    /// Persistent conversation/tool-call transcript (SPEC §12.2). Always
+    /// present in production; `None` only in tests that don't exercise it.
+    pub transcript: Option<TranscriptLog>,
 }
 
 pub type SharedState = std::sync::Arc<AppState>;

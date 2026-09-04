@@ -35,6 +35,12 @@ pub struct ChatMessage {
     /// Set on Tool messages to pair a result with the assistant tool call that
     /// produced it (context trimming must never split the pair — SPEC §8).
     pub tool_call_id: Option<String>,
+    /// Set on an Assistant message that requested tool calls — what the model
+    /// asked for (tool + args), so the *next* completion (even later in the
+    /// same order's loop) can see its own prior request instead of only the
+    /// orphaned result. Without this, a tool result travels with no matching
+    /// request ever having been shown back to the model.
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
@@ -43,6 +49,7 @@ impl ChatMessage {
             role,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -51,6 +58,18 @@ impl ChatMessage {
             role: Role::Tool,
             content: content.into(),
             tool_call_id: Some(call_id.into()),
+            tool_calls: None,
+        }
+    }
+
+    /// The assistant's own turn requesting one or more tool calls — mirrors
+    /// the native Ollama wire shape (empty `content`, a `tool_calls` array).
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: Some(calls),
         }
     }
 }

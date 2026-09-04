@@ -90,8 +90,13 @@ mod tests {
 
     #[test]
     fn never_splits_tool_result_from_assistant_call() {
-        let mut call = ChatMessage::new(Role::Assistant, "calling");
-        call.tool_call_id = Some("c1".into());
+        // Real production shape (not a hand-rolled stand-in): the assistant's
+        // actual tool-call request, as `orchestrator/mod.rs` now appends it.
+        let call = ChatMessage::assistant_tool_calls(vec![crate::model::ToolCall {
+            id: "c1".into(),
+            name: "securo.list_transactions".into(),
+            args: serde_json::json!({}),
+        }]);
         let result = ChatMessage::tool_result("c1", "result");
         let hist = vec![user("old ".repeat(200).trim_end()), call, result];
         // Budget only fits the pair → both survive or neither does.
@@ -103,6 +108,28 @@ mod tests {
             out.iter().all(|m| m.role != Role::User),
             "older turn dropped before splitting pair"
         );
+    }
+
+    #[test]
+    fn assistant_tool_call_request_survives_alongside_its_result() {
+        // Confirms the pairing logic actually engages with the real shape:
+        // both messages carry the same content either way, so this would
+        // catch a regression where `tool_calls` silently stops being grouped.
+        let call = ChatMessage::assistant_tool_calls(vec![crate::model::ToolCall {
+            id: "c1".into(),
+            name: "securo.list_transactions".into(),
+            args: serde_json::json!({"limit": 5}),
+        }]);
+        let result = ChatMessage::tool_result("c1", "result");
+        let hist = vec![call, result];
+        let out = trim(&hist, 10_000, 0);
+        assert_eq!(out.len(), 2, "both the request and its result survive");
+        assert_eq!(out[0].role, Role::Assistant);
+        assert_eq!(
+            out[0].tool_calls.as_ref().unwrap()[0].name,
+            "securo.list_transactions"
+        );
+        assert_eq!(out[1].role, Role::Tool);
     }
 
     #[test]

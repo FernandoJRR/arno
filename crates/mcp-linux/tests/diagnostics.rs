@@ -3,7 +3,7 @@
 //! same transport pair the harness registry uses for `exec:` backends.
 
 use mcp_linux::diagnostics::{
-    decode_hex_ip, parse_proc_net_tcp, parse_systemctl_units, read_mounts, unescape_mount,
+    decode_hex_ip, parse_proc_net_tcp, parse_systemctl_units, unescape_mount,
 };
 
 const PROC_TCP_FIXTURE: &str = "\
@@ -82,7 +82,7 @@ async fn stdio_round_trip_lists_tools_and_calls_disk_free() {
     let text = serde_json::to_value(&result).unwrap();
     assert!(!text.is_null(), "result carries content: {text:?}");
 
-    client.cancel().await;
+    let _ = client.cancel().await;
 }
 
 // list_all_tools convenience exists? If not, paginate manually below.

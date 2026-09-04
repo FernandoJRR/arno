@@ -168,7 +168,7 @@ HOST (Linux home server)
 ├─ ollama.service                      :11434  (GPU/model access — stays on host)
 └─ docker compose
    ├─ harness         → binds 127.0.0.1:8080   extra_hosts: "host.docker.internal:host-gateway"
-   │                     volume arno-state:/data (tool policy + audit log, M3)
+   │                     bind mount ./data:/data (tool policy + audit log + transcript, M3)
    ├─ telegram-adapter→ outbound-only (getUpdates); single replica (409 rule)
    └─ mcp-linux       → Streamable HTTP on the compose network, localhost-scoped
 ```
@@ -178,11 +178,14 @@ HOST (Linux home server)
 - Secrets enter exclusively as compose/env vars (`env_file` excluded from VCS).
 - Healthchecks: harness `GET /v1/health` (additive route), adapters process-liveness, mcp-linux MCP ping — surfaced to compose (backlog §12.3).
 - Restart policy `unless-stopped`.
-- **`arno-state` (M3, AGENTS.md #7 exceptions):** the one stateful volume in
-  this topology, holding `TOOL_POLICY_PATH` and `AUDIT_LOG_PATH`. Everything
-  else here is legitimately restart-clears; these two must survive a
-  container recreate or the harness's own memory of tool safety and its
-  record of executed writes vanish with it.
+- **`./data` (M3, AGENTS.md #7 exceptions):** the one stateful path in this
+  topology, bind-mounted (not a named volume, so the files are host-visible
+  and inspectable with plain `cat`/`jq`) holding `TOOL_POLICY_PATH`,
+  `AUDIT_LOG_PATH`, and `TRANSCRIPT_LOG_PATH` — gitignored, real finance data.
+  Everything else here is legitimately restart-clears; these three must
+  survive a container recreate or the harness's own memory of tool safety,
+  its record of executed writes, and its conversation
+  history all vanish with it.
 
 ## 7. Config ownership
 
@@ -190,7 +193,7 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
 | deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
@@ -218,6 +221,13 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
   exercised only the redemption *replay* half by seeding the pending store
   directly — these are the first to exercise the classify-then-freeze-or-
   dispatch decision itself.
+- **Transcript log (`transcript.rs`)**: same coverage shape as the audit log
+  (genesis entry, chaining, resume-on-reopen, tampered/truncated line
+  rejected, `0600` perms) plus one `api_contract.rs` integration test driving
+  a real tool-call round trip end to end and asserting the resulting file
+  contains `user_message` → `tool_call` → `tool_result` → `assistant_final`
+  in order with a valid hash chain — the concrete fix for "there's no record
+  of what tools got called."
 
 ## 9. Deliberately deferred
 

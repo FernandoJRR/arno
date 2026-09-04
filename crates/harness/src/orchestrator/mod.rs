@@ -64,13 +64,25 @@ impl ToolExecutor for NoBackends {
 /// "today" instead of the real date, silently returning zero matches for a
 /// perfectly valid, correctly-dispatched query — observed live against Securo
 /// (SPEC §8: this is a reliability constraint, not a Securo-specific fix).
+///
+/// The field-preservation rule below addresses a distinct, separately
+/// observed failure: a small model correcting one bad field after a tool
+/// error (e.g. a malformed `group_id`) tends to rebuild the whole payload
+/// from only the fields it's actively reasoning about, silently dropping
+/// other previously-correct ones (e.g. a user-specified `date`) rather than
+/// carrying them forward — even when its own prior attempt, containing the
+/// correct value, is right there in context (`assistant_tool_calls`, above).
 fn system_prompt() -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
     format!(
         "You are the home-server harness assistant called Arno. \
          Current date and time: {now}. \
          You interpret orders and answer with the help of the available tools. \
-         Be terse and factual."
+         Be terse and factual. \
+         When a tool call fails and you retry it, change only the argument(s) \
+         that caused the failure — copy every other value from your own \
+         previous attempt exactly. Never drop or reset a field the user \
+         already gave you just because you're also fixing something else."
     )
 }
 
@@ -147,6 +159,27 @@ async fn redeem(
                     tracing::error!(error = %e, tool = %action.tool, "audit log write failed");
                 }
             }
+            // Broader conversational record (SPEC §12.2) — deliberately
+            // duplicates data the audit log also holds: that log is the
+            // narrow financial ledger, this is the general narrative that
+            // happens to include writes too.
+            if let Some(transcript) = &st.transcript {
+                let ser_outcome: crate::transcript::SerOutcome = match &outcome {
+                    Ok(result) => crate::transcript::Outcome::Ok(result).into(),
+                    Err(code) => crate::transcript::Outcome::Err(code.as_str()).into(),
+                };
+                if let Err(e) = transcript.record(
+                    client_id,
+                    session_id,
+                    crate::transcript::Event::ConfirmationRedeemed {
+                        tool: &action.tool,
+                        args: &action.args,
+                        outcome: ser_outcome,
+                    },
+                ) {
+                    tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
+                }
+            }
             match outcome {
                 Ok(result) => Ok(Response {
                     text: format!("Executed `{}`.", action.tool),
@@ -173,6 +206,15 @@ async fn normal_path(
     order: contract::Order,
 ) -> Result<Response, ApiError> {
     let key = (client_id.to_owned(), order.session_id.clone());
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            &order.session_id,
+            crate::transcript::Event::UserMessage { text: &order.text },
+        )
+    {
+        tracing::error!(error = %e, "transcript log write failed");
+    }
     st.sessions.append(
         &key,
         crate::model::ChatMessage::new(crate::model::Role::User, order.text),
@@ -214,6 +256,15 @@ async fn normal_path(
             .map_err(model_error_to_api)?
         {
             crate::model::CompletionOutput::Final(text) => {
+                if let Some(transcript) = &st.transcript
+                    && let Err(e) = transcript.record(
+                        client_id,
+                        &order.session_id,
+                        crate::transcript::Event::AssistantFinal { text: &text },
+                    )
+                {
+                    tracing::error!(error = %e, "transcript log write failed");
+                }
                 st.sessions.append(
                     &key,
                     crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
@@ -222,7 +273,27 @@ async fn normal_path(
             }
             crate::model::CompletionOutput::ToolCalls(calls) => {
                 dispatched_tool_calls += calls.len() as u32;
+                // The model's own request, remembered — without this the next
+                // completion (even later in this same loop) sees only an
+                // orphaned tool result, never what was actually asked for.
+                st.sessions.append(
+                    &key,
+                    crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
+                );
                 for call in calls {
+                    if let Some(transcript) = &st.transcript
+                        && let Err(e) = transcript.record(
+                            client_id,
+                            &order.session_id,
+                            crate::transcript::Event::ToolCall {
+                                call_id: &call.id,
+                                tool: &call.name,
+                                args: &call.args,
+                            },
+                        )
+                    {
+                        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                    }
                     // Classification is model-authored ahead of time, never
                     // ahead of this specific order (SPEC §4.2, AGENTS.md #3):
                     // this is a synchronous lookup against the persisted
@@ -236,6 +307,18 @@ async fn normal_path(
                             call.name.clone(),
                             call.args.clone(),
                         );
+                        if let Some(transcript) = &st.transcript
+                            && let Err(e) = transcript.record(
+                                client_id,
+                                &order.session_id,
+                                crate::transcript::Event::ConfirmationRequested {
+                                    tool: &call.name,
+                                    args: &call.args,
+                                },
+                            )
+                        {
+                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                        }
                         return Ok(Response {
                             text: format!(
                                 "This would run `{}` with {}. \
@@ -253,16 +336,71 @@ async fn normal_path(
                         .execute(&call.name, &call.args)
                         .await
                         .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()));
+                    if let Some(transcript) = &st.transcript
+                        && let Err(e) = transcript.record(
+                            client_id,
+                            &order.session_id,
+                            crate::transcript::Event::ToolResult {
+                                call_id: &call.id,
+                                tool: &call.name,
+                                result: &result,
+                            },
+                        )
+                    {
+                        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                    }
                     st.sessions.append(
                         &key,
                         crate::model::ChatMessage::tool_result(call.id.clone(), result.to_string()),
                     );
+                    // A static system-prompt rule competes poorly against
+                    // whatever's most recent in context (small-model recency
+                    // bias — the same effect that drops a field on correction
+                    // also works in our favor here). So instead of only
+                    // relying on system_prompt(), inject a fresh, situational
+                    // instruction right when a failure actually happened,
+                    // maximally recent for the next completion. This cannot
+                    // force a tool call (Ollama's `tool_choice` is a documented
+                    // no-op on this runtime — verified live), only nudge; the
+                    // model can still legitimately choose to ask the user a
+                    // question instead of retrying blind.
+                    if looks_like_error(&result) {
+                        st.sessions.append(
+                            &key,
+                            crate::model::ChatMessage::new(crate::model::Role::User, RETRY_NUDGE),
+                        );
+                    }
                 }
                 if dispatched_tool_calls > st.cfg.max_tool_calls {
                     return Err(ApiError(ErrorCode::OrderBudgetExceeded));
                 }
             }
         }
+    }
+}
+
+const RETRY_NUDGE: &str = "\
+The previous tool call did not succeed. If you have enough information, call \
+the tool again right now with corrected arguments — keep every previously- \
+correct value, change only what caused the failure. If you genuinely need \
+more information, ask the user one direct question instead. Do not say you \
+will retry or check something later without actually doing it in this turn.";
+
+/// Backend-agnostic (AGENTS.md #1) heuristic, not a guarantee: our own
+/// harness-defined tags (`tool_error`, the `backend_unavailable` error code)
+/// are always reliable; a bare top-level `error`/`errors` key is a common
+/// enough REST/API convention to treat as a weak signal. A false positive
+/// just adds a harmless extra nudge; a false negative just falls back to
+/// today's behavior — so erring permissive here costs little either way.
+fn looks_like_error(result: &serde_json::Value) -> bool {
+    match result {
+        serde_json::Value::Object(map) => {
+            map.contains_key("tool_error")
+                || map.contains_key("error")
+                || map.contains_key("errors")
+        }
+        serde_json::Value::String(s) => s == contract::ErrorCode::BackendUnavailable.as_str(),
+        _ => false,
     }
 }
 
@@ -285,4 +423,31 @@ fn render_args(args: &serde_json::Value) -> String {
 fn model_error_to_api(e: crate::model::ModelError) -> ApiError {
     tracing::warn!(error = %e, "model provider failure");
     ApiError(ErrorCode::BackendUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_error_recognizes_harness_and_common_backend_shapes() {
+        assert!(looks_like_error(
+            &serde_json::json!({"tool_error": "Tool error: bad uuid"})
+        ));
+        assert!(looks_like_error(
+            &serde_json::json!({"error": "group_id and splits must be provided together"})
+        ));
+        assert!(looks_like_error(&serde_json::json!({"errors": ["a", "b"]})));
+        assert!(looks_like_error(&serde_json::json!("backend_unavailable")));
+    }
+
+    #[test]
+    fn looks_like_error_does_not_flag_ordinary_results() {
+        assert!(!looks_like_error(&serde_json::json!({"total": 8})));
+        assert!(!looks_like_error(&serde_json::json!("some text answer")));
+        assert!(!looks_like_error(&serde_json::json!(null)));
+        assert!(!looks_like_error(
+            &serde_json::json!({"description": "grocery run", "amount": 50})
+        ));
+    }
 }
