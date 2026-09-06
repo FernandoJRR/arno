@@ -27,6 +27,14 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(args.timeout_secs))
         .build()?;
 
+    // Per-process nonce, not just the loop index: the harness dedups on
+    // (client_id, client_msg_id) for DEDUP_WINDOW_MIN, and a bare
+    // enumerate() index restarts at 0 every launch.
+    let boot_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
     let stdin = std::io::stdin();
     for (n, line) in stdin.lock().lines().enumerate() {
         let text = line?;
@@ -39,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         let order = Order {
             session_id: args.session.clone(),
             text,
-            client_msg_id: Some(n.to_string()),
+            client_msg_id: Some(format!("{boot_id}-{n}")),
             confirmation_token: None,
             attachments: Vec::new(),
         };
@@ -63,11 +71,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn render(r: Response) {
+    // Confirmation (SPEC §4.3 revised) is harness-interpreted from plain
+    // text now — `r.text` alone already carries the instruction.
     println!("{}", r.text);
-    if r.needs_confirmation == Some(true)
-        && let Some(token) = r.confirmation_token
-    {
-        // M0 has no destructive tools; the hint documents the shape only.
-        println!("[confirmation required — token {token}]");
-    }
 }

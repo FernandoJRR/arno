@@ -51,7 +51,14 @@ Adapters must not depend on `harness`; `harness` must not depend on adapters.
 3. **The model never executes confirmed actions.** A redemption path dispatches
    the stored frozen payload verbatim over MCP with zero model involvement, and
    the token is deleted *before* dispatch. Destructive calls are never dispatched
-   on model output alone and **never auto-retried** (SPEC §4.3, §8).
+   on model output alone and **never auto-retried** (SPEC §4.3, §8). Confirmation
+   *interpretation* is model-driven (`crates/harness/src/confirm.rs`, SPEC §4.3
+   revised) — the model judges whether a reply constitutes consent to a pending
+   action. This does not weaken this rule: the classifier decides only *whether*,
+   never *what* — it cannot see or alter the frozen payload, only whether a
+   `redeem()` call happens at all. If you're touching confirmation code and find
+   yourself passing the model anything it could use to influence *content* rather
+   than *consent*, stop — that crosses this rule.
 4. **All model access goes through the `ModelProvider` trait.** No direct HTTP to
    Ollama outside `harness/src/model/ollama.rs`.
 5. **One order in flight.** The global FIFO queue is what makes session access

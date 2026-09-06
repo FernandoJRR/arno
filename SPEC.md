@@ -1,12 +1,31 @@
-# Home Server Harness — Spec v0.8 (draft)
+# Home Server Harness — Spec v0.9 (draft)
 
-Supersedes v0.7. Restructured around a single principle: **three independently
+Supersedes v0.8. Restructured around a single principle: **three independently
 replaceable parts, joined by two stable contracts.** Any part can be swapped
 without touching the other two. Concrete stack and deployment topology live in
 the companion file `STACK.md`; agent-facing rules in `AGENTS.md`.
 
 > Status: draft for review. Assumptions needing confirmation are marked
 > **[CONFIRM]**. Open decisions are in §11.
+>
+> **Changelog v0.8 → v0.9** — Confirmation moved from each adapter into the
+> harness core and became model-interpreted (§4.3, revised). Prompted by two
+> real, adapter-level bugs found live: `adapter-cli` never implemented
+> redemption at all (every order hardcoded `confirmation_token: None`, so a
+> destructive action proposed through it could never execute, no matter how
+> many times the model claimed success — seen directly in a real transcript);
+> `adapter-telegram` only redeemed on the exact literal `[CONFIRM]` and
+> discarded the pending token on any other reply. Both were symptoms of one
+> mistake: confirmation was implemented per-adapter, when the harness already
+> holds both the pending-action store and the model. New module
+> `crates/harness/src/confirm.rs` mirrors `policy.rs`'s classifier shape
+> exactly (free function, `Option` not `Result`, strict single-line JSON
+> contract, every failure fails closed) to judge confirm/reject/unrelated — a
+> `confirm` verdict dispatches through the same unchanged `redeem()`, so
+> AGENTS.md #3 (model never executes a confirmed action, bypassed at
+> execution) is fully intact: the model only ever judges *whether consent was
+> given*, never *what* would execute. `CONFIRM_MODE=token_only` restores the
+> strict pre-revision exact-token-only behavior without a redeploy.
 >
 > **Changelog v0.7 → v0.8** — Persistent conversation/tool-call transcript
 > added (`crates/harness/src/transcript.rs`, `TRANSCRIPT_LOG_PATH`), the third
@@ -220,10 +239,42 @@ Destructive tools are never dispatched on the model's word alone. The gate is a
 - **Token rules:** single-use; TTL `CONFIRM_TTL_MIN` (default 10); bound to the
   issuing client and session. Invalid redemptions return the distinct error codes
   `confirmation_unknown` / `confirmation_expired` / `confirmation_used`.
-- **Text while an action is pending:** plain-text Orders are processed as fresh
-  orders (the model may propose again → new frozen payload + new token). There is
-  no implicit "yes" and no natural-language confirmation parsing; only a
-  token-bearing Order redeems. Stale pendings simply expire.
+- **Text while an action is pending (revised, M-confirm):** an explicit
+  `confirmation_token` on the Order still redeems outright — that contract path is
+  unchanged. For everything else, the harness itself classifies the client's plain
+  text against the single most recent unexpired pending action for that
+  `(client_id, session_id)` (`crate::confirm`, harness-internal, never exposed to
+  adapters — AGENTS.md: adapters must not reach a model). The classifier answers
+  exactly one of three things:
+  - **Confirm** — dispatches through the same unchanged redemption path: frozen
+    payload verbatim, model bypassed at execution, token deleted before dispatch.
+  - **Reject** — the action is cancelled immediately (`PendingStore::cancel`,
+    same single-use bookkeeping as a redemption) rather than left to expire; a
+    later message can never resurrect it.
+  - **Unrelated** (including every classifier failure — unreachable model,
+    timeout, unparseable output) — the message falls through and is processed as
+    an ordinary fresh order, exactly as the pre-revision behavior was. A pending
+    action is confirmable any time up to `CONFIRM_TTL_MIN`, not only on the very
+    next message — you may ask clarifying questions first.
+
+  **What this does and does not change.** This revises the prior "no implicit
+  yes, no natural-language confirmation parsing" rule — that is the explicit
+  point of the change. It does **not** touch AGENTS.md #3: the model still never
+  executes a confirmed action, and can never see or alter *what* would execute —
+  it only ever judges *whether consent was given*, from the same rendered
+  arguments already shown in the proposal. `CONFIRM_MODE=token_only` (§5.7)
+  restores the strict pre-revision behavior without a code change, for anyone who
+  wants the exact-token-only guarantee back.
+
+  **Accepted risks, stated rather than buried:** a wrong `confirm` verdict
+  executes a real write — bounded by the action already having been rendered to
+  the user and being unalterable by the model, but a genuine weakening versus an
+  exact string match. The pending action's own args (model/user-derived text) are
+  visible to the classifier, so crafted content is a theoretical prompt-injection
+  vector against the verdict, mitigated but not eliminated by prompt wording and
+  the strict three-value output contract. The `CONFIRM_TTL_MIN`-wide window means
+  a "yes" said several turns later, possibly about something else, could be
+  judged a confirmation of an older pending write.
 - **Echo:** a successfully executed confirmation includes `{tool, args, result}`
   in the Response's `structured` field. Every redemption attempt — success or
   failure — is additionally appended to the persistent, hash-chained audit
@@ -273,6 +324,9 @@ MAX_TOOL_CALLS=8                     # tool-call cap per order (runaway-loop sto
 DEDUP_WINDOW_MIN=60                  # client_msg_id dedup window
 SESSION_TTL_H=24                     # idle session expiry
 CONFIRM_TTL_MIN=10                   # confirmation-token lifetime
+CONFIRM_MODE=model                   # model|token_only — model-interpreted
+                                      #   consent (§4.3, revised) vs. the strict
+                                      #   pre-revision explicit-token-only behavior
 ATTACH_MAX_BYTES=10485760            # inline attachment cap (raw bytes)
 DESTRUCTIVE_TOOLS=                    # exact namespaced tool names always destructive,
                                       #   regardless of args (§4.2) — the operator's
@@ -401,7 +455,7 @@ Each milestone is independently useful.
 
 ## 11. Decisions
 
-### Resolved (v0.4–v0.7)
+### Resolved (v0.4–v0.9)
 
 | # | Question | Outcome | Notes |
 |---|---|---|---|
@@ -417,6 +471,7 @@ Each milestone is independently useful.
 | 11 | Tool safety classification (M3) | **Model-classified at discovery, persisted, plain-Rust-evaluated** | Rejected: exact-name env list (can't express dual-mode-by-argument tools, and drifts open as a backend's tool list evolves); standard MCP annotations (no backend obligated to send them — Securo sends none). Adopted: the model reads each tool's name/description/schema once at discovery and emits a persisted rule (`safe`/`destructive`/`destructive_when{key,value}`); dispatch evaluates the rule synchronously, never calling the model per order (§4.2). Fail-closed: unclassified/ambiguous/drifted tools are `destructive` until a real verdict lands; a background task retries tools left pending after a model outage. `DESTRUCTIVE_TOOLS` survives as the operator's override. This required the two AGENTS.md #7 persistence exceptions (tool policy file, audit log) — see #12. **Live-verified** against the real Securo endpoint (`qwen3:4b-instruct-2507-q4_K_M`): boot classified all 29 real tools in ~24s, correctly landing 20 `safe` / 9 `destructive_when{apply,true}` — matching manual inspection exactly, with zero Securo-specific harness code. **One tool was initially misclassified** (`propose_update_recurring_transaction` → `safe`, though its schema is byte-identical in convention to its 8 correctly-classified siblings) — hand-corrected via the operator-pin escape hatch (`"source":"operator"` in the policy file) once found. This is the concrete, observed shape of the accepted risk: fail-closed catches unparseable/ambiguous verdicts, **not** a confidently wrong one — the model reasoned about the `apply` mechanism correctly in its own stated `reason` text but still emitted the wrong `class` label. Operator review of the generated policy file after first boot against a new/updated backend is a real operational step, not optional hardening. Separately live-verified: with Ollama unreachable, boot still succeeds with all 29 tools `pending` (`safe=0 destructive=0 conditional=0 pending=29`) rather than blocking; the background retry task fires correctly on `TOOL_POLICY_RETRY_S` against the real endpoint. |
 | 12 | Audit log persistence | **Hash-chained append-only JSONL, `AUDIT_LOG_PATH`** | Backlog #1 required this "before M3 runs against real books"; AGENTS.md #7 requires a spec revision before any persistent store — this is that revision. Each executed frozen action (success or failure) is appended with a hash covering its own content plus the previous entry's hash; a corrupt/tampered file aborts boot rather than silently starting a fresh chain, since tamper-evidence is the entire point. |
 | 13 | Conversation/tool-call transcript persistence | **Separate hash-chained append-only JSONL, `TRANSCRIPT_LOG_PATH`** | Rejected: folding this into the audit log — that log's narrow, auditor-facing scope ("what write executed") would blur into a much noisier general narrative (every read, every chat turn). Adopted: a structurally similar but separate module (`crates/harness/src/transcript.rs`) with its own tagged `Event` enum (`user_message`/`assistant_final`/`tool_call`/`tool_result`/`confirmation_requested`/`confirmation_redeemed`), same hash-chain-and-abort-on-corruption posture as the audit log. `confirmation_requested` is recorded here even though `audit.rs` only ever sees a *redeemed* write — this is the only durable record that a write was ever proposed at all, confirmed or not. This is the third AGENTS.md #7 exception (see #12 in AGENTS.md) and resolves backlog #2 ("log hygiene") for this artifact: verbatim tool args/results are stored by design, same posture as the audit log. |
+| 14 | Confirmation ownership and interpretation | **Moved into the harness core (`crate::confirm`); model-interpreted with a `token_only` escape hatch** | Rejected: fixing each adapter's confirmation handling separately — the actual bug was that confirmation was an adapter concern at all, when `AGENTS.md` already forbids adapters reaching a model and the harness already owns the pending-action store; widening `adapter-telegram`'s literal string list (e.g. accepting "yes"/"ok" alongside `[CONFIRM]`) — still just enumerating phrasings, the exact approach rejected. Adopted: one classifier (`crate::confirm`, mirroring `policy.rs`'s proven shape) judges confirm/reject/unrelated for *any* client uniformly; `Confirm` dispatches through the unchanged `redeem()` (AGENTS.md #3 intact — the model judges consent, never content, and can neither see nor alter what executes); `Reject` cancels immediately via a new `PendingStore::cancel`; every failure mode (unreachable model, timeout, unparseable output) is treated identically to `Unrelated`, since unlike `policy.rs`'s tool classification this sits *on* the request path with no pre-computed synchronous default available. `CONFIRM_MODE=token_only` restores the strict exact-token behavior without a redeploy. Found live: `adapter-cli` hardcoded `confirmation_token: None` on every order and only ever printed a token it never resent — a destructive action proposed through it could never execute, confirmed by a real transcript showing the model repeatedly claiming success for a transaction that never ran; `adapter-telegram` discarded its own pending token on any reply other than the exact literal `[CONFIRM]`. |
 
 ### Still open
 

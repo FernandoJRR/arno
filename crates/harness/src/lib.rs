@@ -6,6 +6,7 @@
 pub mod api;
 pub mod audit;
 pub mod config;
+pub mod confirm;
 pub mod mcp;
 pub mod model;
 pub mod orchestrator;

@@ -1,53 +1,21 @@
-//! Pure Order/Response mapping (SPEC §4.1, §4.3) — no Telegram/HTTP types here
-//! so the confirmation round trip and error rendering stay unit-testable.
+//! Pure Order/Response mapping (SPEC §4.1) — no Telegram/HTTP types here so
+//! error rendering stays unit-testable.
+//!
+//! Confirmation (SPEC §4.3 revised) is now the harness's job — every order
+//! here just carries the message text with `confirmation_token: None`.
 
-use contract::{ErrorCode, Order, Response};
+use contract::{ErrorCode, Order};
 
-/// The literal reply that redeems a pending `confirmation_token` (SPEC §4.3).
-pub fn is_confirm_phrase(text: &str) -> bool {
-    text.trim().eq_ignore_ascii_case("[confirm]")
-}
-
-/// Builds the next `Order` for a chat. `pending_token` is `Some` only when the
-/// incoming text is the `[CONFIRM]` phrase and a token is on file for this
-/// chat — in that case the order redeems it verbatim with empty `text`
-/// (SPEC §4.3); otherwise it's a fresh order carrying the message text.
-pub fn build_order(
-    session_id: String,
-    client_msg_id: String,
-    text: String,
-    pending_token: Option<String>,
-) -> Order {
-    match pending_token {
-        Some(token) => Order {
-            session_id,
-            text: String::new(),
-            client_msg_id: Some(client_msg_id),
-            confirmation_token: Some(token),
-            attachments: Vec::new(),
-        },
-        None => Order {
-            session_id,
-            text,
-            client_msg_id: Some(client_msg_id),
-            confirmation_token: None,
-            attachments: Vec::new(),
-        },
+/// Builds the next `Order` for a chat — the harness decides on its own
+/// whether it confirms anything pending.
+pub fn build_order(session_id: String, client_msg_id: String, text: String) -> Order {
+    Order {
+        session_id,
+        text,
+        client_msg_id: Some(client_msg_id),
+        confirmation_token: None,
+        attachments: Vec::new(),
     }
-}
-
-/// Renders a successful `Response` to display text, plus a confirmation token
-/// to remember for this chat when one was minted (SPEC §4.3).
-pub fn render_response(resp: &Response) -> (String, Option<String>) {
-    let mut text = resp.text.clone();
-    let mut pending = None;
-    if resp.needs_confirmation == Some(true)
-        && let Some(token) = &resp.confirmation_token
-    {
-        text.push_str("\n\nReply [CONFIRM] to proceed.");
-        pending = Some(token.clone());
-    }
-    (text, pending)
 }
 
 /// Terse, code-derived text only — never the underlying payload (AGENTS.md
@@ -72,53 +40,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confirm_phrase_is_case_and_whitespace_insensitive() {
-        assert!(is_confirm_phrase("[CONFIRM]"));
-        assert!(is_confirm_phrase("  [confirm]  "));
-        assert!(!is_confirm_phrase("confirm"));
-        assert!(!is_confirm_phrase("[confirm] please"));
-    }
-
-    #[test]
-    fn fresh_order_carries_text_and_no_token() {
-        let order = build_order("chat:1".into(), "42".into(), "hello".into(), None);
+    fn order_carries_text_with_no_confirmation_token() {
+        let order = build_order("chat:1".into(), "42".into(), "hello".into());
         assert_eq!(order.text, "hello");
         assert_eq!(order.session_id, "chat:1");
         assert_eq!(order.client_msg_id.as_deref(), Some("42"));
         assert_eq!(order.confirmation_token, None);
-    }
-
-    #[test]
-    fn redemption_order_has_empty_text_and_carries_token() {
-        let order = build_order(
-            "chat:1".into(),
-            "43".into(),
-            "[CONFIRM]".into(),
-            Some("tok-abc".into()),
-        );
-        assert_eq!(order.text, "");
-        assert_eq!(order.confirmation_token.as_deref(), Some("tok-abc"));
-    }
-
-    #[test]
-    fn response_without_confirmation_yields_no_pending_token() {
-        let (text, pending) = render_response(&Response::text("done"));
-        assert_eq!(text, "done");
-        assert_eq!(pending, None);
-    }
-
-    #[test]
-    fn response_needing_confirmation_appends_prompt_and_returns_token() {
-        let resp = Response {
-            text: "about to delete something".into(),
-            needs_confirmation: Some(true),
-            confirmation_token: Some("tok-xyz".into()),
-            structured: None,
-        };
-        let (text, pending) = render_response(&resp);
-        assert!(text.starts_with("about to delete something"));
-        assert!(text.contains("[CONFIRM]"));
-        assert_eq!(pending.as_deref(), Some("tok-xyz"));
     }
 
     #[test]

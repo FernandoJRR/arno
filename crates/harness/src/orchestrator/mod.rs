@@ -6,6 +6,7 @@
 pub mod context;
 
 use crate::api::error::ApiError;
+use crate::confirm;
 use crate::state::AppState;
 use crate::stores::pending::TakeOutcome;
 use contract::{ErrorCode, Response, StructuredItem};
@@ -104,13 +105,67 @@ pub async fn handle(
         return Err(ApiError(ErrorCode::DuplicateOrder));
     }
 
-    // SPEC §6 step 3 — redemption path: frozen payload dispatched verbatim,
-    // zero model involvement.
+    // SPEC §6 step 3 — redemption path, unchanged: explicit token always
+    // wins, even in token_only mode.
     if let Some(token) = order.confirmation_token.as_deref() {
         return redeem(st, client_id, &order.session_id, token).await;
     }
 
+    // SPEC §4.3 revised, AGENTS.md #3: model judges consent only; Confirm
+    // still dispatches through the unchanged redeem(). peek_latest doesn't
+    // consume, so Unrelated/failure just falls through to normal_path.
+    if cfg.confirm_mode == crate::config::ConfirmMode::Model
+        && let Some((token, action)) =
+            st.pending
+                .peek_latest(client_id, &order.session_id, cfg.confirm_ttl)
+    {
+        let verdict = confirm::classify(
+            st.provider.as_ref(),
+            &action.tool,
+            &action.args,
+            &order.text,
+        )
+        .await;
+        match verdict {
+            Some(confirm::Verdict::Confirm) => {
+                return redeem(st, client_id, &order.session_id, &token).await;
+            }
+            Some(confirm::Verdict::Reject) => {
+                return Ok(reject_pending(st, client_id, &order.session_id, &token, action).await);
+            }
+            Some(confirm::Verdict::Unrelated) | None => {
+                // Falls through to normal_path as an ordinary order.
+            }
+        }
+    }
+
     normal_path(st, client_id, order).await
+}
+
+/// Cancels a pending action the model judged declined — single-use via
+/// `PendingStore::cancel`, so it can never later be redeemed. Mirrors
+/// `redeem()`'s footprint: transcript only, no `SessionStore` touch.
+async fn reject_pending(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    token: &str,
+    action: crate::stores::pending::PendingAction,
+) -> Response {
+    st.pending.cancel(client_id, session_id, token);
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            session_id,
+            crate::transcript::Event::ConfirmationCancelled {
+                tool: &action.tool,
+                args: &action.args,
+            },
+        )
+    {
+        tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
+    }
+    Response::text(format!("Cancelled `{}`.", action.tool))
 }
 
 fn validate_attachments(order: &contract::Order, cap: usize) -> Result<(), ApiError> {
@@ -320,9 +375,11 @@ async fn normal_path(
                             tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
                         }
                         return Ok(Response {
+                            // SPEC §4.3 revised: most clients now confirm by
+                            // replying naturally; confirmation_token below
+                            // still works too, just isn't the only way.
                             text: format!(
-                                "This would run `{}` with {}. \
-                                 Resend with confirmation_token to execute it.",
+                                "This would run `{}` with {}. Reply to confirm or say no to cancel.",
                                 call.name,
                                 render_args(&call.args)
                             ),

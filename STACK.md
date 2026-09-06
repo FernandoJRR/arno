@@ -193,7 +193,7 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (`model`\|`token_only`, §4.3 revised), `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
 | deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
@@ -228,6 +228,23 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
   contains `user_message` → `tool_call` → `tool_result` → `assistant_final`
   in order with a valid hash chain — the concrete fix for "there's no record
   of what tools got called."
+- **Confirmation classifier (§4.3 revised, `confirm.rs`)**: same
+  scripted-`ModelProvider` shape as the tool-policy classifier — clean
+  confirm/reject/unrelated verdicts, code-fenced JSON tolerance, prose-only
+  output, an unknown verdict string, a down provider, and a tool-call output
+  from the provider, all failing closed to `None` (never `Confirm`, asserted
+  explicitly). `pending.rs` gains coverage for `peek_latest` (newest-of-several,
+  TTL, client/session isolation, non-consuming) and `cancel` (single-use,
+  matching `take`'s bookkeeping). `api_contract.rs` adds end-to-end coverage a
+  static `FixedProvider` can't give: a `ScriptedProvider` that branches on
+  whether the request is `confirm::classify`'s call or an ordinary
+  `normal_path` completion (the two share the same `ModelProvider::complete`
+  seam, distinguished only by the classifier's fixed system-prompt content) —
+  plain "yes" dispatches the frozen payload exactly once; plain "no" cancels
+  it and a later "yes" cannot resurrect it; an unrelated reply falls through
+  to `normal_path` leaving the pending action redeemable by a real token
+  afterward; a classifier failure falls through the same way — nothing ever
+  executes on an unparseable or unreachable verdict.
 
 ## 9. Deliberately deferred
 

@@ -44,6 +44,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         dedup_window: Duration::from_secs(60),
         session_ttl: Duration::from_secs(3600),
         confirm_ttl,
+        confirm_mode: harness::config::ConfirmMode::Model,
         attach_max_bytes: 64,
         destructive_tools: ["securo.create_transaction".to_owned()]
             .into_iter()
@@ -751,4 +752,200 @@ async fn unknown_and_expired_tokens_give_distinct_codes() {
     let (s, e) = post_order(api_router(expired.state), &body, Some("tok-cli")).await;
     assert_eq!(s, StatusCode::GONE);
     assert_eq!(e["error_code"], "confirmation_expired");
+}
+
+// ---- model-interpreted confirmation (SPEC §4.3, revised) ----
+//
+// `confirm::classify` and `normal_path` share one `ModelProvider::complete`
+// seam, so this provider scripts its reply by inspecting request content
+// (the classifier's system prompt) rather than by wiremock URL matching.
+
+struct ScriptedProvider {
+    /// Reply for a `confirm::classify` call.
+    confirm_reply: &'static str,
+    /// Reply for an ordinary `normal_path` completion.
+    normal_reply: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ScriptedProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        let is_confirm_call = req
+            .messages
+            .first()
+            .is_some_and(|m| m.content.contains("confirmation classifier"));
+        Ok(CompletionOutput::Final(
+            if is_confirm_call {
+                self.confirm_reply
+            } else {
+                self.normal_reply
+            }
+            .to_owned(),
+        ))
+    }
+}
+
+fn confirm_rig(provider: ScriptedProvider, behavior: ExecBehavior) -> RedemptionRig {
+    let cfg = test_config("http://127.0.0.1:1".into(), Duration::from_secs(600));
+    let executor = RecordingExecutor::new(behavior);
+    let state = build_state(cfg, Arc::new(provider), Arc::new(executor.clone()));
+    RedemptionRig { state, executor }
+}
+
+#[tokio::test]
+async fn plain_yes_confirms_and_dispatches_the_frozen_payload() {
+    let rig = confirm_rig(
+        ScriptedProvider {
+            confirm_reply: r#"{"verdict":"confirm","reason":"clear yes"}"#,
+            normal_reply: "unused — must not be reached",
+        },
+        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+    );
+    rig.state.pending.freeze(
+        "cli",
+        "s1",
+        "securo.create_transaction".into(),
+        serde_json::json!({"amount": 42}),
+    );
+
+    let body = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m1"});
+    let (status, resp) =
+        post_order(api_router(rig.state), &body.to_string(), Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["text"], "Executed `securo.create_transaction`.");
+    assert_eq!(
+        rig.executor.calls.lock().unwrap().len(),
+        1,
+        "the frozen payload dispatched exactly once"
+    );
+}
+
+#[tokio::test]
+async fn plain_no_cancels_and_a_later_yes_does_not_resurrect_it() {
+    let rig = confirm_rig(
+        ScriptedProvider {
+            confirm_reply: r#"{"verdict":"reject","reason":"declines"}"#,
+            normal_reply: "ok, understood",
+        },
+        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+    );
+    rig.state.pending.freeze(
+        "cli",
+        "s1",
+        "securo.create_transaction".into(),
+        serde_json::json!({"amount": 42}),
+    );
+
+    let body =
+        serde_json::json!({"session_id": "s1", "text": "no, cancel that", "client_msg_id": "m1"});
+    let (status, resp) = post_order(
+        api_router(rig.state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["text"], "Cancelled `securo.create_transaction`.");
+    assert_eq!(
+        rig.executor.calls.lock().unwrap().len(),
+        0,
+        "a rejected action must never dispatch"
+    );
+
+    // A later "yes" has nothing left to confirm — cancel() already moved the
+    // token to `used`, so peek_latest sees no pending action at all and this
+    // just becomes an ordinary order.
+    let body2 = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m2"});
+    let (status2, resp2) = post_order(
+        api_router(rig.state.clone()),
+        &body2.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(resp2["text"], "ok, understood");
+    assert_eq!(
+        rig.executor.calls.lock().unwrap().len(),
+        0,
+        "still never dispatched — a rejected action cannot be resurrected"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_message_falls_through_leaving_the_pending_action_untouched() {
+    let rig = confirm_rig(
+        ScriptedProvider {
+            confirm_reply: r#"{"verdict":"unrelated","reason":"different topic"}"#,
+            normal_reply: "it's sunny today",
+        },
+        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+    );
+    let token = rig.state.pending.freeze(
+        "cli",
+        "s1",
+        "securo.create_transaction".into(),
+        serde_json::json!({"amount": 42}),
+    );
+
+    let body = serde_json::json!({"session_id": "s1", "text": "what's the weather like", "client_msg_id": "m1"});
+    let (status, resp) = post_order(
+        api_router(rig.state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp["text"], "it's sunny today",
+        "fell through to normal_path"
+    );
+    assert_eq!(
+        rig.executor.calls.lock().unwrap().len(),
+        0,
+        "not dispatched"
+    );
+
+    // The pending action is untouched (peek_latest never consumes) — a
+    // real confirmation_token redemption still works afterward.
+    let redeem_body =
+        serde_json::json!({"session_id": "s1", "text": "", "confirmation_token": token});
+    let (redeem_status, redeem_resp) = post_order(
+        api_router(rig.state.clone()),
+        &redeem_body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(redeem_status, StatusCode::OK);
+    assert_eq!(redeem_resp["text"], "Executed `securo.create_transaction`.");
+}
+
+#[tokio::test]
+async fn classifier_failure_fails_closed_nothing_executes() {
+    let rig = confirm_rig(
+        ScriptedProvider {
+            // Neither a valid classify verdict nor parseable in any way —
+            // classify() returns None, which must behave identically to
+            // Unrelated: fall through, never confirm.
+            confirm_reply: "I cannot decide.",
+            normal_reply: "here's an ordinary answer",
+        },
+        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+    );
+    rig.state.pending.freeze(
+        "cli",
+        "s1",
+        "securo.create_transaction".into(),
+        serde_json::json!({"amount": 42}),
+    );
+
+    let body = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m1"});
+    let (status, resp) =
+        post_order(api_router(rig.state), &body.to_string(), Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["text"], "here's an ordinary answer");
+    assert_eq!(
+        rig.executor.calls.lock().unwrap().len(),
+        0,
+        "a classifier failure must never execute a pending write"
+    );
 }

@@ -111,6 +111,45 @@ impl PendingStore {
         inner.live.retain(|_, a| a.created.elapsed() < ttl);
         inner.used.retain(|_, t| t.elapsed() < ttl);
     }
+
+    /// Read-only lookup for model-interpreted confirmation (SPEC §4.3
+    /// revised): the newest unexpired pending action for this client+session,
+    /// without consuming it. Same client/session isolation as `take`.
+    pub fn peek_latest(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        ttl: Duration,
+    ) -> Option<(String, PendingAction)> {
+        let inner = self.0.lock().expect("pending lock");
+        inner
+            .live
+            .iter()
+            .filter(|((c, s, _), action)| {
+                c == client_id && s == session_id && action.created.elapsed() < ttl
+            })
+            .max_by_key(|(_, action)| action.created)
+            .map(|((_, _, token), action)| (token.clone(), action.clone()))
+    }
+
+    /// Discards a pending action without dispatching it (explicit rejection,
+    /// SPEC §4.3 revised) — same single-use move to `used` as `take`, so it
+    /// can never later be redeemed. `false` if the token was already gone.
+    pub fn cancel(&self, client_id: &str, session_id: &str, token: &str) -> bool {
+        let key: PendingKey = (
+            client_id.to_owned(),
+            session_id.to_owned(),
+            token.to_owned(),
+        );
+        let mut inner = self.0.lock().expect("pending lock");
+        match inner.live.remove(&key) {
+            Some(_) => {
+                inner.used.insert(key, Instant::now());
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// 128 bits of CSPRNG output, hex-encoded (SPEC §4.3).
@@ -202,5 +241,77 @@ mod tests {
             store2.take("cli", "s", &tok, Duration::from_secs(3600)),
             TakeOutcome::Action(_)
         ));
+    }
+
+    #[test]
+    fn peek_latest_returns_the_newest_of_several_pendings() {
+        let store = PendingStore::new();
+        let first = store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = store.freeze("cli", "s", "tool.b".into(), serde_json::json!({}));
+
+        let (token, action) = store
+            .peek_latest("cli", "s", Duration::from_secs(10))
+            .expect("a pending action exists");
+        assert_eq!(token, second, "the more recently frozen action wins");
+        assert_eq!(action.tool, "tool.b");
+        assert_ne!(token, first);
+    }
+
+    #[test]
+    fn peek_latest_respects_ttl_and_does_not_consume() {
+        let store = PendingStore::new();
+        store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
+        assert_eq!(
+            store.peek_latest("cli", "s", Duration::ZERO),
+            None,
+            "expired"
+        );
+
+        let token = store
+            .peek_latest("cli", "s", Duration::from_secs(10))
+            .map(|(t, _)| t);
+        assert!(token.is_some());
+        // Peeking must not consume — take() still sees a live Action after.
+        let (real_token, _) = store
+            .peek_latest("cli", "s", Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            store.take("cli", "s", &real_token, Duration::from_secs(10)),
+            TakeOutcome::Action(_)
+        ));
+    }
+
+    #[test]
+    fn peek_latest_never_crosses_client_or_session_boundaries() {
+        let store = PendingStore::new();
+        store.freeze("cli", "s1", "tool.a".into(), serde_json::json!({}));
+        assert_eq!(
+            store.peek_latest("telegram", "s1", Duration::from_secs(10)),
+            None
+        );
+        assert_eq!(
+            store.peek_latest("cli", "s2", Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn cancel_makes_a_subsequent_take_report_used_not_action() {
+        let store = PendingStore::new();
+        let token = store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
+        assert!(store.cancel("cli", "s", &token));
+        assert_eq!(
+            store.take("cli", "s", &token, Duration::from_secs(10)),
+            TakeOutcome::Used,
+            "a cancelled action must never be redeemable"
+        );
+        assert_eq!(store.peek_latest("cli", "s", Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn cancel_on_an_unknown_token_returns_false() {
+        let store = PendingStore::new();
+        assert!(!store.cancel("cli", "s", "never-minted"));
     }
 }

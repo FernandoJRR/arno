@@ -94,6 +94,12 @@ pub enum Event<'a> {
         args: &'a serde_json::Value,
         outcome: SerOutcome<'a>,
     },
+    /// A pending action was explicitly rejected (SPEC §4.3 revised) rather
+    /// than redeemed or left to expire — nothing executed.
+    ConfirmationCancelled {
+        tool: &'a str,
+        args: &'a serde_json::Value,
+    },
 }
 
 #[derive(Serialize)]

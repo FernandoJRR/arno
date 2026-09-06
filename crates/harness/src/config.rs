@@ -9,6 +9,28 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// How a reply confirms a pending action (SPEC §4.3 revised). `TokenOnly` is
+/// a no-redeploy escape hatch back to the strict pre-revision behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmMode {
+    Model,
+    TokenOnly,
+}
+
+impl std::str::FromStr for ConfirmMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "model" => Ok(Self::Model),
+            "token_only" => Ok(Self::TokenOnly),
+            other => Err(format!(
+                "invalid confirm mode {other:?} — expected model|token_only"
+            )),
+        }
+    }
+}
+
 /// A configured MCP backend location (SPEC §4.2). Two transports:
 /// Streamable HTTP (`name:http://host/mcp`, optionally
 /// `name:[Header=Value;...]http://host/mcp`) or stdio spawn
@@ -58,6 +80,8 @@ pub struct Config {
     pub dedup_window: Duration,
     pub session_ttl: Duration,
     pub confirm_ttl: Duration,
+    /// SPEC §4.3 revised — see `ConfirmMode`.
+    pub confirm_mode: ConfirmMode,
     pub attach_max_bytes: usize,
     /// Exact namespaced tool names that are *always* destructive, regardless
     /// of arguments (SPEC §11.9). This is now the operator's highest-
@@ -106,6 +130,7 @@ impl Config {
             dedup_window: duration_mins("DEDUP_WINDOW_MIN", 60)?,
             session_ttl: duration_hours("SESSION_TTL_H", 24)?,
             confirm_ttl: duration_mins("CONFIRM_TTL_MIN", 10)?,
+            confirm_mode: parsed("CONFIRM_MODE", Some(ConfirmMode::Model))?,
             attach_max_bytes: usize_var("ATTACH_MAX_BYTES", 10 * 1024 * 1024)?,
             destructive_tools: list("DESTRUCTIVE_TOOLS")?.into_iter().collect(),
             mcp_servers: servers("MCP_SERVERS")?,
@@ -134,6 +159,7 @@ const KNOWN_VARS: &[&str] = &[
     "DEDUP_WINDOW_MIN",
     "SESSION_TTL_H",
     "CONFIRM_TTL_MIN",
+    "CONFIRM_MODE",
     "ATTACH_MAX_BYTES",
     "DESTRUCTIVE_TOOLS",
     "TOOL_POLICY_PATH",
@@ -150,7 +176,7 @@ const OWNED_PREFIXES: &[&str] = &[
     "MAX_TOOL_CALLS",
     "DEDUP_WINDOW",
     "SESSION_TTL",
-    "CONFIRM_TTL",
+    "CONFIRM_",
     "ATTACH_MAX",
     "DESTRUCTIVE_",
     "TOOL_POLICY_",
@@ -460,6 +486,7 @@ mod tests {
             "DEDUP_WINDOW_MIN",
             "SESSION_TTL_H",
             "CONFIRM_TTL_MIN",
+            "CONFIRM_MODE",
             "ATTACH_MAX_BYTES",
             "DESTRUCTIVE_TOOLS",
             "TOOL_POLICY_PATH",
@@ -481,6 +508,7 @@ mod tests {
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
         assert_eq!(cfg.session_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(cfg.confirm_ttl, Duration::from_secs(600));
+        assert_eq!(cfg.confirm_mode, ConfirmMode::Model);
         assert!(cfg.mcp_servers.is_empty());
         assert_eq!(
             cfg.tool_policy_path,
@@ -689,6 +717,20 @@ mod tests {
             }
             other => panic!("expected exec backend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn confirm_mode_parses_case_insensitively_and_rejects_garbage() {
+        let _lock = env_lock();
+        let _clean = CleanEnv::new(&base_vars());
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set("CONFIRM_MODE", "Token_Only");
+        let cfg = Config::from_env().expect("parses");
+        assert_eq!(cfg.confirm_mode, ConfirmMode::TokenOnly);
+
+        set("CONFIRM_MODE", "bogus");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("CONFIRM_MODE"), "{err}");
     }
 
     #[test]

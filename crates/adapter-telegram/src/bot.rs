@@ -2,9 +2,10 @@
 //! (SPEC §5.1, §6). Single replica only — a second long-poller on the same
 //! bot token gets HTTP 409 from Telegram (SPEC §5.1), so this must never be
 //! scaled beyond one instance.
-
-use std::collections::HashMap;
-use std::sync::Mutex;
+//!
+//! Confirmation (SPEC §4.3 revised) is now the harness's job, not this
+//! adapter's — every message is just forwarded as-is; no per-chat token
+//! store, no `[CONFIRM]`-only matching.
 
 use futures::StreamExt;
 use teloxide::prelude::*;
@@ -13,33 +14,9 @@ use teloxide::update_listeners::{AsUpdateStream, polling_default};
 
 use crate::config::Config;
 use crate::harness_client::{HarnessClient, OrderOutcome};
-use crate::order::{build_order, is_confirm_phrase, render_error, render_response};
-
-/// Per-chat confirmation tokens awaiting a `[CONFIRM]` reply. In-memory only
-/// (AGENTS.md #7) — an adapter restart drops any pending confirmation, same
-/// as the harness dropping the token past `CONFIRM_TTL_MIN`.
-struct PendingConfirmations(Mutex<HashMap<i64, String>>);
-
-impl PendingConfirmations {
-    fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
-    }
-
-    fn take(&self, chat_id: i64) -> Option<String> {
-        self.0.lock().unwrap().remove(&chat_id)
-    }
-
-    fn set(&self, chat_id: i64, token: String) {
-        self.0.lock().unwrap().insert(chat_id, token);
-    }
-
-    fn clear(&self, chat_id: i64) {
-        self.0.lock().unwrap().remove(&chat_id);
-    }
-}
+use crate::order::{build_order, render_error};
 
 pub async fn run(bot: Bot, cfg: Config, client: HarnessClient) -> anyhow::Result<()> {
-    let pending = PendingConfirmations::new();
     let mut listener = polling_default(bot.clone()).await;
     let mut stream = std::pin::pin!(listener.as_stream());
 
@@ -77,23 +54,10 @@ pub async fn run(bot: Bot, cfg: Config, client: HarnessClient) -> anyhow::Result
         let session_id = chat_id.to_string();
         let client_msg_id = update.id.0.to_string();
 
-        let pending_token = if is_confirm_phrase(&text) {
-            pending.take(chat_id)
-        } else {
-            pending.clear(chat_id);
-            None
-        };
-        let order = build_order(session_id, client_msg_id, text, pending_token);
+        let order = build_order(session_id, client_msg_id, text);
 
         let reply = match client.send_order(&order).await {
-            Ok(OrderOutcome::Ok(resp)) => {
-                let (text, token) = render_response(&resp);
-                match token {
-                    Some(token) => pending.set(chat_id, token),
-                    None => pending.clear(chat_id),
-                }
-                text
-            }
+            Ok(OrderOutcome::Ok(resp)) => resp.text,
             Ok(OrderOutcome::Rejected(code)) => render_error(code),
             Err(e) => {
                 tracing::warn!(error = %e, "harness API request failed");

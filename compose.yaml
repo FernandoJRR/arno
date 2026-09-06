@@ -22,6 +22,11 @@ services:
       HARNESS_API_BIND: ${HARNESS_API_BIND:-0.0.0.0:${HARNESS_API_PORT:-8080}}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+      # Raised from 120s: a cold model load alone can take ~42s, and a real
+      # order adds prompt + tool schemas + history on top.
+      OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-180}
+      # SPEC §4.3, revised: model|token_only — see .env.example.
+      CONFIRM_MODE: ${CONFIRM_MODE:-model}
       # Securo (M2) is external — its bearer token is composed into this
       # entry's header block at deploy time. The harness never reads a
       # SECURO_*-named var itself (AGENTS.md #6): the generic
