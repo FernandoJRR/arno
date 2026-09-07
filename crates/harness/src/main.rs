@@ -52,13 +52,21 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     // Tamper-evidence is the point (SPEC §12.1) — a corrupt audit log aborts
     // boot rather than silently starting a fresh chain, same fail-loud
     // precedent as an unreachable configured MCP backend above.
-    let audit = harness::audit::AuditLog::open(&cfg.audit_log_path)
-        .map_err(|e| anyhow::anyhow!("audit log open failed: {e}"))?;
+    let audit = harness::audit::AuditLog::open(
+        &cfg.audit_log_path,
+        cfg.audit_log_rotate_bytes,
+        cfg.log_keep_segments,
+    )
+    .map_err(|e| anyhow::anyhow!("audit log open failed: {e}"))?;
 
     // Same fail-loud posture for the conversation/tool-call transcript
     // (SPEC §12.2) — a separate file from the audit log by design (§12.2).
-    let transcript = harness::transcript::TranscriptLog::open(&cfg.transcript_log_path)
-        .map_err(|e| anyhow::anyhow!("transcript log open failed: {e}"))?;
+    let transcript = harness::transcript::TranscriptLog::open(
+        &cfg.transcript_log_path,
+        cfg.transcript_log_rotate_bytes,
+        cfg.log_keep_segments,
+    )
+    .map_err(|e| anyhow::anyhow!("transcript log open failed: {e}"))?;
 
     // Adaptive tool-safety classification (SPEC §4.2, M3): reconcile the
     // persisted policy against what's actually discovered, then classify

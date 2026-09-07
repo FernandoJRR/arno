@@ -53,6 +53,10 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         tool_policy_path: unique_temp_path("policy.json"),
         audit_log_path: unique_temp_path("audit.jsonl"),
         transcript_log_path: unique_temp_path("transcript.jsonl"),
+        audit_log_rotate_bytes: 0,
+        transcript_log_rotate_bytes: 0,
+        log_keep_segments: 12,
+        log_verify_on_boot: false,
         tool_policy_retry: Duration::from_secs(300),
     }
 }
@@ -117,10 +121,18 @@ fn build_state(
         cfg.tool_policy_path.clone(),
         cfg.destructive_tools.clone(),
     ));
-    let audit =
-        harness::audit::AuditLog::open(&cfg.audit_log_path).expect("audit log opens in tests");
-    let transcript = harness::transcript::TranscriptLog::open(&cfg.transcript_log_path)
-        .expect("transcript log opens in tests");
+    let audit = harness::audit::AuditLog::open(
+        &cfg.audit_log_path,
+        cfg.audit_log_rotate_bytes,
+        cfg.log_keep_segments,
+    )
+    .expect("audit log opens in tests");
+    let transcript = harness::transcript::TranscriptLog::open(
+        &cfg.transcript_log_path,
+        cfg.transcript_log_rotate_bytes,
+        cfg.log_keep_segments,
+    )
+    .expect("transcript log opens in tests");
     let state: SharedState = Arc::new(AppState {
         sessions: harness::stores::sessions::SessionStore::new(),
         dedup: harness::stores::dedup::DedupStore::new(),
@@ -165,6 +177,82 @@ async fn post_order(
 }
 
 const ORDER_BODY: &str = r#"{"session_id":"s1","text":"hello","client_msg_id":"m1"}"#;
+
+/// GET with an optional bearer token, returning (status, parsed JSON).
+async fn get_json(
+    router: axum::Router,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(
+            "authorization",
+            token.map(|t| format!("Bearer {t}")).unwrap_or_default(),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+// ---- /v1/logs/verify (SPEC §11 decision #15) ----
+
+#[tokio::test]
+async fn logs_verify_requires_auth() {
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(FixedProvider("x")),
+        Arc::new(harness::orchestrator::NoBackends),
+    );
+    let (status, _) = get_json(api_router(state), "/v1/logs/verify", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logs_verify_reports_clean_chain_with_entry_count() {
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(FixedProvider("x")),
+        Arc::new(harness::orchestrator::NoBackends),
+    );
+    // Write two audit entries directly through the opened log.
+    let audit = state.audit.as_ref().unwrap();
+    audit
+        .record(
+            "cli",
+            "s1",
+            "t1",
+            &serde_json::json!({}),
+            harness::audit::RecordOutcome::Ok(&serde_json::json!(null)),
+        )
+        .unwrap();
+    audit
+        .record(
+            "cli",
+            "s1",
+            "t2",
+            &serde_json::json!({}),
+            harness::audit::RecordOutcome::Err("backend_unavailable"),
+        )
+        .unwrap();
+
+    let (status, body) = get_json(api_router(state), "/v1/logs/verify", Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["audit"]["ok"], true, "{body}");
+    assert_eq!(body["audit"]["entries"], 2, "{body}");
+    assert_eq!(body["audit"]["segments"], 1, "{body}");
+    assert_eq!(body["transcript"]["ok"], true, "{body}");
+}
 
 // ---- transport & auth ----
 

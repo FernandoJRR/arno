@@ -46,6 +46,14 @@ services:
       TOOL_POLICY_PATH: /data/arno-tool-policy.json
       AUDIT_LOG_PATH: /data/arno-audit.jsonl
       TRANSCRIPT_LOG_PATH: /data/arno-transcript.jsonl
+      # Log rotation (SPEC §11 decision #15). Defaults: 2 MiB audit, 10 MiB
+      # transcript, keep 12 segments, verify-on-boot off. Rotation fires at
+      # boot: segments land as arno-<store>-<UTC ts>.jsonl inside this same
+      # volume and LOG_KEEP_SEGMENTS prunes the oldest there.
+      AUDIT_LOG_ROTATE_BYTES: ${AUDIT_LOG_ROTATE_BYTES:-2097152}
+      TRANSCRIPT_LOG_ROTATE_BYTES: ${TRANSCRIPT_LOG_ROTATE_BYTES:-10485760}
+      LOG_KEEP_SEGMENTS: ${LOG_KEEP_SEGMENTS:-12}
+      LOG_VERIFY_ON_BOOT: ${LOG_VERIFY_ON_BOOT:-false}
       # RUST_LOG: debug
     volumes:
       # Bind-mounted (not a named volume) so the tool policy / audit log /

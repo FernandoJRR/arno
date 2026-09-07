@@ -6,14 +6,10 @@
 *.local.env
 
 # Bind-mounted harness state (M3, AGENTS.md #7 exceptions) — tool policy,
-# hash-chained audit log, transcript. Contains real finance data.
+# hash-chained audit log, transcript + rotated segments (SPEC §11 decision #15).
+# Contains real finance data. ./data is the single canonical location in every
+# mode (local dev defaults point here too).
 /data
-# Same three files, but at their config.rs default paths (./arno-*) — what
-# you get running the harness natively without setting TOOL_POLICY_PATH /
-# AUDIT_LOG_PATH / TRANSCRIPT_LOG_PATH.
-/arno-tool-policy.json
-/arno-audit.jsonl
-/arno-transcript.jsonl
 
 # Session-scoped scratch notes (see AGENTS.md workflow) — never meant for VCS
 *.tmp.md

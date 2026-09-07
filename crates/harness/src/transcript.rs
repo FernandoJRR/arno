@@ -25,15 +25,13 @@
 //! File permissions are narrowed to the owner on Unix.
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-// 64 zero hex chars, trimmed to exactly 64 below (const fmt can't repeat).
+use crate::chains::{self, ChainError, ChainHead};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptError {
@@ -111,12 +109,19 @@ struct Entry<'a> {
     #[serde(flatten)]
     event: Event<'a>,
     prev_hash: &'a str,
+    /// Set only on the first entry of a fresh active file that continues a
+    /// rotated segment's chain (SPEC §11 decision #15).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation: Option<&'a chains::RotationHandoff>,
 }
 
 struct Inner {
     file: File,
     seq: u64,
     last_hash: String,
+    /// Set at open when a rotation just happened: emitted on the first
+    /// recorded entry, then cleared.
+    next_entry_rotation: Option<chains::RotationHandoff>,
 }
 
 #[derive(Debug)]
@@ -136,12 +141,46 @@ impl TranscriptLog {
     /// — any mismatch aborts with `TranscriptError::Corrupt` rather than
     /// silently starting over (same fail-loud precedent as `audit.rs` and
     /// "unreachable configured backend is a config error", `crate::mcp`).
-    pub fn open(path: &Path) -> Result<Self, TranscriptError> {
-        let (seq, last_hash) = if path.exists() {
-            replay(path)?
+    /// Rotation (SPEC §11 decision #15): fires at boot only — keeps the
+    /// single-writer FIFO model untouched (AGENTS.md #5) and the seam
+    /// deterministic. After a rotation the fresh active file's first entry
+    /// carries a `rotation` handoff and chains onto the rotated file's tail
+    /// hash.
+    pub fn open(
+        path: &Path,
+        rotate_bytes: u64,
+        keep_segments: usize,
+    ) -> Result<Self, TranscriptError> {
+        let rotated_head = chains::maybe_rotate(path, rotate_bytes, keep_segments)
+            .map_err(TranscriptError::from)?;
+        // Replay all rotated segments + the active file as ONE logical chain —
+        // this is what validates the rotation seam (fail-closed on any
+        // mismatch, SPEC §11 decision #15). With no file at all, start fresh.
+        let mut walk = chains::segments_for(path);
+        let exists = path.exists();
+        if exists {
+            walk.push(path.to_path_buf());
+        }
+        let (mut seq, mut last_hash) = if exists {
+            chains::replay_chain(&walk)
+                .map_err(TranscriptError::from)
+                .map(|ChainHead { seq, hash }| (seq, hash))?
         } else {
             (0, genesis())
         };
+        let rotation_handoff = rotated_head.as_ref().map(|head| chains::RotationHandoff {
+            from_file: chains::segments_for(path)
+                .pop()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default(),
+            prev_chain_head: head.hash.clone(),
+        });
+        if let Some(head) = &rotated_head {
+            // The fresh active file continues the previous segment's chain:
+            // seq and last_hash pick up where the rotated file left off.
+            seq = head.seq;
+            last_hash = head.hash.clone();
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -158,6 +197,7 @@ impl TranscriptLog {
             file,
             seq,
             last_hash,
+            next_entry_rotation: rotation_handoff,
         })))
     }
 
@@ -177,6 +217,7 @@ impl TranscriptLog {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
+        let rotation = inner.next_entry_rotation.take();
         let entry = Entry {
             seq,
             ts_unix_ms,
@@ -184,6 +225,7 @@ impl TranscriptLog {
             session_id,
             event,
             prev_hash: &inner.last_hash,
+            rotation: rotation.as_ref(),
         };
         let mut value = serde_json::to_value(&entry).expect("transcript entry always serializes");
         let hash = hash_entry(&inner.last_hash, &value);
@@ -211,89 +253,20 @@ impl<'a> From<Outcome<'a>> for SerOutcome<'a> {
 }
 
 fn genesis() -> String {
-    GENESIS_HASH.to_owned()
+    chains::genesis()
 }
 
-/// Hashes exactly the entry's own JSON (without a `hash` field yet) chained
-/// onto `prev_hash` — the same value verifiers recompute in `replay`.
 fn hash_entry(prev_hash: &str, entry_without_hash: &serde_json::Value) -> String {
-    let body = serde_json::to_string(entry_without_hash).expect("entry always serializes");
-    let mut hasher = Sha256::new();
-    hasher.update(prev_hash.as_bytes());
-    hasher.update(body.as_bytes());
-    hex(&hasher.finalize())
+    chains::hash_entry(prev_hash, entry_without_hash)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Reads every line, verifying each one's `hash` covers `prev_hash` + its own
-/// content, and that its `prev_hash` matches the previous line's `hash` (or
-/// genesis for line 1). Returns the final `(seq, hash)` to resume from.
-fn replay(path: &Path) -> Result<(u64, String), TranscriptError> {
-    let file = File::open(path).map_err(TranscriptError::Open)?;
-    let reader = BufReader::new(file);
-    let mut seq = 0_u64;
-    let mut expected_prev = genesis();
-    for (i, line) in reader.lines().enumerate() {
-        let line_no = i + 1;
-        let line = line.map_err(TranscriptError::Open)?;
-        if line.trim().is_empty() {
-            continue;
+impl From<ChainError> for TranscriptError {
+    fn from(e: ChainError) -> Self {
+        match e {
+            ChainError::Open(io) => TranscriptError::Open(io),
+            ChainError::Corrupt { line, problem } => TranscriptError::Corrupt { line, problem },
         }
-        let mut value: serde_json::Value =
-            serde_json::from_str(&line).map_err(|e| TranscriptError::Corrupt {
-                line: line_no,
-                problem: format!("invalid JSON: {e}"),
-            })?;
-        let stored_hash = value
-            .get("hash")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| TranscriptError::Corrupt {
-                line: line_no,
-                problem: "missing hash field".into(),
-            })?
-            .to_owned();
-        let stored_prev = value
-            .get("prev_hash")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| TranscriptError::Corrupt {
-                line: line_no,
-                problem: "missing prev_hash field".into(),
-            })?
-            .to_owned();
-        if stored_prev != expected_prev {
-            return Err(TranscriptError::Corrupt {
-                line: line_no,
-                problem: "prev_hash does not match preceding entry's hash — chain broken".into(),
-            });
-        }
-        let obj = value
-            .as_object_mut()
-            .ok_or_else(|| TranscriptError::Corrupt {
-                line: line_no,
-                problem: "entry is not a JSON object".into(),
-            })?;
-        obj.remove("hash");
-        let recomputed = hash_entry(&stored_prev, &value);
-        if recomputed != stored_hash {
-            return Err(TranscriptError::Corrupt {
-                line: line_no,
-                problem: "hash does not match entry content — tampered or truncated".into(),
-            });
-        }
-        let this_seq = value
-            .get("seq")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| TranscriptError::Corrupt {
-                line: line_no,
-                problem: "missing seq field".into(),
-            })?;
-        seq = this_seq;
-        expected_prev = stored_hash;
     }
-    Ok((seq, expected_prev))
 }
 
 #[cfg(test)]
@@ -314,7 +287,7 @@ mod tests {
     #[test]
     fn first_entry_chains_from_genesis_with_64_hex_hash() {
         let path = tmp_path("first");
-        let log = TranscriptLog::open(&path).unwrap();
+        let log = TranscriptLog::open(&path, 0, 12).unwrap();
         log.record(
             "cli",
             "s1",
@@ -337,7 +310,7 @@ mod tests {
     #[test]
     fn second_entry_chains_onto_first() {
         let path = tmp_path("chain");
-        let log = TranscriptLog::open(&path).unwrap();
+        let log = TranscriptLog::open(&path, 0, 12).unwrap();
         log.record(
             "cli",
             "s1",
@@ -373,7 +346,7 @@ mod tests {
     #[test]
     fn confirmation_events_serialize_with_tagged_outcome() {
         let path = tmp_path("confirm");
-        let log = TranscriptLog::open(&path).unwrap();
+        let log = TranscriptLog::open(&path, 0, 12).unwrap();
         log.record(
             "cli",
             "s1",
@@ -409,11 +382,11 @@ mod tests {
     fn reopening_a_valid_file_resumes_seq_and_hash() {
         let path = tmp_path("resume");
         {
-            let log = TranscriptLog::open(&path).unwrap();
+            let log = TranscriptLog::open(&path, 0, 12).unwrap();
             log.record("cli", "s1", Event::AssistantFinal { text: "hi" })
                 .unwrap();
         }
-        let log2 = TranscriptLog::open(&path).unwrap();
+        let log2 = TranscriptLog::open(&path, 0, 12).unwrap();
         log2.record("cli", "s1", Event::AssistantFinal { text: "bye" })
             .unwrap();
 
@@ -431,7 +404,7 @@ mod tests {
     fn tampered_line_is_rejected_on_reopen() {
         let path = tmp_path("tamper");
         {
-            let log = TranscriptLog::open(&path).unwrap();
+            let log = TranscriptLog::open(&path, 0, 12).unwrap();
             log.record(
                 "cli",
                 "s1",
@@ -447,7 +420,7 @@ mod tests {
         let tampered = std::fs::read_to_string(&path).unwrap().replace("50", "99");
         std::fs::write(&path, tampered).unwrap();
 
-        let err = TranscriptLog::open(&path).unwrap_err();
+        let err = TranscriptLog::open(&path, 0, 12).unwrap_err();
         assert!(matches!(err, TranscriptError::Corrupt { .. }), "{err}");
     }
 
@@ -457,7 +430,7 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{{not valid json").unwrap();
         drop(f);
-        let err = TranscriptLog::open(&path).unwrap_err();
+        let err = TranscriptLog::open(&path, 0, 12).unwrap_err();
         assert!(matches!(err, TranscriptError::Corrupt { .. }), "{err}");
     }
 
@@ -465,7 +438,7 @@ mod tests {
     fn missing_file_starts_fresh_at_genesis() {
         let path = tmp_path("missing");
         assert!(!path.exists());
-        let log = TranscriptLog::open(&path).unwrap();
+        let log = TranscriptLog::open(&path, 0, 12).unwrap();
         log.record("cli", "s1", Event::UserMessage { text: "hi" })
             .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -477,7 +450,7 @@ mod tests {
     fn file_permissions_are_owner_only_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let path = tmp_path("perms");
-        let _log = TranscriptLog::open(&path).unwrap();
+        let _log = TranscriptLog::open(&path, 0, 12).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

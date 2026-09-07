@@ -100,6 +100,16 @@ pub struct Config {
     /// Where the hash-chained conversation/tool-call transcript persists
     /// (SPEC §12.2, AGENTS.md #7 exception #3).
     pub transcript_log_path: PathBuf,
+    /// Rotate the audit log at boot past this size (bytes); 0 disables
+    /// (SPEC §11 decision #15).
+    pub audit_log_rotate_bytes: u64,
+    /// Rotate the transcript at boot past this size (bytes); 0 disables
+    /// (SPEC §11 decision #15).
+    pub transcript_log_rotate_bytes: u64,
+    /// Rotated segments retained per store; oldest pruned first (decision #15).
+    pub log_keep_segments: usize,
+    /// Replay the full chain (all segments) at boot; any break aborts boot.
+    pub log_verify_on_boot: bool,
     /// How often the background task retries tools left `Pending` because the
     /// model was unavailable at boot (SPEC §11 M3).
     pub tool_policy_retry: Duration,
@@ -134,9 +144,13 @@ impl Config {
             attach_max_bytes: usize_var("ATTACH_MAX_BYTES", 10 * 1024 * 1024)?,
             destructive_tools: list("DESTRUCTIVE_TOOLS")?.into_iter().collect(),
             mcp_servers: servers("MCP_SERVERS")?,
-            tool_policy_path: path_var("TOOL_POLICY_PATH", "./arno-tool-policy.json"),
-            audit_log_path: path_var("AUDIT_LOG_PATH", "./arno-audit.jsonl"),
-            transcript_log_path: path_var("TRANSCRIPT_LOG_PATH", "./arno-transcript.jsonl"),
+            tool_policy_path: path_var("TOOL_POLICY_PATH", "./data/arno-tool-policy.json"),
+            audit_log_path: path_var("AUDIT_LOG_PATH", "./data/arno-audit.jsonl"),
+            transcript_log_path: path_var("TRANSCRIPT_LOG_PATH", "./data/arno-transcript.jsonl"),
+            audit_log_rotate_bytes: u64_var("AUDIT_LOG_ROTATE_BYTES", 2 * 1024 * 1024)?,
+            transcript_log_rotate_bytes: u64_var("TRANSCRIPT_LOG_ROTATE_BYTES", 10 * 1024 * 1024)?,
+            log_keep_segments: usize_var("LOG_KEEP_SEGMENTS", 12)?,
+            log_verify_on_boot: parsed("LOG_VERIFY_ON_BOOT", Some(false))?,
             tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
         })
     }
@@ -165,7 +179,11 @@ const KNOWN_VARS: &[&str] = &[
     "TOOL_POLICY_PATH",
     "TOOL_POLICY_RETRY_S",
     "AUDIT_LOG_PATH",
+    "AUDIT_LOG_ROTATE_BYTES",
     "TRANSCRIPT_LOG_PATH",
+    "TRANSCRIPT_LOG_ROTATE_BYTES",
+    "LOG_KEEP_SEGMENTS",
+    "LOG_VERIFY_ON_BOOT",
 ];
 
 const OWNED_PREFIXES: &[&str] = &[
@@ -230,6 +248,10 @@ fn parsed<T: std::str::FromStr>(var: &'static str, default: Option<T>) -> Result
 }
 
 fn u32_var(var: &'static str, default: u32) -> Result<u32, ConfigError> {
+    parsed(var, Some(default))
+}
+
+fn u64_var(var: &'static str, default: u64) -> Result<u64, ConfigError> {
     parsed(var, Some(default))
 }
 
@@ -492,7 +514,11 @@ mod tests {
             "TOOL_POLICY_PATH",
             "TOOL_POLICY_RETRY_S",
             "AUDIT_LOG_PATH",
+            "AUDIT_LOG_ROTATE_BYTES",
             "TRANSCRIPT_LOG_PATH",
+            "TRANSCRIPT_LOG_ROTATE_BYTES",
+            "LOG_KEEP_SEGMENTS",
+            "LOG_VERIFY_ON_BOOT",
         ]
     }
 
@@ -512,14 +538,18 @@ mod tests {
         assert!(cfg.mcp_servers.is_empty());
         assert_eq!(
             cfg.tool_policy_path,
-            PathBuf::from("./arno-tool-policy.json")
+            PathBuf::from("./data/arno-tool-policy.json")
         );
-        assert_eq!(cfg.audit_log_path, PathBuf::from("./arno-audit.jsonl"));
+        assert_eq!(cfg.audit_log_path, PathBuf::from("./data/arno-audit.jsonl"));
         assert_eq!(
             cfg.transcript_log_path,
-            PathBuf::from("./arno-transcript.jsonl")
+            PathBuf::from("./data/arno-transcript.jsonl")
         );
         assert_eq!(cfg.tool_policy_retry, Duration::from_secs(300));
+        assert_eq!(cfg.audit_log_rotate_bytes, 2 * 1024 * 1024);
+        assert_eq!(cfg.transcript_log_rotate_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.log_keep_segments, 12);
+        assert!(!cfg.log_verify_on_boot);
     }
 
     #[test]
@@ -531,6 +561,10 @@ mod tests {
         set("AUDIT_LOG_PATH", "/data/audit.jsonl");
         set("TRANSCRIPT_LOG_PATH", "/data/transcript.jsonl");
         set("TOOL_POLICY_RETRY_S", "60");
+        set("AUDIT_LOG_ROTATE_BYTES", "0");
+        set("TRANSCRIPT_LOG_ROTATE_BYTES", "4096");
+        set("LOG_KEEP_SEGMENTS", "3");
+        set("LOG_VERIFY_ON_BOOT", "true");
         let cfg = Config::from_env().expect("parses");
         assert_eq!(cfg.tool_policy_path, PathBuf::from("/data/policy.json"));
         assert_eq!(cfg.audit_log_path, PathBuf::from("/data/audit.jsonl"));
@@ -539,6 +573,10 @@ mod tests {
             PathBuf::from("/data/transcript.jsonl")
         );
         assert_eq!(cfg.tool_policy_retry, Duration::from_secs(60));
+        assert_eq!(cfg.audit_log_rotate_bytes, 0);
+        assert_eq!(cfg.transcript_log_rotate_bytes, 4096);
+        assert_eq!(cfg.log_keep_segments, 3);
+        assert!(cfg.log_verify_on_boot);
     }
 
     #[test]
@@ -731,6 +769,11 @@ mod tests {
         set("CONFIRM_MODE", "bogus");
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("CONFIRM_MODE"), "{err}");
+
+        set("CONFIRM_MODE", "model"); // reset — from_env fails fast on the first bad var
+        set("LOG_VERIFY_ON_BOOT", "bogus");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("LOG_VERIFY_ON_BOOT"), "{err}");
     }
 
     #[test]

@@ -185,7 +185,20 @@ HOST (Linux home server)
   Everything else here is legitimately restart-clears; these three must
   survive a container recreate or the harness's own memory of tool safety,
   its record of executed writes, and its conversation
-  history all vanish with it.
+  history all vanish with it. The harness's own local-dev defaults now point
+  at `./data/` too (SPEC §11 decision #15), so `./data` is the single
+  canonical location in every mode. Rotated log segments
+  (`arno-audit-<UTC ts>.jsonl`, `arno-transcript-<UTC ts>.jsonl`, SPEC §11
+  decision #15) live beside the active files in this same directory and are
+  covered by the same bind mount, gitignore, and inspectability guarantees.
+
+## 8.1 Backup (ops)
+
+The chain stores in `./data` are the only stateful data; off-host copy is an
+ops concern (SPEC §11 decision #15): tail-truncation of the newest segment is
+undetectable from the files alone — only a second copy catches it.
+`docker/backup-logs.sh` rsyncs `./data/` (owner-only perms) to
+`$ARNO_BACKUP_DEST` (default `~/arno-logs-backup`); schedule via host cron.
 
 ## 7. Config ownership
 
@@ -193,7 +206,7 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (`model`\|`token_only`, §4.3 revised), `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3) |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (`model`\|`token_only`, §4.3 revised), `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3), `AUDIT_LOG_ROTATE_BYTES` (default 2 MiB, 0=off), `TRANSCRIPT_LOG_ROTATE_BYTES` (default 10 MiB, 0=off), `LOG_KEEP_SEGMENTS` (default 12), `LOG_VERIFY_ON_BOOT` (default `false`) — rotation/verification knobs per SPEC §11 decision #15 |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
 | deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |

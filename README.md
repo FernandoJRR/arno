@@ -59,6 +59,42 @@ This starts `harness`, `mcp-linux`, and `telegram-adapter` on an isolated
 compose network. `harness`'s API is published to `127.0.0.1` only; the
 Telegram adapter is outbound-only (long-polling) and publishes no ports.
 
+## Chain-store logs (audit, transcript)
+
+The harness's tamper-evident logs live at `./data/` in every mode
+(SPEC §11 decision #15):
+
+- `arno-audit.jsonl` — executed frozen writes (§12.1)
+- `arno-transcript.jsonl` — full conversation/tool-call narrative (§12.2)
+- `arno-tool-policy.json` — persisted tool-safety classification (hand-editable)
+
+Inspect them with plain tools — no `docker run` indirection:
+
+```sh
+jq -c . data/arno-transcript.jsonl | tail -5
+```
+
+When the active file exceeds its rotate threshold (`AUDIT_LOG_ROTATE_BYTES`,
+2 MiB default; transcript 10 MiB) it is renamed to
+`arno-<store>-<UTC timestamp>.jsonl` beside the active file **at next boot**,
+and the new active file's first entry chains onto the old tail. The oldest
+segments beyond `LOG_KEEP_SEGMENTS` (12) are pruned. Verify both chains
+runtime:
+
+```sh
+curl -s -H "Authorization: Bearer <client-token>" \
+    http://127.0.0.1:8080/v1/logs/verify
+# {"audit":{"ok":true,...},"transcript":{"ok":true,...},"ok":true}
+```
+
+Off-host backup (catches tail-truncation the chain alone cannot):
+
+```sh
+docker/backup-logs.sh   # rsyncs ./data to $ARNO_BACKUP_DEST (~/arno-logs-backup)
+```
+
+Schedule it from host cron — e.g. `0 3 * * *` for a nightly copy.
+
 ## Configuration
 
 All configuration is env-only — no config files, no CLI flags for secrets.
