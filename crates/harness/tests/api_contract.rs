@@ -37,6 +37,8 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         model: "qwen3:8b".into(),
         num_ctx: 32_768,
         ollama_think: harness::model::ollama::ThinkMode::Off,
+        ollama_seed: 42,
+        ollama_top_k: 1,
         ollama_timeout: Duration::from_secs(5),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
@@ -204,6 +206,109 @@ async fn get_json(
     )
 }
 
+// ---- tool-recognition reliability (SPEC §11 decision #16) ----
+
+/// A provider double that yields scripted outputs in order, then repeats the
+/// last one — drives multi-pass recovery-loop tests.
+struct SequencedProvider(std::sync::Mutex<Vec<CompletionOutput>>);
+
+#[async_trait::async_trait]
+impl ModelProvider for SequencedProvider {
+    async fn complete(&self, _req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        let mut q = self.0.lock().unwrap();
+        if q.len() > 1 {
+            Ok(q.remove(0))
+        } else {
+            Ok(q[0].clone())
+        }
+    }
+}
+
+#[tokio::test]
+async fn rescued_text_tool_call_is_dispatched_through_normal_path() {
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"id": "tx_9"})));
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(SequencedProvider(std::sync::Mutex::new(vec![
+            // Pass 1: the model emits the call as text instead of the
+            // structured field.
+            CompletionOutput::Final(
+                "Sure.\n```json\n{\"tool\": \"securo.list_accounts\", \"arguments\": {}}\n```"
+                    .into(),
+            ),
+            // Pass 2 (after the real result lands): honest final.
+            CompletionOutput::Final("Here are your accounts.".into()),
+        ]))),
+        Arc::new(executor.clone()),
+    );
+    pin_safe(&state, "securo.list_accounts").await;
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "the text call was rescued and dispatched");
+    assert_eq!(calls[0].0, "securo.list_accounts");
+    assert_eq!(body["text"], "Here are your accounts.", "{body}");
+}
+
+#[tokio::test]
+async fn false_claim_final_triggers_recovery_loop() {
+    // Pass 1: the model lies (no tool call). Pass 2 (after the corrective
+    // nudge): the model makes the real call. Pass 3: honest final.
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(SequencedProvider(std::sync::Mutex::new(vec![
+            CompletionOutput::Final(
+                "Your expense for the Pixel 10 Pro has been successfully created.".into(),
+            ),
+            CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+                id: "call_1".into(),
+                name: "securo.list_accounts".into(),
+                args: serde_json::json!({}),
+            }]),
+            CompletionOutput::Final("Done — the account list is in the result above.".into()),
+        ]))),
+        Arc::new(RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!(
+            {"accounts": []}
+        )))),
+    );
+    pin_safe(&state, "securo.list_accounts").await;
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The FIRST (lying) text must NOT be what the user receives.
+    assert!(
+        !body["text"]
+            .as_str()
+            .unwrap()
+            .contains("successfully created"),
+        "{body}"
+    );
+    assert_eq!(
+        body["text"], "Done — the account list is in the result above.",
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn false_claim_delivered_when_budget_exhausts_recovery() {
+    // The model lies on EVERY pass: after the budget guard window closes,
+    // the text must be delivered rather than silently swallowed.
+    let mut cfg = test_config("http://127.0.0.1:1".into(), Duration::from_millis(50));
+    cfg.order_budget = Duration::from_millis(50); // tiny budget: first guard pass consumes it
+    let state = build_state(
+        cfg,
+        Arc::new(FixedProvider(
+            "The transaction has been applied to your account.",
+        )),
+        Arc::new(harness::orchestrator::NoBackends),
+    );
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["text"].as_str().unwrap().contains("has been applied"),
+        "budget-exhausted lie is delivered, not swallowed: {body}"
+    );
+}
+
 // ---- /v1/logs/verify (SPEC §11 decision #15) ----
 
 #[tokio::test]
@@ -323,6 +428,8 @@ async fn happy_path_round_trips_through_model() {
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     let state = build_state(
         test_config(server.uri(), Duration::from_secs(10)),
@@ -390,6 +497,18 @@ async fn pin_conditional_on_apply(state: &SharedState, name: &str) {
         .await;
 }
 
+/// Seeds `state.policy` with a `Safe` rule for `name` (same mechanism) so a
+/// rescue/claim-guard test can dispatch without confirmation.
+async fn pin_safe(state: &SharedState, name: &str) {
+    let schema = conditional_tool_schema(name);
+    let pending = state.policy.reconcile(std::slice::from_ref(&schema));
+    let verdict = FixedVerdict(r#"{"class":"safe","reason":"test-pinned"}"#);
+    state
+        .policy
+        .classify_pending(&verdict, &[schema], &pending)
+        .await;
+}
+
 #[tokio::test]
 async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
     let server = MockServer::start().await;
@@ -407,6 +526,8 @@ async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"ok": true})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -460,6 +581,8 @@ async fn tool_call_not_matching_the_conditional_predicate_dispatches_directly() 
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"preview": true})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -512,6 +635,8 @@ async fn second_completion_sees_the_models_own_prior_tool_call() {
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -574,6 +699,8 @@ async fn tool_error_triggers_a_situational_retry_nudge_on_the_next_completion() 
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     // The tool "dispatches" (not destructive — no `apply`) but the backend
     // itself reports an application-level failure, same shape as Securo's
@@ -635,6 +762,8 @@ async fn transcript_records_user_tool_call_result_and_final_answer_in_order() {
         "qwen3:8b",
         Duration::from_secs(5),
         harness::model::ollama::ThinkMode::Off,
+        42,
+        1,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));

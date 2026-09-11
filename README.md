@@ -95,6 +95,33 @@ docker/backup-logs.sh   # rsyncs ./data to $ARNO_BACKUP_DEST (~/arno-logs-backup
 
 Schedule it from host cron — e.g. `0 3 * * *` for a nightly copy.
 
+## Tool-recognition health
+
+Small local models (qwen3:4b-instruct) sometimes assert they executed an
+action without ever calling a tool. The harness defends against this with
+three output-side layers (SPEC §11 decision #16): deterministic sampling
+(`OLLAMA_SEED`/`OLLAMA_TOP_K`), rescue of tool calls the model emits as
+text, and a success-claim guard that withholds false "done!" replies and
+forces a real call. None of these require the user to phrase orders any
+particular way.
+
+Check the live false-claim rate from the transcript:
+
+```sh
+# finals claiming success:
+jq -r 'select(.kind=="assistant_final")|.text' data/arno-transcript.jsonl \
+    | grep -ci "successfully\|has been created\|has been applied"
+# tool calls that actually ran:
+jq -r 'select(.kind=="tool_call")|.tool' data/arno-transcript.jsonl | wc -l
+```
+
+If false claims persist after the harness layers, try a model swap (ops,
+no code): `qwen3:4b` (non-instruct tag — some `-instruct` variants silently
+lose native tool mode) or `qwen3:8b` (compose default). Verify capability
+first: `ollama show <model>` must list `tools` under Capabilities.
+`OLLAMA_SEED=0`/`OLLAMA_TOP_K=0` restore provider-default sampling if you
+want more answer variety.
+
 ## Configuration
 
 All configuration is env-only — no config files, no CLI flags for secrets.

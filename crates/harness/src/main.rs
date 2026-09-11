@@ -36,6 +36,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         cfg.model.clone(),
         cfg.ollama_timeout,
         cfg.ollama_think,
+        cfg.ollama_seed,
+        cfg.ollama_top_k,
     ));
     let executor: Arc<dyn ToolExecutor> = if cfg.mcp_servers.is_empty() {
         tracing::info!("MCP_SERVERS empty — tool dispatch reports backend_unavailable");

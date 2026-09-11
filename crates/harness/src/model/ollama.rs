@@ -18,6 +18,11 @@ pub struct OllamaProvider {
     chat_url: String,
     model: String,
     think: ThinkMode,
+    /// 0 = provider default; else fixed seed for deterministic tool
+    /// selection (SPEC §8).
+    seed: u32,
+    /// 0 = provider default; 1 = greedy (deterministic tool selection).
+    top_k: u32,
 }
 
 /// Native-API `think` control for thinking-capable models (qwen3,
@@ -71,6 +76,8 @@ impl OllamaProvider {
         model: impl Into<String>,
         timeout: Duration,
         think: ThinkMode,
+        seed: u32,
+        top_k: u32,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -82,6 +89,8 @@ impl OllamaProvider {
             chat_url,
             model: model.into(),
             think,
+            seed,
+            top_k,
         }
     }
 
@@ -94,6 +103,24 @@ impl OllamaProvider {
             "options": {
                 "num_ctx": req.context_tokens,
                 "temperature": TOOL_SELECTION_TEMPERATURE,
+                // Deterministic sampling for reliable tool selection
+                // (SPEC §8, observed 4/12 false-success finals): top_k=1 +
+                // a fixed seed collapse the sampling tail that lets a small
+                // model wander into prose instead of emitting the structured
+                // call. repeat_penalty discourages the model restating its
+                // own prior false claim after the orchestrator's corrective
+                // nudge. 0 seed = provider default (env knobs, config.rs).
+                "top_k": if self.top_k == 0 {
+                    Value::Null
+                } else {
+                    json!(self.top_k)
+                },
+                "seed": if self.seed == 0 {
+                    Value::Null
+                } else {
+                    json!(self.seed)
+                },
+                "repeat_penalty": TOOL_SELECTION_REPEAT_PENALTY,
             },
             // Explicit thinking control; `Off` forces determinism instead of
             // relying on per-model defaults.
@@ -110,6 +137,9 @@ impl OllamaProvider {
 
 /// Low temperature for tool selection (SPEC §5.4); not a timeout/retry knob.
 const TOOL_SELECTION_TEMPERATURE: f32 = 0.2;
+
+/// Greedy-ish decode for deterministic tool selection (SPEC §8).
+const TOOL_SELECTION_REPEAT_PENALTY: f32 = 1.05;
 
 #[async_trait]
 impl ModelProvider for OllamaProvider {
@@ -250,6 +280,8 @@ mod tests {
             "qwen3:8b",
             Duration::from_secs(5),
             ThinkMode::Max,
+            42,
+            1,
         );
         let req = CompletionRequest {
             messages: vec![ChatMessage::new(Role::User, "hi")],
@@ -261,6 +293,16 @@ mod tests {
         assert_eq!(body["model"], "qwen3:8b");
         assert_eq!(body["options"]["num_ctx"], 4096);
         assert_eq!(body["stream"], false);
+        // Deterministic-sampling knobs (SPEC §8 tool-recognition reliability):
+        // collapse the sampling tail that lets a small model wander into
+        // prose instead of emitting the structured tool call.
+        assert_eq!(body["options"]["top_k"], 1);
+        assert_eq!(body["options"]["seed"], 42);
+        // f32 wire form; compare with epsilon (1.05 is not exact in f32).
+        assert!(
+            (body["options"]["repeat_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-6,
+            "{body}"
+        );
     }
 
     #[test]

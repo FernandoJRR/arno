@@ -73,6 +73,12 @@ pub struct Config {
     /// Model reasoning effort (native `/api/chat` `think` field); default off
     /// for deterministic low-latency tool selection.
     pub ollama_think: ThinkMode,
+    /// Fixed sampler seed for deterministic tool selection (SPEC §8, SPEC
+    /// §11 decision #16). 0 = provider default.
+    pub ollama_seed: u32,
+    /// Sampler top_k; 1 = greedy (deterministic tool selection). 0 =
+    /// provider default.
+    pub ollama_top_k: u32,
     pub ollama_timeout: Duration,
     pub mcp_tool_timeout: Duration,
     pub order_budget: Duration,
@@ -133,6 +139,8 @@ impl Config {
             model: string_var("OLLAMA_MODEL", "qwen3:8b"),
             num_ctx: u32_var("OLLAMA_NUM_CTX", 32_768)?,
             ollama_think: parsed("OLLAMA_THINK", Some(ThinkMode::Off))?,
+            ollama_seed: u32_var("OLLAMA_SEED", 42)?,
+            ollama_top_k: u32_var("OLLAMA_TOP_K", 1)?,
             ollama_timeout: duration_secs("OLLAMA_TIMEOUT_S", 120)?,
             mcp_tool_timeout: duration_secs("MCP_TOOL_TIMEOUT_S", 30)?,
             order_budget: duration_secs("ORDER_BUDGET_S", 180)?,
@@ -165,6 +173,8 @@ const KNOWN_VARS: &[&str] = &[
     "OLLAMA_MODEL",
     "OLLAMA_NUM_CTX",
     "OLLAMA_THINK",
+    "OLLAMA_SEED",
+    "OLLAMA_TOP_K",
     "OLLAMA_TIMEOUT_S",
     "MCP_TOOL_TIMEOUT_S",
     "MCP_SERVERS",
@@ -500,6 +510,8 @@ mod tests {
             "OLLAMA_MODEL",
             "OLLAMA_NUM_CTX",
             "OLLAMA_THINK",
+            "OLLAMA_SEED",
+            "OLLAMA_TOP_K",
             "OLLAMA_TIMEOUT_S",
             "MCP_TOOL_TIMEOUT_S",
             "MCP_SERVERS",
@@ -531,6 +543,9 @@ mod tests {
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:8080");
         assert_eq!(cfg.num_ctx, 32_768);
         assert_eq!(cfg.ollama_think, ThinkMode::Off);
+        // Deterministic tool-selection sampler defaults (SPEC §11 decision #16).
+        assert_eq!(cfg.ollama_seed, 42);
+        assert_eq!(cfg.ollama_top_k, 1);
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
         assert_eq!(cfg.session_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(cfg.confirm_ttl, Duration::from_secs(600));
@@ -560,6 +575,8 @@ mod tests {
         set("TOOL_POLICY_PATH", "/data/policy.json");
         set("AUDIT_LOG_PATH", "/data/audit.jsonl");
         set("TRANSCRIPT_LOG_PATH", "/data/transcript.jsonl");
+        set("OLLAMA_SEED", "0");
+        set("OLLAMA_TOP_K", "0");
         set("TOOL_POLICY_RETRY_S", "60");
         set("AUDIT_LOG_ROTATE_BYTES", "0");
         set("TRANSCRIPT_LOG_ROTATE_BYTES", "4096");
@@ -573,6 +590,9 @@ mod tests {
             PathBuf::from("/data/transcript.jsonl")
         );
         assert_eq!(cfg.tool_policy_retry, Duration::from_secs(60));
+        // 0 = provider default overrides of the deterministic sampler.
+        assert_eq!(cfg.ollama_seed, 0);
+        assert_eq!(cfg.ollama_top_k, 0);
         assert_eq!(cfg.audit_log_rotate_bytes, 0);
         assert_eq!(cfg.transcript_log_rotate_bytes, 4096);
         assert_eq!(cfg.log_keep_segments, 3);

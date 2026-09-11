@@ -311,6 +311,126 @@ async fn normal_path(
             .map_err(model_error_to_api)?
         {
             crate::model::CompletionOutput::Final(text) => {
+                // Rescue FIRST (SPEC §11 decision #16): a Final reply whose
+                // body contains exactly one tool-call-shaped JSON object is
+                // re-interpreted as the call the model meant to make. It then
+                // flows through the SAME classification/dispatch path below
+                // (this branch sets `text = ""` and falls into the ToolCalls
+                // arm via a synthetic re-entry — implemented inline to keep
+                // the loop's single-writer structure).
+                if let Some(call) = rescue_text_tool_call(&text) {
+                    tracing::info!(tool = %call.name, "rescued text tool call");
+                    let calls = vec![call];
+                    dispatched_tool_calls += calls.len() as u32;
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
+                    );
+                    for call in calls {
+                        if let Some(transcript) = &st.transcript
+                            && let Err(e) = transcript.record(
+                                client_id,
+                                &order.session_id,
+                                crate::transcript::Event::ToolCall {
+                                    call_id: &call.id,
+                                    tool: &call.name,
+                                    args: &call.args,
+                                },
+                            )
+                        {
+                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                        }
+                        if st.policy.is_destructive(&call.name, &call.args) {
+                            let token = st.pending.freeze(
+                                client_id,
+                                &order.session_id,
+                                call.name.clone(),
+                                call.args.clone(),
+                            );
+                            if let Some(transcript) = &st.transcript
+                                && let Err(e) = transcript.record(
+                                    client_id,
+                                    &order.session_id,
+                                    crate::transcript::Event::ConfirmationRequested {
+                                        tool: &call.name,
+                                        args: &call.args,
+                                    },
+                                )
+                            {
+                                tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                            }
+                            return Ok(Response {
+                                text: format!(
+                                    "This would run `{}` with {}. Reply to confirm or say no to cancel.",
+                                    call.name,
+                                    render_args(&call.args)
+                                ),
+                                needs_confirmation: Some(true),
+                                confirmation_token: Some(token),
+                                structured: None,
+                            });
+                        }
+                        let result = st
+                            .executor
+                            .execute(&call.name, &call.args)
+                            .await
+                            .unwrap_or_else(|code| {
+                                serde_json::Value::String(code.as_str().to_owned())
+                            });
+                        if let Some(transcript) = &st.transcript
+                            && let Err(e) = transcript.record(
+                                client_id,
+                                &order.session_id,
+                                crate::transcript::Event::ToolResult {
+                                    call_id: &call.id,
+                                    tool: &call.name,
+                                    result: &result,
+                                },
+                            )
+                        {
+                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+                        }
+                        st.sessions.append(
+                            &key,
+                            crate::model::ChatMessage::tool_result(
+                                call.id.clone(),
+                                result.to_string(),
+                            ),
+                        );
+                        if looks_like_error(&result) {
+                            st.sessions.append(
+                                &key,
+                                crate::model::ChatMessage::new(
+                                    crate::model::Role::User,
+                                    RETRY_NUDGE,
+                                ),
+                            );
+                        }
+                    }
+                    if dispatched_tool_calls > st.cfg.max_tool_calls {
+                        return Err(ApiError(ErrorCode::OrderBudgetExceeded));
+                    }
+                    continue; // loop: let the model speak with the real result
+                }
+                // Claim guard (SPEC §11 decision #16): a Final that asserts
+                // execution with NO tool call this order is the observed
+                // qwen3:4b lie. Withhold it, correct the model, loop —
+                // bounded by budget; on exhaustion the text IS delivered
+                // (never silently swallowed) with an ops warn.
+                if claims_execution_without_tool(&text, dispatched_tool_calls)
+                    && Instant::now() + st.cfg.order_budget / 4 < deadline
+                {
+                    tracing::warn!("final claims execution but no tool ran this order; nudging");
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
+                    );
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(crate::model::Role::User, FALSE_CLAIM_NUDGE),
+                    );
+                    continue;
+                }
                 if let Some(transcript) = &st.transcript
                     && let Err(e) = transcript.record(
                         client_id,
@@ -482,6 +602,131 @@ fn model_error_to_api(e: crate::model::ModelError) -> ApiError {
     ApiError(ErrorCode::BackendUnavailable)
 }
 
+/// Small models sometimes emit the tool call as literal text (a fenced JSON
+/// block or a bare `{...}` object) instead of the structured `tool_calls`
+/// field the native API parses — the harness currently discards it and the
+/// user sees a model that "answered" without acting (SPEC §11 decision #16).
+/// Rescue: a Final reply containing EXACTLY ONE parseable
+/// `{"tool": name, "arguments": {...}}` (or `{"name": ...}`) object becomes a
+/// real dispatch. 0 or >1 candidates → None (never guess — AGENTS.md #3
+/// spirit: don't invent consent-shaped actions). The rescued call flows
+/// through the same classification/dispatch path as a structured call.
+fn rescue_text_tool_call(text: &str) -> Option<crate::model::ToolCall> {
+    let mut candidates: Vec<crate::model::ToolCall> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Balanced-brace scan (string-aware enough: skip braces inside quotes).
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (off, &b) in bytes[i..].iter().enumerate() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match b {
+                    b'\\' if in_str => escaped = true,
+                    b'"' => in_str = !in_str,
+                    b'{' if !in_str => depth += 1,
+                    b'}' if !in_str => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + off + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(end) = end {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[i..end])
+                    && let Some(call) = parse_rescued_object(&v)
+                {
+                    candidates.push(call);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
+/// Shape check for one rescued candidate: string `tool`/`name` + object
+/// `arguments`/`args`. Anything else is not a tool call.
+fn parse_rescued_object(v: &serde_json::Value) -> Option<crate::model::ToolCall> {
+    let obj = v.as_object()?;
+    let name = obj
+        .get("tool")
+        .or_else(|| obj.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let args = match obj.get("arguments").or_else(|| obj.get("args")) {
+        Some(v) => v.clone(),
+        // Absent arguments key defaults to an empty argument set (mirrors
+        // `arguments_object` in the MCP registry, which tolerates drift).
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    if !args.is_object() {
+        return None;
+    }
+    Some(crate::model::ToolCall {
+        id: format!(
+            "rescued_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ),
+        name: name.to_owned(),
+        args,
+    })
+}
+
+/// Success-execution claim patterns, drawn from REAL false claims observed in
+/// `data/arno-transcript.jsonl` (qwen3:4b asserted "has been successfully
+/// created/applied" with zero tool call behind it — SPEC §11 decision #16).
+/// Lowercase substring match, case-insensitive at the call site.
+const FALSE_CLAIM_PATTERNS: &[&str] = &[
+    "successfully",
+    "has been created",
+    "has been applied",
+    "has been registered",
+    "is now live",
+    "has been posted",
+    "i've recorded",
+    "i have recorded",
+    "executed the",
+];
+
+/// True when a final answer asserts an action was executed but NO tool call
+/// has run this order — the observed qwen3:4b failure mode. Only these
+/// replies trigger the corrective nudge; ordinary replies (even ones that
+/// list data, which one live false claim mimicked) pass through untouched.
+fn claims_execution_without_tool(text: &str, dispatched_tool_calls: u32) -> bool {
+    if dispatched_tool_calls > 0 {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    FALSE_CLAIM_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+const FALSE_CLAIM_NUDGE: &str = "\
+You just stated that an action was completed, but you did not call any tool \
+in this turn — nothing was executed. If the user's request requires an \
+action, call the appropriate tool right now with the arguments you already \
+have (you may reuse values from earlier tool results in this conversation). \
+If no tool is needed or information is genuinely missing, reply with what \
+you actually know and explicitly say no action was taken.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +750,105 @@ mod tests {
         assert!(!looks_like_error(&serde_json::json!(null)));
         assert!(!looks_like_error(
             &serde_json::json!({"description": "grocery run", "amount": 50})
+        ));
+    }
+
+    // ---- text tool-call rescue (SPEC §11 decision #16) ----
+
+    #[test]
+    fn rescue_parses_fenced_json_tool_call() {
+        let text = "Sure, let me look that up.\n```json\n{\"tool\": \"securo.list_accounts\", \"arguments\": {}}\n```";
+        let call = rescue_text_tool_call(text).expect("rescued");
+        assert_eq!(call.name, "securo.list_accounts");
+        assert_eq!(call.args, serde_json::json!({}));
+        assert!(call.id.starts_with("rescued_"));
+    }
+
+    #[test]
+    fn rescue_parses_bare_json_object() {
+        let call = rescue_text_tool_call(
+            "{\"name\": \"securo.list_transactions\", \"args\": {\"limit\": 5}}",
+        )
+        .expect("rescued");
+        assert_eq!(call.name, "securo.list_transactions");
+        assert_eq!(call.args["limit"], 5);
+    }
+
+    #[test]
+    fn rescue_ignores_prose_without_json() {
+        assert!(rescue_text_tool_call("Your expense has been recorded.").is_none());
+        assert!(rescue_text_tool_call("").is_none());
+    }
+
+    #[test]
+    fn rescue_ignores_multiple_candidates() {
+        let text = "{\"tool\": \"a\", \"arguments\": {}} then {\"tool\": \"b\", \"arguments\": {}}";
+        assert!(rescue_text_tool_call(text).is_none(), "ambiguous → None");
+    }
+
+    #[test]
+    fn rescue_requires_object_arguments() {
+        assert!(rescue_text_tool_call("{\"tool\": \"a\", \"arguments\": \"x\"}").is_none());
+        // No arguments key at all defaults to an empty object set — allowed.
+        let call = rescue_text_tool_call("{\"tool\": \"a\"}").expect("defaults to {}");
+        assert_eq!(call.args, serde_json::json!({}));
+    }
+
+    #[test]
+    fn rescue_ignores_non_tool_json_objects() {
+        // An ordinary data object (e.g. rendered results) is not a call.
+        assert!(rescue_text_tool_call("{\"total\": 8, \"items\": []}").is_none());
+        // Empty tool name is not a call.
+        assert!(rescue_text_tool_call("{\"tool\": \"\", \"arguments\": {}}").is_none());
+    }
+
+    // ---- success-claim guard (SPEC §11 decision #16) ----
+
+    #[test]
+    fn claim_guard_flags_success_language_without_calls() {
+        assert!(claims_execution_without_tool(
+            "Your expense for the Pixel 10 Pro has been successfully registered in your account.",
+            0
+        ));
+        assert!(claims_execution_without_tool(
+            "The transaction is now live in your records.",
+            0
+        ));
+        assert!(claims_execution_without_tool(
+            "I have recorded the transaction.",
+            0
+        ));
+    }
+
+    #[test]
+    fn claim_guard_allows_success_language_after_calls() {
+        assert!(!claims_execution_without_tool(
+            "Your expense has been successfully created.",
+            2
+        ));
+    }
+
+    #[test]
+    fn claim_guard_allows_ordinary_replies() {
+        // This exact false-positive pattern occurred in the live transcript
+        // ("Here are the available categories for your expense...") — the
+        // word "expense" must not trigger the guard.
+        assert!(!claims_execution_without_tool(
+            "Here are the available categories for your expense: 1. Donations 2. Education",
+            0
+        ));
+        assert!(!claims_execution_without_tool(
+            "Could you please provide the account ID where this transaction should be recorded?",
+            0
+        ));
+        assert!(!claims_execution_without_tool("pong", 0));
+    }
+
+    #[test]
+    fn claim_guard_is_case_insensitive() {
+        assert!(claims_execution_without_tool(
+            "The Transaction Has Been Created Successfully.",
+            0
         ));
     }
 }
