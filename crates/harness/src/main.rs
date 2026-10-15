@@ -29,6 +29,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cfg: config::Config) -> anyhow::Result<()> {
+    // Scratch, not durable state (AGENTS.md #7): anything left in ATTACH_DIR
+    // from a prior process is stale — handles live for one order only.
+    if let Err(e) = std::fs::create_dir_all(&cfg.attach_dir) {
+        tracing::warn!(error = %e, dir = %cfg.attach_dir.display(), "attachment scratch dir create failed at boot");
+    }
+    stores::attachments::purge_all(&cfg.attach_dir);
+
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<queue::OrderJob>(64);
 
     let provider = Arc::new(OllamaProvider::new(
@@ -38,6 +45,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         cfg.ollama_think,
         cfg.ollama_seed,
         cfg.ollama_top_k,
+        cfg.ollama_num_predict,
     ));
     let executor: Arc<dyn ToolExecutor> = if cfg.mcp_servers.is_empty() {
         tracing::info!("MCP_SERVERS empty — tool dispatch reports backend_unavailable");
@@ -89,6 +97,9 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     let (safe, destructive, conditional, pending) = policy.counts();
     tracing::info!(safe, destructive, conditional, pending, "tool policy ready");
+    if cfg.confirm_mode.is_some() {
+        tracing::warn!("CONFIRM_MODE is deprecated and ignored (SPEC §11 #18)");
+    }
 
     let state: SharedState = Arc::new(AppState {
         sessions: stores::sessions::SessionStore::new(),

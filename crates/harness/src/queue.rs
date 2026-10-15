@@ -16,7 +16,7 @@ pub struct OrderJob {
 }
 
 pub enum Outcome {
-    Ok(Response),
+    Ok(Box<Response>),
     Err(ApiError),
 }
 
@@ -24,7 +24,7 @@ pub async fn spawn_worker(state: SharedState, mut rx: tokio::sync::mpsc::Receive
     while let Some(job) = rx.recv().await {
         let result = orchestrator::handle(&state, &job.client_id, job.order).await;
         let outcome = match result {
-            Ok(response) => Outcome::Ok(response),
+            Ok(response) => Outcome::Ok(Box::new(response)),
             Err(err) => {
                 tracing::info!(code = err.0.as_str(), "order rejected");
                 Outcome::Err(err)

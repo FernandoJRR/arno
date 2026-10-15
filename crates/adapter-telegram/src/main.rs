@@ -4,6 +4,7 @@
 
 mod bot;
 mod config;
+mod decision;
 mod harness_client;
 mod order;
 

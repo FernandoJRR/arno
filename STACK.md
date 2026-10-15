@@ -35,7 +35,12 @@ Versions are current stable majors at decision time (`major.minor` shown for ori
 | axum | 0.8 | harness | HTTP API server under `/v1`; extractor-based auth |
 | rmcp | 3.1 | harness + mcp-linux | MCP client (harness: tool discovery/dispatch over Streamable HTTP); MCP server (mcp-linux diagnostics tools) |
 | reqwest | 0.13 | harness | Ollama adapter transport; Telegram adapter's calls to Harness API |
-| teloxide | 0.17 | adapter-telegram | long-polling updates stream, sendMessage rendering |
+| teloxide | 0.17 | adapter-telegram | long-polling updates stream (messages + callback queries), sendMessage rendering, inline keyboards for decisions (SPEC §4.3) |
+| futures | 0.3 | adapter-telegram | `StreamExt` to drive the polling stream |
+| image | 0.25 (jpeg, png, webp) | mcp-ocr | decode attachments (EXIF orientation applied), resize, grayscale; pure Rust, no system libs (SPEC §11 #19) |
+| imageproc | 0.27 | mcp-ocr | rotation for deskew |
+| tempfile | 3 | mcp-ocr | private 0600 temp file for the cleaned image, removed on drop |
+| text2num | 2.8 | mcp-ocr | amounts written in words (English, Spanish) for misread checks (SPEC §11 #20) |
 | tracing / tracing-subscriber | 0.1 / 0.3 | all | structured logging; env-filter via `RUST_LOG` |
 | thiserror | 2.0 | libs | typed errors in library crates (`contract`, harness internals) |
 | anyhow | 1.0 | binaries | error context at binary edges (main, adapters) |
@@ -53,6 +58,27 @@ Notes:
   dev-dependency unification; mcp-linux ships `server`, `macros`,
   `transport-io`, `transport-streamable-http-server`. Dual transport is a
   config concern only — both converge on the same rmcp client handle.
+  `mcp-ocr` mirrors mcp-linux's feature set exactly (SPEC §11 decision #17).
+- `mcp-ocr` execs the fixed `tesseract` binary directly (argv, no shell) via
+  an `OcrEngine` trait mirroring mcp-linux's `CommandRunner`/`SystemCtl` seam;
+  chosen over a co-resident vision model because qwen3:4b-instruct already
+  saturates most of a 6 GB VRAM budget. An `ollama-vision` `OcrEngine` impl is
+  a documented future variant behind the same trait, not built.
+  Each call cleans the image in-process (`preprocess.rs`: upscale, contrast
+  stretch, deskew) and runs three Tesseract reads in parallel (TSV output,
+  `OMP_THREAD_LIMIT=1`), keeping the most confident (`reading.rs`); words under
+  60% confidence come back as `[?word]`, and rule fragments plus
+  all-doubtful non-numeric lines are trimmed before returning. `checks.rs`
+  adds `checks` for likely misreads (single confusable-digit repairs that
+  satisfy sums, differences or an amount in words) and corrects the text in
+  place when two independent pieces of evidence agree; the harness relays
+  any tool's `checks` verbatim (hiding them from the model) and notes
+  ungrounded numbers
+  (`orchestrator/grounding.rs`, SPEC §11 #20). The image ships `tessdata_best`
+  eng+spa pinned to commit `e12c65a` with sha256 checks (`TESSDATA_PREFIX`);
+  Debian's fast models stay installed as the fallback. Tuning on a real bill:
+  `cargo run -p mcp-ocr --example ocr_eval -- <image> [expected…]` with
+  `TESSDATA_PREFIX` pointing at the models (SPEC §11 #19).
 - No ORM/database anywhere: every store is in-memory by design (SPEC §4.1). If persistence arrives later it enters behind a store trait, not as a new global dependency.
 - No HTTP framework beyond axum; no tower-http middleware stack in v1 (localhost-only, no TLS — SPEC §7).
 
@@ -68,7 +94,8 @@ arno/
 ├── docker/
 │   ├── harness.Dockerfile
 │   ├── telegram-adapter.Dockerfile
-│   └── linux-mcp.Dockerfile
+│   ├── linux-mcp.Dockerfile
+│   └── ocr-mcp.Dockerfile
 └── crates/
     ├── contract/            # Order, Response, ErrorCode enum, attachment types.
     │                        # The ONLY dependency adapters share with the core.
@@ -76,14 +103,17 @@ arno/
     ├── harness/             # Part B binary. Modules:
     │   ├── api/             #   axum router, auth layer, /v1 routes, error mapping
     │   ├── queue/           #   global FIFO (tokio mpsc(1)) — one order in flight
-    │   ├── stores/          #   sessions (+TTL sweeper), dedup LRU, pending actions
+    │   ├── stores/          #   sessions (+TTL sweeper), dedup LRU, pending actions,
+    │   │                    #   attachments (ephemeral scratch, §4.4)
     │   ├── orchestrator/    #   agent loop, prompt assembly/context budgeting,
     │   │                    #   safety classification, frozen-payload gate
     │   ├── mcp/             #   connection manager, tool registry, namespacing
     │   └── model/           #   provider.rs (trait) + ollama.rs (impl)
     ├── adapter-cli/         # M0 throwaway: stdin → Order → render Response
-    ├── adapter-telegram/    # Part A: teloxide polling → Order; renders replies/errors
-    └── mcp-linux/           # Contract C backend: read-only Linux diagnostics MCP server
+    ├── adapter-telegram/    # Part A: teloxide polling → Order; renders replies/errors/decision buttons
+    ├── mcp-linux/           # Contract C backend: read-only Linux diagnostics MCP server
+    └── mcp-ocr/             # Contract C backend: read-only OCR MCP server (Tesseract,
+                             # `OcrEngine` trait seam — SPEC §11 decision #17)
 ```
 
 Dependency rule (enforced by imports, reviewable in CI): `contract ← {harness, adapters}`.
@@ -142,7 +172,7 @@ Rule: nothing outside `harness/src/model/` speaks HTTP to a model provider.
 3. `orchestrator/` runs the §6 loop: prompt assembly fills context budget in fixed
    priority (tool schemas → system → newest history first; drop oldest whole turns),
    classifies each tool call (read-only → `mcp/` dispatch; destructive → freeze
-   `{tool, args}`, mint token, return `needs_confirmation`), enforces
+   `{tool, args}`, mint a decision id, return a `decision`, SPEC §4.3), enforces
    `ORDER_BUDGET_S` with a clean cancel that reports completed RO side effects.
 4. Safety classification is **adaptive** (M3, SPEC §4.2): `policy.rs` classifies
    each discovered tool by asking the model to read its name/description/
@@ -155,9 +185,10 @@ Rule: nothing outside `harness/src/model/` speaks HTTP to a model provider.
 5. `mcp/` holds one rmcp client per configured backend, namespaces tools
    `<server>.<tool>`, presents the merged schema to the orchestrator, and tags
    failures with their backend for `backend_unavailable`.
-6. Redemption path (Order carries `confirmation_token`): validated in `stores/`,
-   stored payload dispatched verbatim, token deleted before dispatch, zero model
-   involvement (SPEC §4.3). `audit.rs` appends the outcome (success or failure)
+6. Decision path (Order carries `decision_answer`, or a legacy
+   `confirmation_token`): validated in `stores/`, id deleted before anything
+   happens, only `approve` dispatches the stored payload verbatim, zero model
+   involvement (SPEC §4.3). Any other order supersedes pending decisions. `audit.rs` appends the outcome (success or failure)
    to a hash-chained JSONL file — the harness's own durable record, independent
    of `stores/`'s in-memory, restart-clears semantics (SPEC §12.1).
 
@@ -169,8 +200,11 @@ HOST (Linux home server)
 └─ docker compose
    ├─ harness         → binds 127.0.0.1:8080   extra_hosts: "host.docker.internal:host-gateway"
    │                     bind mount ./data:/data (tool policy + audit log + transcript, M3)
+   │                     named volume attachments:/attachments (ephemeral scratch, §4.4)
    ├─ telegram-adapter→ outbound-only (getUpdates); single replica (409 rule)
-   └─ mcp-linux       → Streamable HTTP on the compose network, localhost-scoped
+   ├─ mcp-linux       → Streamable HTTP on the compose network, localhost-scoped
+   └─ mcp-ocr         → Streamable HTTP on the compose network, localhost-scoped;
+                         named volume attachments:/attachments (same volume as harness)
 ```
 
 - Images: multi-stage build (rust:slim builder → debian-slim runtime), non-root user, one binary per image.
@@ -191,6 +225,17 @@ HOST (Linux home server)
   (`arno-audit-<UTC ts>.jsonl`, `arno-transcript-<UTC ts>.jsonl`, SPEC §11
   decision #15) live beside the active files in this same directory and are
   covered by the same bind mount, gitignore, and inspectability guarantees.
+- **`attachments` (SPEC §4.4, §11 decision #17):** the opposite posture from
+  `./data` above — a **named** volume, not a bind mount, and deliberately
+  *not* one of the AGENTS.md #7 exceptions. It holds inbound image
+  attachments for the duration of one order only: the harness deletes each
+  order's files on every return path and purges the whole volume again at its
+  own boot, so `docker compose down -v` losing it is a feature, not a risk.
+  Shared between `harness` (`ATTACH_DIR`) and `mcp-ocr`
+  (`MCP_OCR_ATTACH_DIR`); both containers run as the same uid (`10001`,
+  `docker/harness.Dockerfile` and `docker/ocr-mcp.Dockerfile`) so the
+  harness's 0600 files stay readable across the container boundary without
+  loosening the file mode.
 
 ## 8.1 Backup (ops)
 
@@ -206,9 +251,10 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/NUM_CTX/TIMEOUT_S/THINK`, `OLLAMA_SEED` (default 42, 0=provider default), `OLLAMA_TOP_K` (default 1 greedy, 0=provider default) — deterministic tool-selection sampler per SPEC §11 decision #16, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (`model`\|`token_only`, §4.3 revised), `ATTACH_MAX_BYTES`, `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3), `AUDIT_LOG_ROTATE_BYTES` (default 2 MiB, 0=off), `TRANSCRIPT_LOG_ROTATE_BYTES` (default 10 MiB, 0=off), `LOG_KEEP_SEGMENTS` (default 12), `LOG_VERIFY_ON_BOOT` (default `false`) — rotation/verification knobs per SPEC §11 decision #15 |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/TIMEOUT_S/THINK`, `OLLAMA_NUM_CTX` (default 16384 — fits qwen3:4b ~94% on a 6 GB GPU, SPEC §11 #20), `OLLAMA_SEED` (default 42, 0=provider default), `OLLAMA_TOP_K` (default 1 greedy, 0=provider default) — deterministic tool-selection sampler per SPEC §11 decision #16, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (deprecated, ignored with a boot warning — SPEC §11 #18), `ATTACH_MAX_BYTES`, `ATTACH_DIR` (default `./data/attachments` — ephemeral scratch for inbound image attachments, SPEC §4.4/§11 decision #17), `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3), `AUDIT_LOG_ROTATE_BYTES` (default 2 MiB, 0=off), `TRANSCRIPT_LOG_ROTATE_BYTES` (default 10 MiB, 0=off), `LOG_KEEP_SEGMENTS` (default 12), `LOG_VERIFY_ON_BOOT` (default `false`) — rotation/verification knobs per SPEC §11 decision #15, `OLLAMA_NUM_PREDICT` (default 400, 0=provider default), `NUMBER_GUARD` (default `true`) — answer length and number hygiene per SPEC §11 #20 |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
+| mcp-ocr | `MCP_OCR_TRANSPORT` (`http`\|`stdio`), `MCP_OCR_BIND`, `MCP_OCR_ATTACH_DIR` (its own mount of the `attachments` volume shared with the harness, SPEC §4.4), `MCP_OCR_LANG` (default `eng+spa`), `MCP_OCR_ENGINE` (only `tesseract` today; `ollama-vision` documented, not built — SPEC §11 decision #17), `MCP_OCR_PREPROCESS` (`on`\|`off`, default `on` — SPEC §11 #19) |
 | deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
 
 ## 8. Testing strategy
@@ -241,23 +287,36 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
   contains `user_message` → `tool_call` → `tool_result` → `assistant_final`
   in order with a valid hash chain — the concrete fix for "there's no record
   of what tools got called."
-- **Confirmation classifier (§4.3 revised, `confirm.rs`)**: same
-  scripted-`ModelProvider` shape as the tool-policy classifier — clean
-  confirm/reject/unrelated verdicts, code-fenced JSON tolerance, prose-only
-  output, an unknown verdict string, a down provider, and a tool-call output
-  from the provider, all failing closed to `None` (never `Confirm`, asserted
-  explicitly). `pending.rs` gains coverage for `peek_latest` (newest-of-several,
-  TTL, client/session isolation, non-consuming) and `cancel` (single-use,
-  matching `take`'s bookkeeping). `api_contract.rs` adds end-to-end coverage a
-  static `FixedProvider` can't give: a `ScriptedProvider` that branches on
-  whether the request is `confirm::classify`'s call or an ordinary
-  `normal_path` completion (the two share the same `ModelProvider::complete`
-  seam, distinguished only by the classifier's fixed system-prompt content) —
-  plain "yes" dispatches the frozen payload exactly once; plain "no" cancels
-  it and a later "yes" cannot resurrect it; an unrelated reply falls through
-  to `normal_path` leaving the pending action redeemable by a real token
-  afterward; a classifier failure falls through the same way — nothing ever
-  executes on an unparseable or unreachable verdict.
+- **Decisions (SPEC §4.3, §11 #18)**: `contract` round-trips `decision` /
+  `decision_answer` (exactly-one-of `value`/`text`) and the four
+  `decision_*` codes; `pending.rs` covers `dcs_` ids carrying their options
+  and `discard_session` (supersede, client/session isolation); the
+  orchestrator builds `details` from args + schema titles without model text.
+  `api_contract.rs`: a frozen proposal returns `decision` plus legacy fields
+  with equal ids; `approve` dispatches exactly once and a replay is
+  `decision_used`; `reject` never dispatches; unknown / expired / invalid
+  value give distinct codes and an invalid value still burns the id; a
+  free-text answer runs the model and never dispatches; a plain "yes"
+  supersedes the decision and never executes. Adapter tests cover Telegram
+  short callback keys (≤64 bytes, chat-bound, single tap per decision,
+  bounded map) and the CLI number/free-text mapping.
+- **Attachment ingestion (SPEC §4.4/§11 decision #17, `stores/attachments.rs`)**:
+  allowed-mime + size filtering, a written file has `0600` perms and a
+  charset-safe handle, disallowed mime/oversize/`ref`-form attachments are
+  skipped, `cleanup`/`purge_all` remove files and tolerate an already-missing
+  target. `api_contract.rs` adds one end-to-end test: an order carrying an
+  inline image attachment produces the manifest system message, a scripted
+  `ModelProvider` reads the handle back out of it and calls `ocr.extract_text`,
+  the response reflects the tool result, the scratch file is gone afterward,
+  and the manifest never appears in the persisted session history.
+- **`mcp-ocr` (SPEC §11 decision #17)**: `extract_text` argument/result shape
+  exercised against a fake `OcrEngine` (no real Tesseract binary in CI); the
+  handle-traversal guard rejects `../x` and empty handles before the engine is
+  ever called; a stdio round trip against the crate's own binary lists the
+  fixed one-tool surface and confirms the same traversal guard end to end. Preprocessing is tested on synthetic images only
+  (gradient lighting, known 3° tilt, upscale cap, pixel-count cap, garbage
+  input); TSV parsing, doubt marks and variant selection use a fake engine;
+  the cleaned temp file is checked gone after every call.
 
 ## 9. Deliberately deferred
 
@@ -266,3 +325,6 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 | Concrete linux diagnostic tool list | M1 | needs a real box to design against |
 | SSE/WebSocket under `/v1` | when a consumer exists | additive, no rework (SPEC §11.3) |
 | Second ModelProvider impl | when needed | seam exists; do not pre-build |
+| `ollama-vision` `OcrEngine` impl | when GPU budget allows a co-resident vision model | trait seam exists (`mcp-ocr`); building it now would compete with qwen3 for the same 6 GB VRAM (SPEC §11 decision #17) |
+| PDF bill OCR | when needed | needs `pdftoppm` rasterization ahead of `extract_text`; images-only for v1 |
+| `ref`-form attachment upload (`POST /v1/files`) | when needed | schema field already reserved (SPEC §4.1); no server-side TTL temp storage built yet |

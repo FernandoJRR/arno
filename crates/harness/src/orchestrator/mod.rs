@@ -4,10 +4,11 @@
 //! flight makes session access and confirmation redemption race-free.
 
 pub mod context;
+mod grounding;
 
 use crate::api::error::ApiError;
-use crate::confirm;
 use crate::state::AppState;
+use crate::stores::attachments;
 use crate::stores::pending::TakeOutcome;
 use contract::{ErrorCode, Response, StructuredItem};
 use std::sync::Arc;
@@ -79,7 +80,9 @@ fn system_prompt() -> String {
         "You are the home-server harness assistant called Arno. \
          Current date and time: {now}. \
          You interpret orders and answer with the help of the available tools. \
-         Be terse and factual. \
+         Be terse and factual: keep final answers to at most 6 short lines \
+         of key facts (amounts, dates, names, outcomes) and offer more \
+         detail on request. Always call a tool when one is needed to answer. \
          When a tool call fails and you retry it, change only the argument(s) \
          that caused the failure — copy every other value from your own \
          previous attempt exactly. Never drop or reset a field the user \
@@ -105,54 +108,90 @@ pub async fn handle(
         return Err(ApiError(ErrorCode::DuplicateOrder));
     }
 
-    // SPEC §6 step 3 — redemption path, unchanged: explicit token always
-    // wins, even in token_only mode.
+    // SPEC §4.3: a decision answer is resolved without the model; only an
+    // explicit `approve` on a live id dispatches (AGENTS.md #3).
+    if let Some(answer) = order.decision_answer.clone() {
+        answer
+            .validate()
+            .map_err(|_| ApiError(ErrorCode::InvalidOrder))?;
+        return answer_decision(st, client_id, order, answer).await;
+    }
+
+    // Legacy redemption path (deprecated until /v2): token == decision id.
     if let Some(token) = order.confirmation_token.as_deref() {
         return redeem(st, client_id, &order.session_id, token).await;
     }
 
-    // SPEC §4.3 revised, AGENTS.md #3: model judges consent only; Confirm
-    // still dispatches through the unchanged redeem(). peek_latest doesn't
-    // consume, so Unrelated/failure just falls through to normal_path.
-    if cfg.confirm_mode == crate::config::ConfirmMode::Model
-        && let Some((token, action)) =
-            st.pending
-                .peek_latest(client_id, &order.session_id, cfg.confirm_ttl)
-    {
-        let verdict = confirm::classify(
-            st.provider.as_ref(),
-            &action.tool,
-            &action.args,
-            &order.text,
-        )
-        .await;
-        match verdict {
-            Some(confirm::Verdict::Confirm) => {
-                return redeem(st, client_id, &order.session_id, &token).await;
-            }
-            Some(confirm::Verdict::Reject) => {
-                return Ok(reject_pending(st, client_id, &order.session_id, &token, action).await);
-            }
-            Some(confirm::Verdict::Unrelated) | None => {
-                // Falls through to normal_path as an ordinary order.
-            }
-        }
-    }
-
-    normal_path(st, client_id, order).await
+    // Any other order supersedes a pending decision: plain text never
+    // approves (SPEC §4.3, §11 #18).
+    let superseded = supersede(st, client_id, &order.session_id);
+    normal_path(st, client_id, order, superseded).await
 }
 
-/// Cancels a pending action the model judged declined — single-use via
-/// `PendingStore::cancel`, so it can never later be redeemed. Mirrors
-/// `redeem()`'s footprint: transcript only, no `SessionStore` touch.
-async fn reject_pending(
+/// Resolves a `decision_answer`. The id is consumed before anything else
+/// happens, so every answer is single-use even when it fails.
+async fn answer_decision(
+    st: &Arc<AppState>,
+    client_id: &str,
+    order: contract::Order,
+    answer: contract::DecisionAnswer,
+) -> Result<Response, ApiError> {
+    let session_id = order.session_id.clone();
+    let action = match st
+        .pending
+        .take(client_id, &session_id, &answer.id, st.cfg.confirm_ttl)
+    {
+        TakeOutcome::Action(action) => action,
+        TakeOutcome::Unknown => return Err(ApiError(ErrorCode::DecisionUnknown)),
+        TakeOutcome::Expired => return Err(ApiError(ErrorCode::DecisionExpired)),
+        TakeOutcome::Used => return Err(ApiError(ErrorCode::DecisionUsed)),
+    };
+    // Any older decision in this session is stale now too.
+    supersede(st, client_id, &session_id);
+
+    match (answer.value.as_deref(), answer.text) {
+        (Some(value), _) if !action.options.iter().any(|o| o == value) => {
+            record_cancelled(st, client_id, &session_id, &action);
+            Err(ApiError(ErrorCode::DecisionInvalidValue))
+        }
+        (Some(APPROVE), _) => execute_frozen_action(st, client_id, &session_id, action).await,
+        (Some(_), _) => {
+            record_cancelled(st, client_id, &session_id, &action);
+            Ok(Response::text("Cancelled. Nothing was executed."))
+        }
+        (None, Some(text)) => {
+            record_cancelled(st, client_id, &session_id, &action);
+            let order = contract::Order {
+                text,
+                decision_answer: None,
+                ..order
+            };
+            normal_path(st, client_id, order, vec![action]).await
+        }
+        (None, None) => Err(ApiError(ErrorCode::InvalidOrder)),
+    }
+}
+
+/// Discards every pending decision of this session, recording each as
+/// cancelled. Returns them so the model can be told they did not run.
+fn supersede(
     st: &Arc<AppState>,
     client_id: &str,
     session_id: &str,
-    token: &str,
-    action: crate::stores::pending::PendingAction,
-) -> Response {
-    st.pending.cancel(client_id, session_id, token);
+) -> Vec<crate::stores::pending::PendingAction> {
+    let discarded = st.pending.discard_session(client_id, session_id);
+    for action in &discarded {
+        record_cancelled(st, client_id, session_id, action);
+    }
+    discarded
+}
+
+fn record_cancelled(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    action: &crate::stores::pending::PendingAction,
+) {
     if let Some(transcript) = &st.transcript
         && let Err(e) = transcript.record(
             client_id,
@@ -165,7 +204,6 @@ async fn reject_pending(
     {
         tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
     }
-    Response::text(format!("Cancelled `{}`.", action.tool))
 }
 
 fn validate_attachments(order: &contract::Order, cap: usize) -> Result<(), ApiError> {
@@ -192,62 +230,7 @@ async fn redeem(
         .take(client_id, session_id, token, st.cfg.confirm_ttl)
     {
         TakeOutcome::Action(action) => {
-            // Deleted-before-dispatch already happened inside take(); a failed
-            // execution is NOT retried — the safe direction (SPEC §4.3).
-            let outcome = st.executor.execute_frozen(&action.tool, &action.args).await;
-            // Audit before reporting the outcome (SPEC §12.1): the write to
-            // Securo (or whichever backend) already happened either way — a
-            // failure to record it is an ops alarm, never a reason to hide
-            // the real execution result from the caller.
-            if let Some(audit) = &st.audit {
-                let record_outcome = match &outcome {
-                    Ok(result) => crate::audit::RecordOutcome::Ok(result),
-                    Err(code) => crate::audit::RecordOutcome::Err(code.as_str()),
-                };
-                if let Err(e) = audit.record(
-                    client_id,
-                    session_id,
-                    &action.tool,
-                    &action.args,
-                    record_outcome,
-                ) {
-                    tracing::error!(error = %e, tool = %action.tool, "audit log write failed");
-                }
-            }
-            // Broader conversational record (SPEC §12.2) — deliberately
-            // duplicates data the audit log also holds: that log is the
-            // narrow financial ledger, this is the general narrative that
-            // happens to include writes too.
-            if let Some(transcript) = &st.transcript {
-                let ser_outcome: crate::transcript::SerOutcome = match &outcome {
-                    Ok(result) => crate::transcript::Outcome::Ok(result).into(),
-                    Err(code) => crate::transcript::Outcome::Err(code.as_str()).into(),
-                };
-                if let Err(e) = transcript.record(
-                    client_id,
-                    session_id,
-                    crate::transcript::Event::ConfirmationRedeemed {
-                        tool: &action.tool,
-                        args: &action.args,
-                        outcome: ser_outcome,
-                    },
-                ) {
-                    tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
-                }
-            }
-            match outcome {
-                Ok(result) => Ok(Response {
-                    text: format!("Executed `{}`.", action.tool),
-                    needs_confirmation: None,
-                    confirmation_token: None,
-                    structured: Some(vec![StructuredItem {
-                        tool: action.tool,
-                        args: action.args,
-                        result,
-                    }]),
-                }),
-                Err(code) => Err(ApiError(code)),
-            }
+            execute_frozen_action(st, client_id, session_id, action).await
         }
         TakeOutcome::Unknown => Err(ApiError(ErrorCode::ConfirmationUnknown)),
         TakeOutcome::Expired => Err(ApiError(ErrorCode::ConfirmationExpired)),
@@ -255,12 +238,89 @@ async fn redeem(
     }
 }
 
+/// Dispatches an already-consumed frozen payload verbatim, model bypassed.
+/// Deleted-before-dispatch already happened in `take()`; a failed execution
+/// is NOT retried — the safe direction (SPEC §4.3).
+async fn execute_frozen_action(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    action: crate::stores::pending::PendingAction,
+) -> Result<Response, ApiError> {
+    let outcome = st.executor.execute_frozen(&action.tool, &action.args).await;
+    // Audit before reporting the outcome (SPEC §12.1): the write to
+    // Securo (or whichever backend) already happened either way — a
+    // failure to record it is an ops alarm, never a reason to hide
+    // the real execution result from the caller.
+    if let Some(audit) = &st.audit {
+        let record_outcome = match &outcome {
+            Ok(result) => crate::audit::RecordOutcome::Ok(result),
+            Err(code) => crate::audit::RecordOutcome::Err(code.as_str()),
+        };
+        if let Err(e) = audit.record(
+            client_id,
+            session_id,
+            &action.tool,
+            &action.args,
+            record_outcome,
+        ) {
+            tracing::error!(error = %e, tool = %action.tool, "audit log write failed");
+        }
+    }
+    // Broader conversational record (SPEC §12.2) — deliberately
+    // duplicates data the audit log also holds: that log is the
+    // narrow financial ledger, this is the general narrative that
+    // happens to include writes too.
+    if let Some(transcript) = &st.transcript {
+        let ser_outcome: crate::transcript::SerOutcome = match &outcome {
+            Ok(result) => crate::transcript::Outcome::Ok(result).into(),
+            Err(code) => crate::transcript::Outcome::Err(code.as_str()).into(),
+        };
+        if let Err(e) = transcript.record(
+            client_id,
+            session_id,
+            crate::transcript::Event::ConfirmationRedeemed {
+                tool: &action.tool,
+                args: &action.args,
+                outcome: ser_outcome,
+            },
+        ) {
+            tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
+        }
+    }
+    match outcome {
+        Ok(result) => Ok(Response {
+            text: format!("Executed `{}`.", action.tool),
+            structured: Some(vec![StructuredItem {
+                tool: action.tool,
+                args: action.args,
+                result,
+            }]),
+            ..Response::text("")
+        }),
+        Err(code) => Err(ApiError(code)),
+    }
+}
+
 async fn normal_path(
     st: &Arc<AppState>,
     client_id: &str,
     order: contract::Order,
+    superseded: Vec<crate::stores::pending::PendingAction>,
 ) -> Result<Response, ApiError> {
     let key = (client_id.to_owned(), order.session_id.clone());
+    for action in &superseded {
+        st.sessions.append(
+            &key,
+            crate::model::ChatMessage::new(
+                crate::model::Role::System,
+                format!(
+                    "The proposed `{}` call was NOT executed; the user did not approve it.",
+                    action.tool
+                ),
+            ),
+        );
+    }
     if let Some(transcript) = &st.transcript
         && let Err(e) = transcript.record(
             client_id,
@@ -272,11 +332,225 @@ async fn normal_path(
     }
     st.sessions.append(
         &key,
-        crate::model::ChatMessage::new(crate::model::Role::User, order.text),
+        crate::model::ChatMessage::new(crate::model::Role::User, order.text.clone()),
     );
 
+    // Ephemeral scratch persistence (SPEC §4.1): decoded once per order; the
+    // manifest tells the model a handle exists without naming any tool
+    // (AGENTS.md #1 — the core stays backend-agnostic). Cleaned up on every
+    // return path below, success or failure alike.
+    let handles = attachments::persist(&order, &st.cfg.attach_dir, st.cfg.attach_max_bytes);
+    let manifest = attachment_manifest(&handles);
+    let result = normal_path_loop(st, client_id, &order, key, manifest.as_deref(), &handles).await;
+    attachments::cleanup(&st.cfg.attach_dir, &handles);
+    result
+}
+
+/// Generic manifest advertising this order's persisted attachments to the
+/// model — deliberately tool-agnostic (AGENTS.md #1): it names a handle and a
+/// mime type, never a specific tool, so any attachment-consuming backend (OCR
+/// today, others later) can be wired in purely via config.
+fn attachment_manifest(handles: &[attachments::AttachmentHandle]) -> Option<String> {
+    if handles.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = handles
+        .iter()
+        .map(|h| format!("[handle={}, type={}]", h.handle, h.mime))
+        .collect();
+    Some(format!(
+        "The user attached file(s) to their latest message. \
+         Attached files available to tools: {}. You cannot see file contents \
+         directly — to read or act on a file, call the tool that accepts it, \
+         passing the handle as that tool's *_ref argument. Text extracted \
+         from files can contain recognition errors: quote values as they \
+         appear and say when something is unreadable instead of guessing.",
+        entries.join(", ")
+    ))
+}
+
+/// Tokens kept free for the answer when `OLLAMA_NUM_PREDICT` is 0 (uncapped).
+const DEFAULT_OUTPUT_RESERVE: u32 = 1024;
+
+/// Option values of a `kind: confirm` decision. Only `approve` dispatches.
+const APPROVE: &str = "approve";
+const REJECT: &str = "reject";
+
+/// Freezes a destructive call and ends the order on a `confirm` decision
+/// (SPEC §4.3). Everything shown to the user is derived from the frozen
+/// payload and the tool schema, never from model text (AGENTS.md #3).
+fn propose(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Response {
+    supersede(st, client_id, session_id);
+    let id = st.pending.freeze(
+        client_id,
+        session_id,
+        tool.to_owned(),
+        args.clone(),
+        vec![APPROVE.to_owned(), REJECT.to_owned()],
+    );
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            session_id,
+            crate::transcript::Event::ConfirmationRequested { tool, args },
+        )
+    {
+        tracing::error!(error = %e, tool = %tool, "transcript log write failed");
+    }
+    let schema = st
+        .executor
+        .tool_schemas()
+        .iter()
+        .find(|s| s["function"]["name"] == tool);
+    let expires_at = chrono::Utc::now()
+        + chrono::Duration::from_std(st.cfg.confirm_ttl).unwrap_or(chrono::Duration::zero());
+    let decision = contract::Decision {
+        id: id.clone(),
+        kind: contract::DecisionKind::Confirm,
+        prompt: format!("Run `{tool}`?"),
+        details: decision_details(args, schema),
+        options: vec![
+            contract::DecisionOption {
+                value: APPROVE.into(),
+                title: "Confirm".into(),
+                style: contract::OptionStyle::Primary,
+            },
+            contract::DecisionOption {
+                value: REJECT.into(),
+                title: "Cancel".into(),
+                style: contract::OptionStyle::Danger,
+            },
+        ],
+        free_text: true,
+        expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    Response {
+        // Readable on its own for adapters that ignore `decision`.
+        text: format!(
+            "This would run `{tool}` with {}. Approve or cancel it.",
+            render_args(args)
+        ),
+        needs_confirmation: Some(true),
+        confirmation_token: Some(id),
+        decision: Some(decision),
+        ..Response::text("")
+    }
+}
+
+/// One row per argument: label from the schema property `title` when the
+/// backend declares one, else the parameter name; strings shown unquoted.
+fn decision_details(
+    args: &serde_json::Value,
+    schema: Option<&serde_json::Value>,
+) -> Vec<contract::DecisionDetail> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .map(|(k, v)| {
+            let label = schema
+                .and_then(|s| s["function"]["parameters"]["properties"][k]["title"].as_str())
+                .unwrap_or(k)
+                .to_owned();
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            contract::DecisionDetail { label, value }
+        })
+        .collect()
+}
+
+/// Deterministic additions to a final answer (SPEC §11 #20): relayed
+/// backend checks, then — when a tool ran this order — the numbers the
+/// answer states that no tool result or user message contains.
+fn finish_answer(
+    st: &Arc<AppState>,
+    key: &crate::stores::sessions::SessionKey,
+    text: &str,
+    checks: &[String],
+    dispatched_tool_calls: u32,
+) -> String {
+    let missing = if st.cfg.number_guard && dispatched_tool_calls > 0 {
+        let history = st.sessions.snapshot(key);
+        let prompt = system_prompt();
+        let mut sources: Vec<&str> = history
+            .iter()
+            .filter(|m| matches!(m.role, crate::model::Role::Tool | crate::model::Role::User))
+            .map(|m| m.content.as_str())
+            .collect();
+        sources.push(&prompt);
+        sources.extend(checks.iter().map(String::as_str));
+        let found = grounding::ungrounded(text, &sources);
+        if !found.is_empty() {
+            tracing::warn!(
+                count = found.len(),
+                "final answer states numbers not found in sources"
+            );
+        }
+        found
+    } else {
+        Vec::new()
+    };
+    grounding::decorate(text, checks, &missing)
+}
+
+/// Small models mangle long handles when copying them (observed: a dropped
+/// hex digit → "file not found"). With exactly one attachment on the order,
+/// any `*_ref` argument naming an unknown handle is pointed at it; with
+/// several, nothing is guessed. Runs before transcript/policy, so what is
+/// logged and frozen is what is dispatched (SPEC §4.1).
+fn repair_attachment_refs(
+    calls: &mut [crate::model::ToolCall],
+    handles: &[attachments::AttachmentHandle],
+) {
+    let [only] = handles else { return };
+    for call in calls {
+        let Some(args) = call.args.as_object_mut() else {
+            continue;
+        };
+        for (k, v) in args.iter_mut() {
+            if k.ends_with("_ref") && v.as_str() != Some(only.handle.as_str()) {
+                tracing::info!(tool = %call.name, arg = %k, "repaired attachment handle");
+                *v = serde_json::Value::String(only.handle.clone());
+            }
+        }
+    }
+}
+
+/// Schemas of tools taking an attachment handle — any parameter named
+/// `*_ref`, the same convention the manifest advertises. Schema-driven, so
+/// the core names no backend (AGENTS.md #1).
+fn attachment_tools(schemas: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    schemas
+        .iter()
+        .filter(|s| {
+            s["function"]["parameters"]["properties"]
+                .as_object()
+                .is_some_and(|props| props.keys().any(|k| k.ends_with("_ref")))
+        })
+        .cloned()
+        .collect()
+}
+
+async fn normal_path_loop(
+    st: &Arc<AppState>,
+    client_id: &str,
+    order: &contract::Order,
+    key: crate::stores::sessions::SessionKey,
+    manifest: Option<&str>,
+    handles: &[attachments::AttachmentHandle],
+) -> Result<Response, ApiError> {
     let deadline = Instant::now() + st.cfg.order_budget;
     let mut dispatched_tool_calls: u32 = 0;
+    // Backend `checks` relayed verbatim on the final answer (SPEC §4.2).
+    let mut checks: Vec<String> = Vec::new();
 
     loop {
         if Instant::now() >= deadline {
@@ -286,22 +560,59 @@ async fn normal_path(
         }
 
         let history = st.sessions.snapshot(&key);
-        // Budget priority (SPEC §8): schemas → system → newest history first.
+        // Budget priority (SPEC §8): schemas → system → attachment manifest
+        // (when present, SPEC §4.1) → newest history first. The manifest goes
+        // right after the latest user turn: small models ignore it when it
+        // sits before the whole history.
         let schemas = st.executor.tool_schemas();
         let prompt = system_prompt();
-        let reserved = context::estimate_system(&prompt) + context::estimate_schemas(schemas);
+        // The answer needs room too, or Ollama shifts the window and drops
+        // the system prompt (SPEC §11 #20).
+        let output_reserve = match st.cfg.ollama_num_predict {
+            0 => DEFAULT_OUTPUT_RESERVE,
+            n => n,
+        };
+        let mut reserved =
+            context::estimate_system(&prompt) + context::estimate_schemas(schemas) + output_reserve;
+        if let Some(m) = manifest {
+            reserved += context::estimate_system(m);
+        }
         let messages = {
             let mut msgs = vec![crate::model::ChatMessage::new(
                 crate::model::Role::System,
                 prompt,
             )];
             msgs.extend(context::trim(&history, st.cfg.num_ctx, reserved));
+            if let Some(m) = manifest {
+                let at = msgs
+                    .iter()
+                    .rposition(|m| m.role == crate::model::Role::User)
+                    .map_or(msgs.len(), |i| i + 1);
+                msgs.insert(
+                    at,
+                    crate::model::ChatMessage::new(crate::model::Role::System, m.to_owned()),
+                );
+            }
             msgs
         };
 
+        // Until the first tool runs, an order with attachments offers only
+        // tools that accept one (a `*_ref` parameter, SPEC §4.1): with the
+        // full catalogue small models answer "I can't see the file" instead.
+        let tools = match manifest {
+            Some(_) if dispatched_tool_calls == 0 => {
+                let narrowed = attachment_tools(schemas);
+                if narrowed.is_empty() {
+                    schemas.to_vec()
+                } else {
+                    narrowed
+                }
+            }
+            _ => schemas.to_vec(),
+        };
         let req = crate::model::CompletionRequest {
             messages,
-            tools: schemas.to_vec(),
+            tools,
             context_tokens: st.cfg.num_ctx,
         };
         match st
@@ -320,7 +631,8 @@ async fn normal_path(
                 // the loop's single-writer structure).
                 if let Some(call) = rescue_text_tool_call(&text) {
                     tracing::info!(tool = %call.name, "rescued text tool call");
-                    let calls = vec![call];
+                    let mut calls = vec![call];
+                    repair_attachment_refs(&mut calls, handles);
                     dispatched_tool_calls += calls.len() as u32;
                     st.sessions.append(
                         &key,
@@ -341,34 +653,15 @@ async fn normal_path(
                             tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
                         }
                         if st.policy.is_destructive(&call.name, &call.args) {
-                            let token = st.pending.freeze(
+                            // Freeze exact payload; NEVER dispatch here, NEVER auto-retry
+                            // (SPEC §4.3, §8).
+                            return Ok(propose(
+                                st,
                                 client_id,
                                 &order.session_id,
-                                call.name.clone(),
-                                call.args.clone(),
-                            );
-                            if let Some(transcript) = &st.transcript
-                                && let Err(e) = transcript.record(
-                                    client_id,
-                                    &order.session_id,
-                                    crate::transcript::Event::ConfirmationRequested {
-                                        tool: &call.name,
-                                        args: &call.args,
-                                    },
-                                )
-                            {
-                                tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                            }
-                            return Ok(Response {
-                                text: format!(
-                                    "This would run `{}` with {}. Reply to confirm or say no to cancel.",
-                                    call.name,
-                                    render_args(&call.args)
-                                ),
-                                needs_confirmation: Some(true),
-                                confirmation_token: Some(token),
-                                structured: None,
-                            });
+                                &call.name,
+                                &call.args,
+                            ));
                         }
                         let result = st
                             .executor
@@ -377,6 +670,7 @@ async fn normal_path(
                             .unwrap_or_else(|code| {
                                 serde_json::Value::String(code.as_str().to_owned())
                             });
+                        grounding::collect_checks(&mut checks, &result);
                         if let Some(transcript) = &st.transcript
                             && let Err(e) = transcript.record(
                                 client_id,
@@ -394,7 +688,7 @@ async fn normal_path(
                             &key,
                             crate::model::ChatMessage::tool_result(
                                 call.id.clone(),
-                                result.to_string(),
+                                grounding::strip_checks(&result).to_string(),
                             ),
                         );
                         if looks_like_error(&result) {
@@ -431,6 +725,7 @@ async fn normal_path(
                     );
                     continue;
                 }
+                let text = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
                 if let Some(transcript) = &st.transcript
                     && let Err(e) = transcript.record(
                         client_id,
@@ -446,7 +741,8 @@ async fn normal_path(
                 );
                 return Ok(Response::text(text));
             }
-            crate::model::CompletionOutput::ToolCalls(calls) => {
+            crate::model::CompletionOutput::ToolCalls(mut calls) => {
+                repair_attachment_refs(&mut calls, handles);
                 dispatched_tool_calls += calls.len() as u32;
                 // The model's own request, remembered — without this the next
                 // completion (even later in this same loop) sees only an
@@ -474,45 +770,22 @@ async fn normal_path(
                     // this is a synchronous lookup against the persisted
                     // policy, not a model call.
                     if st.policy.is_destructive(&call.name, &call.args) {
-                        // Freeze exact payload + mint token; NEVER dispatch here,
-                        // NEVER auto-retry (SPEC §4.3, §8).
-                        let token = st.pending.freeze(
+                        // Freeze exact payload; NEVER dispatch here, NEVER auto-retry
+                        // (SPEC §4.3, §8).
+                        return Ok(propose(
+                            st,
                             client_id,
                             &order.session_id,
-                            call.name.clone(),
-                            call.args.clone(),
-                        );
-                        if let Some(transcript) = &st.transcript
-                            && let Err(e) = transcript.record(
-                                client_id,
-                                &order.session_id,
-                                crate::transcript::Event::ConfirmationRequested {
-                                    tool: &call.name,
-                                    args: &call.args,
-                                },
-                            )
-                        {
-                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                        }
-                        return Ok(Response {
-                            // SPEC §4.3 revised: most clients now confirm by
-                            // replying naturally; confirmation_token below
-                            // still works too, just isn't the only way.
-                            text: format!(
-                                "This would run `{}` with {}. Reply to confirm or say no to cancel.",
-                                call.name,
-                                render_args(&call.args)
-                            ),
-                            needs_confirmation: Some(true),
-                            confirmation_token: Some(token),
-                            structured: None,
-                        });
+                            &call.name,
+                            &call.args,
+                        ));
                     }
                     let result = st
                         .executor
                         .execute(&call.name, &call.args)
                         .await
                         .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()));
+                    grounding::collect_checks(&mut checks, &result);
                     if let Some(transcript) = &st.transcript
                         && let Err(e) = transcript.record(
                             client_id,
@@ -528,7 +801,12 @@ async fn normal_path(
                     }
                     st.sessions.append(
                         &key,
-                        crate::model::ChatMessage::tool_result(call.id.clone(), result.to_string()),
+                        crate::model::ChatMessage::tool_result(
+                            call.id.clone(),
+                            // `checks` are for the user, relayed on the final
+                            // answer; the model would only repeat them.
+                            grounding::strip_checks(&result).to_string(),
+                        ),
                     );
                     // A static system-prompt rule competes poorly against
                     // whatever's most recent in context (small-model recency
@@ -730,6 +1008,74 @@ you actually know and explicitly say no action was taken.";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decision_details_come_from_args_and_schema_titles() {
+        let schema = serde_json::json!({"type": "function", "function": {
+            "name": "x.create", "parameters": {"type": "object", "properties": {
+                "amount": {"type": "number", "title": "Amount"},
+                "note": {"type": "string"}}}}});
+        let args = serde_json::json!({"amount": 150.5, "note": "coffee", "apply": true});
+        let rows: Vec<(String, String)> = decision_details(&args, Some(&schema))
+            .into_iter()
+            .map(|d| (d.label, d.value))
+            .collect();
+        assert!(rows.contains(&("Amount".into(), "150.5".into())));
+        assert!(
+            rows.contains(&("note".into(), "coffee".into())),
+            "strings unquoted"
+        );
+        assert!(rows.contains(&("apply".into(), "true".into())));
+        assert!(decision_details(&serde_json::json!(null), None).is_empty());
+    }
+
+    #[test]
+    fn repair_points_mangled_refs_at_the_only_attachment() {
+        let handle = |h: &str| attachments::AttachmentHandle {
+            handle: h.into(),
+            mime: "image/jpeg".into(),
+        };
+        let call = |args| crate::model::ToolCall {
+            id: "c1".into(),
+            name: "ocr.extract_text".into(),
+            args,
+        };
+        let mut calls = vec![call(serde_json::json!({"image_ref": "att_12x4", "n": 1}))];
+        repair_attachment_refs(&mut calls, &[handle("att_1234")]);
+        assert_eq!(
+            calls[0].args,
+            serde_json::json!({"image_ref": "att_1234", "n": 1})
+        );
+
+        // Several attachments: never guess.
+        let mut calls = vec![call(serde_json::json!({"image_ref": "att_12x4"}))];
+        repair_attachment_refs(&mut calls, &[handle("att_1234"), handle("att_5678")]);
+        assert_eq!(calls[0].args["image_ref"], "att_12x4");
+    }
+
+    #[test]
+    fn attachment_tools_keeps_only_schemas_with_a_ref_parameter() {
+        let schema = |name: &str, props: serde_json::Value| {
+            serde_json::json!({"type": "function", "function": {
+                "name": name, "parameters": {"type": "object", "properties": props}}})
+        };
+        let schemas = vec![
+            schema(
+                "ocr.extract_text",
+                serde_json::json!({"image_ref": {"type": "string"}}),
+            ),
+            schema(
+                "securo.list_accounts",
+                serde_json::json!({"limit": {"type": "integer"}}),
+            ),
+            schema("linux.uptime", serde_json::json!({})),
+        ];
+        let names: Vec<_> = attachment_tools(&schemas)
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec!["ocr.extract_text"]);
+    }
 
     #[test]
     fn looks_like_error_recognizes_harness_and_common_backend_shapes() {

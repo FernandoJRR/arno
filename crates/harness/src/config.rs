@@ -9,8 +9,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// How a reply confirms a pending action (SPEC §4.3 revised). `TokenOnly` is
-/// a no-redeploy escape hatch back to the strict pre-revision behavior.
+/// Deprecated (SPEC §11 #18): plain-text confirmation was removed; only an
+/// explicit decision answer or token approves. Still parsed so existing
+/// deployments don't fail to boot; any value is ignored with a warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmMode {
     Model,
@@ -79,6 +80,9 @@ pub struct Config {
     /// Sampler top_k; 1 = greedy (deterministic tool selection). 0 =
     /// provider default.
     pub ollama_top_k: u32,
+    /// Cap on generated tokens per completion (SPEC §11 #20); a cut final
+    /// answer is marked. 0 = provider default.
+    pub ollama_num_predict: u32,
     pub ollama_timeout: Duration,
     pub mcp_tool_timeout: Duration,
     pub order_budget: Duration,
@@ -86,9 +90,15 @@ pub struct Config {
     pub dedup_window: Duration,
     pub session_ttl: Duration,
     pub confirm_ttl: Duration,
-    /// SPEC §4.3 revised — see `ConfirmMode`.
-    pub confirm_mode: ConfirmMode,
+    /// Deprecated, ignored — see `ConfirmMode`. `None` when unset.
+    pub confirm_mode: Option<ConfirmMode>,
     pub attach_max_bytes: usize,
+    /// Ephemeral scratch dir for inbound image attachments (SPEC §4.1): the
+    /// harness writes decoded bytes here under a minted handle, a tool
+    /// resolves handle → file, and the harness deletes it after the order.
+    /// Purged in full at boot (`main.rs`) — restart-clears, not durable
+    /// state (AGENTS.md #7).
+    pub attach_dir: PathBuf,
     /// Exact namespaced tool names that are *always* destructive, regardless
     /// of arguments (SPEC §11.9). This is now the operator's highest-
     /// precedence override, not the primary mechanism — see
@@ -119,6 +129,9 @@ pub struct Config {
     /// How often the background task retries tools left `Pending` because the
     /// model was unavailable at boot (SPEC §11 M3).
     pub tool_policy_retry: Duration,
+    /// Append a note naming numbers in a final answer that no tool result or
+    /// user message contains (SPEC §11 #20).
+    pub number_guard: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,10 +150,13 @@ impl Config {
             client_tokens: tokens("HARNESS_API_CLIENT_TOKENS")?,
             ollama_url: url_var("OLLAMA_URL", "http://127.0.0.1:11434")?,
             model: string_var("OLLAMA_MODEL", "qwen3:8b"),
-            num_ctx: u32_var("OLLAMA_NUM_CTX", 32_768)?,
+            // 16k keeps the 4B model ~94% on a 6 GB GPU; 32k spilled 39% to
+            // the CPU and cut generation to ~4 tok/s (SPEC §11 #20).
+            num_ctx: u32_var("OLLAMA_NUM_CTX", 16_384)?,
             ollama_think: parsed("OLLAMA_THINK", Some(ThinkMode::Off))?,
             ollama_seed: u32_var("OLLAMA_SEED", 42)?,
             ollama_top_k: u32_var("OLLAMA_TOP_K", 1)?,
+            ollama_num_predict: u32_var("OLLAMA_NUM_PREDICT", 400)?,
             ollama_timeout: duration_secs("OLLAMA_TIMEOUT_S", 120)?,
             mcp_tool_timeout: duration_secs("MCP_TOOL_TIMEOUT_S", 30)?,
             order_budget: duration_secs("ORDER_BUDGET_S", 180)?,
@@ -148,8 +164,9 @@ impl Config {
             dedup_window: duration_mins("DEDUP_WINDOW_MIN", 60)?,
             session_ttl: duration_hours("SESSION_TTL_H", 24)?,
             confirm_ttl: duration_mins("CONFIRM_TTL_MIN", 10)?,
-            confirm_mode: parsed("CONFIRM_MODE", Some(ConfirmMode::Model))?,
+            confirm_mode: parsed_opt("CONFIRM_MODE")?,
             attach_max_bytes: usize_var("ATTACH_MAX_BYTES", 10 * 1024 * 1024)?,
+            attach_dir: path_var("ATTACH_DIR", "./data/attachments"),
             destructive_tools: list("DESTRUCTIVE_TOOLS")?.into_iter().collect(),
             mcp_servers: servers("MCP_SERVERS")?,
             tool_policy_path: path_var("TOOL_POLICY_PATH", "./data/arno-tool-policy.json"),
@@ -160,6 +177,7 @@ impl Config {
             log_keep_segments: usize_var("LOG_KEEP_SEGMENTS", 12)?,
             log_verify_on_boot: parsed("LOG_VERIFY_ON_BOOT", Some(false))?,
             tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
+            number_guard: parsed("NUMBER_GUARD", Some(true))?,
         })
     }
 }
@@ -175,6 +193,7 @@ const KNOWN_VARS: &[&str] = &[
     "OLLAMA_THINK",
     "OLLAMA_SEED",
     "OLLAMA_TOP_K",
+    "OLLAMA_NUM_PREDICT",
     "OLLAMA_TIMEOUT_S",
     "MCP_TOOL_TIMEOUT_S",
     "MCP_SERVERS",
@@ -185,6 +204,7 @@ const KNOWN_VARS: &[&str] = &[
     "CONFIRM_TTL_MIN",
     "CONFIRM_MODE",
     "ATTACH_MAX_BYTES",
+    "ATTACH_DIR",
     "DESTRUCTIVE_TOOLS",
     "TOOL_POLICY_PATH",
     "TOOL_POLICY_RETRY_S",
@@ -194,6 +214,7 @@ const KNOWN_VARS: &[&str] = &[
     "TRANSCRIPT_LOG_ROTATE_BYTES",
     "LOG_KEEP_SEGMENTS",
     "LOG_VERIFY_ON_BOOT",
+    "NUMBER_GUARD",
 ];
 
 const OWNED_PREFIXES: &[&str] = &[
@@ -205,11 +226,12 @@ const OWNED_PREFIXES: &[&str] = &[
     "DEDUP_WINDOW",
     "SESSION_TTL",
     "CONFIRM_",
-    "ATTACH_MAX",
+    "ATTACH_",
     "DESTRUCTIVE_",
     "TOOL_POLICY_",
     "AUDIT_LOG_",
     "TRANSCRIPT_LOG_",
+    "NUMBER_GUARD",
 ];
 
 fn reject_unknown() -> Result<(), ConfigError> {
@@ -239,6 +261,13 @@ fn raw(var: &'static str) -> Result<Option<String>, ConfigError> {
 
 fn string_var(var: &'static str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
+}
+
+fn parsed_opt<T: std::str::FromStr>(var: &'static str) -> Result<Option<T>, ConfigError> {
+    match raw(var)? {
+        Some(_) => parsed(var, None).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn parsed<T: std::str::FromStr>(var: &'static str, default: Option<T>) -> Result<T, ConfigError> {
@@ -512,6 +541,7 @@ mod tests {
             "OLLAMA_THINK",
             "OLLAMA_SEED",
             "OLLAMA_TOP_K",
+            "OLLAMA_NUM_PREDICT",
             "OLLAMA_TIMEOUT_S",
             "MCP_TOOL_TIMEOUT_S",
             "MCP_SERVERS",
@@ -522,6 +552,7 @@ mod tests {
             "CONFIRM_TTL_MIN",
             "CONFIRM_MODE",
             "ATTACH_MAX_BYTES",
+            "ATTACH_DIR",
             "DESTRUCTIVE_TOOLS",
             "TOOL_POLICY_PATH",
             "TOOL_POLICY_RETRY_S",
@@ -531,6 +562,7 @@ mod tests {
             "TRANSCRIPT_LOG_ROTATE_BYTES",
             "LOG_KEEP_SEGMENTS",
             "LOG_VERIFY_ON_BOOT",
+            "NUMBER_GUARD",
         ]
     }
 
@@ -541,16 +573,19 @@ mod tests {
         set("HARNESS_API_CLIENT_TOKENS", "cli:secret");
         let cfg = Config::from_env().expect("defaults parse");
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:8080");
-        assert_eq!(cfg.num_ctx, 32_768);
+        assert_eq!(cfg.num_ctx, 16_384);
         assert_eq!(cfg.ollama_think, ThinkMode::Off);
         // Deterministic tool-selection sampler defaults (SPEC §11 decision #16).
         assert_eq!(cfg.ollama_seed, 42);
         assert_eq!(cfg.ollama_top_k, 1);
+        assert_eq!(cfg.ollama_num_predict, 400);
+        assert!(cfg.number_guard);
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
         assert_eq!(cfg.session_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(cfg.confirm_ttl, Duration::from_secs(600));
-        assert_eq!(cfg.confirm_mode, ConfirmMode::Model);
+        assert_eq!(cfg.confirm_mode, None);
         assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(cfg.attach_dir, PathBuf::from("./data/attachments"));
         assert_eq!(
             cfg.tool_policy_path,
             PathBuf::from("./data/arno-tool-policy.json")
@@ -577,6 +612,8 @@ mod tests {
         set("TRANSCRIPT_LOG_PATH", "/data/transcript.jsonl");
         set("OLLAMA_SEED", "0");
         set("OLLAMA_TOP_K", "0");
+        set("OLLAMA_NUM_PREDICT", "0");
+        set("NUMBER_GUARD", "false");
         set("TOOL_POLICY_RETRY_S", "60");
         set("AUDIT_LOG_ROTATE_BYTES", "0");
         set("TRANSCRIPT_LOG_ROTATE_BYTES", "4096");
@@ -593,6 +630,8 @@ mod tests {
         // 0 = provider default overrides of the deterministic sampler.
         assert_eq!(cfg.ollama_seed, 0);
         assert_eq!(cfg.ollama_top_k, 0);
+        assert_eq!(cfg.ollama_num_predict, 0);
+        assert!(!cfg.number_guard);
         assert_eq!(cfg.audit_log_rotate_bytes, 0);
         assert_eq!(cfg.transcript_log_rotate_bytes, 4096);
         assert_eq!(cfg.log_keep_segments, 3);
@@ -784,7 +823,7 @@ mod tests {
         set("HARNESS_API_CLIENT_TOKENS", "cli:s");
         set("CONFIRM_MODE", "Token_Only");
         let cfg = Config::from_env().expect("parses");
-        assert_eq!(cfg.confirm_mode, ConfirmMode::TokenOnly);
+        assert_eq!(cfg.confirm_mode, Some(ConfirmMode::TokenOnly));
 
         set("CONFIRM_MODE", "bogus");
         let err = Config::from_env().unwrap_err();
@@ -794,6 +833,21 @@ mod tests {
         set("LOG_VERIFY_ON_BOOT", "bogus");
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("LOG_VERIFY_ON_BOOT"), "{err}");
+    }
+
+    #[test]
+    fn answer_knobs_reject_garbage() {
+        let _lock = env_lock();
+        let _clean = CleanEnv::new(&base_vars());
+        set("HARNESS_API_CLIENT_TOKENS", "cli:s");
+        set("OLLAMA_NUM_PREDICT", "lots");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("OLLAMA_NUM_PREDICT"), "{err}");
+
+        set("OLLAMA_NUM_PREDICT", "200");
+        set("NUMBER_GUARD", "on");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("NUMBER_GUARD"), "{err}");
     }
 
     #[test]

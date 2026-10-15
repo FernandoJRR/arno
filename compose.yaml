@@ -25,18 +25,21 @@ services:
       # Raised from 120s: a cold model load alone can take ~42s, and a real
       # order adds prompt + tool schemas + history on top.
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-180}
-      # SPEC §4.3, revised: model|token_only — see .env.example.
-      CONFIRM_MODE: ${CONFIRM_MODE:-model}
       # Securo (M2) is external — its bearer token is composed into this
       # entry's header block at deploy time. The harness never reads a
       # SECURO_*-named var itself (AGENTS.md #6): the generic
       # `name:[Header=Value;...]url` form is how any authenticated HTTP MCP
       # backend receives credentials, not a Securo-specific code path.
       MCP_SERVERS: >-
-        linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp,securo:[Authorization=Bearer ${SECURO_MCP_AUTH:?set in .env}]${SECURO_MCP_URL:?set in .env}
+        linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp,ocr:http://mcp-ocr:${MCP_OCR_PORT:-9002}/mcp,securo:[Authorization=Bearer ${SECURO_MCP_AUTH:?set in .env}]${SECURO_MCP_URL:?set in .env}
       # Non-owned name on purpose: anything HARNESS_*-prefixed is rejected by
       # the harness's own strict env validator (SPEC §5.7), even if unread.
       HEALTHCHECK_PORT: ${HARNESS_API_PORT:-8080}
+      # Ephemeral scratch dir for inbound image attachments (SPEC §4.1) —
+      # shared with mcp-ocr via the `attachments` named volume below; the
+      # harness owns this knob, mcp-ocr owns its own MCP_OCR_ATTACH_DIR
+      # pointed at the same mount (SPEC §5.7 "one knob, one owner").
+      ATTACH_DIR: /attachments
       # M3 (SPEC §11, §12.1, §12.2): the harness's own memory of what backends
       # have declared, its trail of executed writes, and the broader
       # conversation/tool-call transcript. All three paths must live on the
@@ -61,10 +64,16 @@ services:
       # cat/jq/tail directly, no `docker run` indirection needed. Contains
       # real finance data (AGENTS.md #7 exceptions) — gitignored.
       - ./data:/data
+      # Named (not bind-mounted, unlike ./data above): transient sensitive
+      # images, not durable state — cleared on `down -v`, purged again at
+      # harness boot regardless (SPEC §4.1). Shared with mcp-ocr below.
+      - attachments:/attachments
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       mcp-linux:
+        condition: service_healthy
+      mcp-ocr:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${HEALTHCHECK_PORT:-8080}/v1/health"]
@@ -92,6 +101,31 @@ services:
       retries: 3
     restart: unless-stopped
 
+  mcp-ocr:
+    build:
+      context: .
+      dockerfile: docker/ocr-mcp.Dockerfile
+      args:
+        MCP_OCR_PORT: ${MCP_OCR_PORT:-9002}
+    image: arno-ocr-mcp
+    environment:
+      MCP_OCR_PORT: ${MCP_OCR_PORT:-9002}
+      MCP_OCR_BIND: ${MCP_OCR_BIND:-0.0.0.0:${MCP_OCR_PORT:-9002}}
+      # Same scratch volume as the harness's ATTACH_DIR — each side names its
+      # own mount path (SPEC §5.7 "one knob, one owner").
+      MCP_OCR_ATTACH_DIR: /attachments
+      MCP_OCR_LANG: eng+spa   # bills may be Spanish — see .env.example
+      MCP_OCR_PREPROCESS: ${MCP_OCR_PREPROCESS:-on}
+    volumes:
+      - attachments:/attachments
+    healthcheck:
+      # Same minimal JSON-RPC initialize probe as mcp-linux, above.
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"healthcheck\",\"version\":\"0\"}}}' http://127.0.0.1:$${MCP_OCR_PORT:-9002}/mcp"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   telegram-adapter:
     build:
       context: .
@@ -111,7 +145,7 @@ services:
     healthcheck:
       # No HTTP surface to probe (outbound-only) — process-liveness only
       # (STACK.md §6).
-      test: ["CMD-SHELL", "pgrep -x adapter-telegram || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f adapter-telegram || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -121,3 +155,14 @@ services:
 # the tool-safety policy, the hash-chained audit log, and the transcript all
 # must survive a container recreate. Bind-mounted at ./data (harness service,
 # above) rather than a named volume, so it's host-visible.
+
+volumes:
+  # Ephemeral scratch for inbound image attachments (SPEC §4.1): named, not
+  # bind-mounted, because these are transient sensitive images rather than
+  # durable state — `docker compose down -v` discards them outright, and the
+  # harness purges the whole directory again at every boot regardless.
+  # Shared by harness (ATTACH_DIR) and mcp-ocr (MCP_OCR_ATTACH_DIR); both
+  # containers run as the same uid (docker/harness.Dockerfile,
+  # docker/ocr-mcp.Dockerfile) so the harness's 0600 files stay readable
+  # across the container boundary.
+  attachments:

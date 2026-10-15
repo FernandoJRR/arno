@@ -6,14 +6,19 @@
 
 use crate::model::{ChatMessage, Role};
 
+/// Bytes per token in the estimate. JSON schemas and Spanish OCR text
+/// tokenize denser than English prose; underestimating lets Ollama silently
+/// drop the oldest tokens — the system prompt — in a tight window (§11 #20).
+const BYTES_PER_TOKEN: u32 = 3;
+
 /// Rough token estimate; small-model budgeting is approximate by nature and
-/// errs on the conservative side (4 chars ≈ 1 token + fixed per-message cost).
+/// errs on the conservative side (+ fixed per-message cost).
 fn estimate(msg: &ChatMessage) -> u32 {
-    (msg.content.len() as u32) / 4 + 8
+    (msg.content.len() as u32) / BYTES_PER_TOKEN + 8
 }
 
 pub fn estimate_system(system: &str) -> u32 {
-    (system.len() as u32) / 4 + 8
+    (system.len() as u32) / BYTES_PER_TOKEN + 8
 }
 
 /// Token estimate for the merged tool-schema block; reserved before any
@@ -23,7 +28,7 @@ pub fn estimate_schemas(schemas: &[serde_json::Value]) -> u32 {
         return 0;
     }
     serde_json::to_string(schemas)
-        .map(|s| s.len() as u32 / 4 + 8)
+        .map(|s| s.len() as u32 / BYTES_PER_TOKEN + 8)
         .unwrap_or(0)
 }
 
@@ -77,8 +82,8 @@ mod tests {
             .iter()
             .map(|s| user(&s.repeat(100)))
             .collect();
-        // Budget fits only ~3 of 4 turns.
-        let out = trim(&hist, 400, 0);
+        // Budget fits only 3 of 4 turns (174 + 141 + 108 ≤ 450 < 531).
+        let out = trim(&hist, 450, 0);
         assert_eq!(
             out.first().unwrap().content,
             hist[1].content,
@@ -134,12 +139,29 @@ mod tests {
 
     #[test]
     fn system_budget_is_reserved() {
-        // 4000 chars ≈ 1008 estimated tokens > remaining budget of 200.
+        // 4000 chars ≈ 1341 estimated tokens > remaining budget of 200.
         let hist = vec![user(&"x".repeat(4000))];
         assert!(
             trim(&hist, 500, 300).is_empty(),
             "no room after system reservation"
         );
+    }
+
+    #[test]
+    fn kept_history_fits_beside_the_reserved_answer() {
+        let hist: Vec<ChatMessage> = (0..20)
+            .map(|i| user(&format!("turn {i} ").repeat(40)))
+            .collect();
+        let (ctx, reserved) = (2000, 900); // system + schemas + answer
+        let out = trim(&hist, ctx, reserved);
+        assert_eq!(
+            out.last().unwrap().content,
+            hist[19].content,
+            "newest turn kept"
+        );
+        let used: u32 = out.iter().map(estimate).sum();
+        assert!(used <= ctx - reserved, "{used} > {}", ctx - reserved);
+        assert!(out.len() < hist.len(), "older turns dropped");
     }
 
     #[test]

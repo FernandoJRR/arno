@@ -1,0 +1,35 @@
+# Dev override — layer on top of compose.yaml to rebuild all four images from
+# ONE shared compile pass (docker/dev.Dockerfile) instead of each service
+# recompiling the whole workspace dependency graph from scratch; see that
+# file's header for the cache-mount details. Everything else (ports, env,
+# volumes, healthchecks) is inherited unchanged from compose.yaml.
+#
+# Usage:
+#   docker compose -f compose.yaml -f compose.dev.yaml build
+#   docker compose -f compose.yaml -f compose.dev.yaml up
+#
+# Requires BuildKit (default on Docker Engine 23+ / Docker Desktop) for the
+# `--mount=type=cache` lines in docker/dev.Dockerfile; on an older Engine,
+# export DOCKER_BUILDKIT=1 first.
+name: arno
+
+services:
+  harness:
+    build:
+      dockerfile: docker/dev.Dockerfile
+      target: harness
+
+  mcp-linux:
+    build:
+      dockerfile: docker/dev.Dockerfile
+      target: mcp-linux
+
+  mcp-ocr:
+    build:
+      dockerfile: docker/dev.Dockerfile
+      target: mcp-ocr
+
+  telegram-adapter:
+    build:
+      dockerfile: docker/dev.Dockerfile
+      target: adapter-telegram

@@ -13,7 +13,7 @@ pub struct HarnessClient {
 /// `Err` variant: it's an expected outcome the caller renders to the user,
 /// distinct from a transport failure.
 pub enum OrderOutcome {
-    Ok(Response),
+    Ok(Box<Response>),
     Rejected(ErrorCode),
 }
 
@@ -35,7 +35,7 @@ impl HarnessClient {
             .send()
             .await?;
         if resp.status().is_success() {
-            Ok(OrderOutcome::Ok(resp.json::<Response>().await?))
+            Ok(OrderOutcome::Ok(Box::new(resp.json::<Response>().await?)))
         } else {
             Ok(OrderOutcome::Rejected(
                 resp.json::<ErrorBody>().await?.error_code,
@@ -58,6 +58,7 @@ mod tests {
             client_msg_id: Some("1".into()),
             confirmation_token: None,
             attachments: Vec::new(),
+            decision_answer: None,
         }
     }
 

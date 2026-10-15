@@ -23,6 +23,8 @@ pub struct OllamaProvider {
     seed: u32,
     /// 0 = provider default; 1 = greedy (deterministic tool selection).
     top_k: u32,
+    /// 0 = provider default; else the per-completion token cap (SPEC §11 #20).
+    num_predict: u32,
 }
 
 /// Native-API `think` control for thinking-capable models (qwen3,
@@ -78,6 +80,7 @@ impl OllamaProvider {
         think: ThinkMode,
         seed: u32,
         top_k: u32,
+        num_predict: u32,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -91,6 +94,7 @@ impl OllamaProvider {
             think,
             seed,
             top_k,
+            num_predict,
         }
     }
 
@@ -121,6 +125,11 @@ impl OllamaProvider {
                     json!(self.seed)
                 },
                 "repeat_penalty": TOOL_SELECTION_REPEAT_PENALTY,
+                "num_predict": if self.num_predict == 0 {
+                    Value::Null
+                } else {
+                    json!(self.num_predict)
+                },
             },
             // Explicit thinking control; `Off` forces determinism instead of
             // relying on per-model defaults.
@@ -154,10 +163,7 @@ impl ModelProvider for OllamaProvider {
             .send()
             .await
             .map_err(map_transport)?;
-        tracing::debug!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "ollama generation done"
-        );
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let status = resp.status();
         let payload: Value = resp
             .json()
@@ -173,9 +179,29 @@ impl ModelProvider for OllamaProvider {
             )));
         }
 
+        // Where the time goes (SPEC §11 #20): reading the prompt vs writing
+        // the answer. Counts and durations only, never content.
+        let num = |k: &str| payload.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let done_reason = payload
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        tracing::info!(
+            elapsed_ms,
+            prompt_tokens = num("prompt_eval_count"),
+            prompt_ms = num("prompt_eval_duration") / 1_000_000,
+            output_tokens = num("eval_count"),
+            output_ms = num("eval_duration") / 1_000_000,
+            done_reason,
+            "ollama completion"
+        );
+
         parse_output(&payload)
     }
 }
+
+/// Appended when the token cap cut a final answer short.
+pub const TRUNCATED_MARKER: &str = " …(answer cut short — ask for more detail)";
 
 fn message_body(m: &ChatMessage) -> Value {
     match m.role {
@@ -236,7 +262,11 @@ fn parse_output(payload: &Value) -> Result<CompletionOutput, ModelError> {
             return Ok(CompletionOutput::ToolCalls(parsed));
         }
     }
-    Ok(CompletionOutput::Final(content.to_owned()))
+    let mut text = content.to_owned();
+    if payload.get("done_reason").and_then(Value::as_str) == Some("length") {
+        text.push_str(TRUNCATED_MARKER);
+    }
+    Ok(CompletionOutput::Final(text))
 }
 
 fn map_transport(e: reqwest::Error) -> ModelError {
@@ -282,6 +312,7 @@ mod tests {
             ThinkMode::Max,
             42,
             1,
+            400,
         );
         let req = CompletionRequest {
             messages: vec![ChatMessage::new(Role::User, "hi")],
@@ -298,6 +329,7 @@ mod tests {
         // prose instead of emitting the structured tool call.
         assert_eq!(body["options"]["top_k"], 1);
         assert_eq!(body["options"]["seed"], 42);
+        assert_eq!(body["options"]["num_predict"], 400);
         // f32 wire form; compare with epsilon (1.05 is not exact in f32).
         assert!(
             (body["options"]["repeat_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-6,
@@ -321,6 +353,20 @@ mod tests {
             "securo.list_transactions"
         );
         assert_eq!(body["tool_calls"][0]["function"]["arguments"]["limit"], 5);
+    }
+
+    #[test]
+    fn a_final_cut_by_the_token_cap_is_marked() {
+        let cut = json!({"message": {"content": "Total: Q80"}, "done_reason": "length"});
+        let done = json!({"message": {"content": "Total: Q80.46"}, "done_reason": "stop"});
+        assert_eq!(
+            parse_output(&cut).unwrap(),
+            CompletionOutput::Final(format!("Total: Q80{TRUNCATED_MARKER}"))
+        );
+        assert_eq!(
+            parse_output(&done).unwrap(),
+            CompletionOutput::Final("Total: Q80.46".into())
+        );
     }
 
     #[test]

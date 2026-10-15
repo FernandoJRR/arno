@@ -35,10 +35,11 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         client_tokens,
         ollama_url: ollama_url.parse().unwrap(),
         model: "qwen3:8b".into(),
-        num_ctx: 32_768,
+        num_ctx: 16_384,
         ollama_think: harness::model::ollama::ThinkMode::Off,
         ollama_seed: 42,
         ollama_top_k: 1,
+        ollama_num_predict: 400,
         ollama_timeout: Duration::from_secs(5),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
@@ -46,8 +47,9 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         dedup_window: Duration::from_secs(60),
         session_ttl: Duration::from_secs(3600),
         confirm_ttl,
-        confirm_mode: harness::config::ConfirmMode::Model,
+        confirm_mode: None,
         attach_max_bytes: 64,
+        attach_dir: unique_temp_path("attachments"),
         destructive_tools: ["securo.create_transaction".to_owned()]
             .into_iter()
             .collect(),
@@ -60,6 +62,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         log_keep_segments: 12,
         log_verify_on_boot: false,
         tool_policy_retry: Duration::from_secs(300),
+        number_guard: true,
     }
 }
 
@@ -430,6 +433,7 @@ async fn happy_path_round_trips_through_model() {
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     let state = build_state(
         test_config(server.uri(), Duration::from_secs(10)),
@@ -528,6 +532,7 @@ async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"ok": true})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -542,6 +547,23 @@ async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
     assert!(
         body["text"].as_str().unwrap().contains("apply=true"),
         "confirmation text renders the proposed args: {body}"
+    );
+    let decision = &body["decision"];
+    assert_eq!(decision["kind"], "confirm");
+    assert_eq!(
+        decision["id"], body["confirmation_token"],
+        "legacy token == decision id"
+    );
+    assert!(decision["id"].as_str().unwrap().starts_with("dcs_"));
+    assert_eq!(decision["options"][0]["value"], "approve");
+    assert_eq!(decision["options"][1]["value"], "reject");
+    assert_eq!(decision["free_text"], true);
+    let details = decision["details"].as_array().unwrap();
+    assert!(
+        details
+            .iter()
+            .any(|d| d["label"] == "amount" && d["value"] == "50"),
+        "details derive from frozen args: {details:?}"
     );
     assert_eq!(
         executor.calls.lock().unwrap().len(),
@@ -583,6 +605,7 @@ async fn tool_call_not_matching_the_conditional_predicate_dispatches_directly() 
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"preview": true})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -637,6 +660,7 @@ async fn second_completion_sees_the_models_own_prior_tool_call() {
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -701,6 +725,7 @@ async fn tool_error_triggers_a_situational_retry_nudge_on_the_next_completion() 
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     // The tool "dispatches" (not destructive — no `apply`) but the backend
     // itself reports an application-level failure, same shape as Securo's
@@ -764,6 +789,7 @@ async fn transcript_records_user_tool_call_result_and_final_answer_in_order() {
         harness::model::ollama::ThinkMode::Off,
         42,
         1,
+        400,
     ));
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"total": 8})));
     let mut cfg = test_config(server.uri(), Duration::from_secs(10));
@@ -860,6 +886,105 @@ async fn ambiguous_attachment_rejected() {
     assert_eq!(err["error_code"], "invalid_order");
 }
 
+// ---- attachment ingestion (SPEC §4.1, attachment→tool wiring) ----
+
+/// Reads the manifest's `[handle=..., type=...]` entry back out of the
+/// system message the orchestrator injects — the test double stands in for
+/// a real model reading the same text.
+fn extract_handle(manifest: &str) -> &str {
+    let after = manifest.split("handle=").nth(1).expect("handle= present");
+    after.split([',', ']']).next().expect("terminator present")
+}
+
+/// First completion: reads the attachment handle out of the manifest system
+/// message and calls `ocr.extract_text` with it. Second completion (after
+/// the tool result lands): an honest final answer.
+struct AttachmentAwareProvider {
+    called: std::sync::Mutex<bool>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for AttachmentAwareProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        let mut called = self.called.lock().unwrap();
+        if !*called {
+            *called = true;
+            let manifest = req
+                .messages
+                .iter()
+                .find(|m| m.content.contains("Attached files available to tools"))
+                .expect("manifest system message present");
+            let handle = extract_handle(&manifest.content);
+            Ok(CompletionOutput::ToolCalls(vec![
+                harness::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "ocr.extract_text".into(),
+                    args: serde_json::json!({"image_ref": handle}),
+                },
+            ]))
+        } else {
+            Ok(CompletionOutput::Final("The bill total is $42.".into()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn image_attachment_produces_manifest_ocr_call_and_cleans_up_scratch_file() {
+    let mut cfg = test_config("http://127.0.0.1:1".into(), Duration::from_secs(10));
+    cfg.attach_max_bytes = 1024;
+    let attach_dir = cfg.attach_dir.clone();
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(
+        serde_json::json!({"text": "Total: $42", "chars": 10}),
+    ));
+    let state = build_state(
+        cfg,
+        Arc::new(AttachmentAwareProvider {
+            called: std::sync::Mutex::new(false),
+        }),
+        Arc::new(executor.clone()),
+    );
+    pin_safe(&state, "ocr.extract_text").await;
+
+    let body = serde_json::json!({
+        "session_id": "s1",
+        "text": "what do I owe on this bill?",
+        "attachments": [{"mime": "image/png", "data_b64": "aGVsbG8="}],
+    });
+    let (status, resp) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["text"], "The bill total is $42.");
+
+    let calls = executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "ocr.extract_text");
+    let handle = calls[0].1["image_ref"].as_str().unwrap().to_owned();
+    assert!(handle.starts_with("att_"), "{handle}");
+    drop(calls);
+
+    // Cleaned up after the order — the scratch file must not survive it.
+    assert!(
+        !attach_dir.join(&handle).exists(),
+        "attachment scratch file was not cleaned up"
+    );
+
+    // Never leaks into the persistent session store (SPEC §4.1): only the
+    // in-loop context saw the manifest, not the durable history.
+    let history = state
+        .sessions
+        .snapshot(&("cli".to_owned(), "s1".to_owned()));
+    assert!(
+        history
+            .iter()
+            .all(|m| !m.content.contains("Attached files available to tools")),
+        "manifest must not be persisted into session history"
+    );
+}
+
 // ---- redemption path (frozen-payload replay, SPEC §4.3) ----
 
 struct RedemptionRig {
@@ -889,6 +1014,7 @@ async fn redemption_dispatches_frozen_payload_verbatim_then_burns_token() {
         "s1",
         "securo.create_transaction".into(),
         serde_json::json!({"amount": 42}),
+        confirm_options(),
     );
 
     let body = serde_json::json!({"session_id": "s1", "text": "", "confirmation_token": token});
@@ -926,10 +1052,13 @@ async fn failed_execution_consumes_token_without_retry() {
         Duration::from_secs(600),
         ExecBehavior::Err(contract::ErrorCode::BackendUnavailable),
     );
-    let token = rig
-        .state
-        .pending
-        .freeze("cli", "s1", "t".into(), serde_json::json!({}));
+    let token = rig.state.pending.freeze(
+        "cli",
+        "s1",
+        "t".into(),
+        serde_json::json!({}),
+        confirm_options(),
+    );
     let body = serde_json::json!({"session_id": "s1", "text": "", "confirmation_token": token})
         .to_string();
 
@@ -960,10 +1089,13 @@ async fn unknown_and_expired_tokens_give_distinct_codes() {
 
     // TTL zero ⇒ deterministic expiry on first take.
     let expired = redemption_rig(Duration::ZERO, ExecBehavior::Ok(serde_json::json!(null)));
-    let token = expired
-        .state
-        .pending
-        .freeze("cli", "s1", "t".into(), serde_json::json!({}));
+    let token = expired.state.pending.freeze(
+        "cli",
+        "s1",
+        "t".into(),
+        serde_json::json!({}),
+        confirm_options(),
+    );
     let body = serde_json::json!({"session_id": "s1", "text": "", "confirmation_token": token})
         .to_string();
     let (s, e) = post_order(api_router(expired.state), &body, Some("tok-cli")).await;
@@ -971,198 +1103,268 @@ async fn unknown_and_expired_tokens_give_distinct_codes() {
     assert_eq!(e["error_code"], "confirmation_expired");
 }
 
-// ---- model-interpreted confirmation (SPEC §4.3, revised) ----
-//
-// `confirm::classify` and `normal_path` share one `ModelProvider::complete`
-// seam, so this provider scripts its reply by inspecting request content
-// (the classifier's system prompt) rather than by wiremock URL matching.
+// ---- decisions (SPEC §4.3, §11 #18) ----
 
-struct ScriptedProvider {
-    /// Reply for a `confirm::classify` call.
-    confirm_reply: &'static str,
-    /// Reply for an ordinary `normal_path` completion.
-    normal_reply: &'static str,
+fn confirm_options() -> Vec<String> {
+    vec!["approve".into(), "reject".into()]
 }
 
-#[async_trait::async_trait]
-impl ModelProvider for ScriptedProvider {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
-        let is_confirm_call = req
-            .messages
-            .first()
-            .is_some_and(|m| m.content.contains("confirmation classifier"));
-        Ok(CompletionOutput::Final(
-            if is_confirm_call {
-                self.confirm_reply
-            } else {
-                self.normal_reply
-            }
-            .to_owned(),
-        ))
-    }
-}
-
-fn confirm_rig(provider: ScriptedProvider, behavior: ExecBehavior) -> RedemptionRig {
-    let cfg = test_config("http://127.0.0.1:1".into(), Duration::from_secs(600));
-    let executor = RecordingExecutor::new(behavior);
-    let state = build_state(cfg, Arc::new(provider), Arc::new(executor.clone()));
-    RedemptionRig { state, executor }
-}
-
-#[tokio::test]
-async fn plain_yes_confirms_and_dispatches_the_frozen_payload() {
-    let rig = confirm_rig(
-        ScriptedProvider {
-            confirm_reply: r#"{"verdict":"confirm","reason":"clear yes"}"#,
-            normal_reply: "unused — must not be reached",
-        },
-        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
-    );
-    rig.state.pending.freeze(
+fn freeze_tx(state: &SharedState) -> String {
+    state.pending.freeze(
         "cli",
         "s1",
         "securo.create_transaction".into(),
         serde_json::json!({"amount": 42}),
-    );
+        confirm_options(),
+    )
+}
 
-    let body = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m1"});
-    let (status, resp) =
-        post_order(api_router(rig.state), &body.to_string(), Some("tok-cli")).await;
-    assert_eq!(status, StatusCode::OK);
+async fn answer(
+    state: &SharedState,
+    msg_id: &str,
+    answer: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({
+        "session_id": "s1",
+        "client_msg_id": msg_id,
+        "decision_answer": answer,
+    });
+    post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn approve_dispatches_frozen_payload_once_then_reports_used() {
+    let rig = redemption_rig(
+        Duration::from_secs(600),
+        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+    );
+    let id = freeze_tx(&rig.state);
+
+    let (status, resp) = answer(
+        &rig.state,
+        "m1",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
     assert_eq!(resp["text"], "Executed `securo.create_transaction`.");
+    assert_eq!(resp["structured"][0]["args"]["amount"], 42);
+
+    let (status, err) = answer(
+        &rig.state,
+        "m2",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err["error_code"], "decision_used");
     assert_eq!(
         rig.executor.calls.lock().unwrap().len(),
         1,
-        "the frozen payload dispatched exactly once"
+        "exactly one dispatch ever"
     );
 }
 
 #[tokio::test]
-async fn plain_no_cancels_and_a_later_yes_does_not_resurrect_it() {
-    let rig = confirm_rig(
-        ScriptedProvider {
-            confirm_reply: r#"{"verdict":"reject","reason":"declines"}"#,
-            normal_reply: "ok, understood",
-        },
-        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+async fn reject_never_dispatches() {
+    let rig = redemption_rig(
+        Duration::from_secs(600),
+        ExecBehavior::Ok(serde_json::json!(null)),
     );
-    rig.state.pending.freeze(
-        "cli",
-        "s1",
-        "securo.create_transaction".into(),
-        serde_json::json!({"amount": 42}),
-    );
-
-    let body =
-        serde_json::json!({"session_id": "s1", "text": "no, cancel that", "client_msg_id": "m1"});
-    let (status, resp) = post_order(
-        api_router(rig.state.clone()),
-        &body.to_string(),
-        Some("tok-cli"),
+    let id = freeze_tx(&rig.state);
+    let (status, resp) = answer(
+        &rig.state,
+        "m1",
+        serde_json::json!({"id": id, "value": "reject"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["text"], "Cancelled `securo.create_transaction`.");
-    assert_eq!(
-        rig.executor.calls.lock().unwrap().len(),
-        0,
-        "a rejected action must never dispatch"
-    );
-
-    // A later "yes" has nothing left to confirm — cancel() already moved the
-    // token to `used`, so peek_latest sees no pending action at all and this
-    // just becomes an ordinary order.
-    let body2 = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m2"});
-    let (status2, resp2) = post_order(
-        api_router(rig.state.clone()),
-        &body2.to_string(),
-        Some("tok-cli"),
-    )
-    .await;
-    assert_eq!(status2, StatusCode::OK);
-    assert_eq!(resp2["text"], "ok, understood");
-    assert_eq!(
-        rig.executor.calls.lock().unwrap().len(),
-        0,
-        "still never dispatched — a rejected action cannot be resurrected"
-    );
+    assert_eq!(resp["text"], "Cancelled. Nothing was executed.");
+    assert!(rig.executor.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn unrelated_message_falls_through_leaving_the_pending_action_untouched() {
-    let rig = confirm_rig(
-        ScriptedProvider {
-            confirm_reply: r#"{"verdict":"unrelated","reason":"different topic"}"#,
-            normal_reply: "it's sunny today",
-        },
-        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+async fn unknown_expired_and_invalid_answers_give_distinct_codes() {
+    let rig = redemption_rig(
+        Duration::from_secs(600),
+        ExecBehavior::Ok(serde_json::json!(null)),
     );
-    let token = rig.state.pending.freeze(
-        "cli",
-        "s1",
-        "securo.create_transaction".into(),
-        serde_json::json!({"amount": 42}),
-    );
+    let (s, e) = answer(
+        &rig.state,
+        "m1",
+        serde_json::json!({"id": "dcs_ghost", "value": "approve"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(e["error_code"], "decision_unknown");
 
-    let body = serde_json::json!({"session_id": "s1", "text": "what's the weather like", "client_msg_id": "m1"});
-    let (status, resp) = post_order(
-        api_router(rig.state.clone()),
-        &body.to_string(),
-        Some("tok-cli"),
+    let id = freeze_tx(&rig.state);
+    let (s, e) = answer(
+        &rig.state,
+        "m2",
+        serde_json::json!({"id": id, "value": "yolo"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(e["error_code"], "decision_invalid_value");
+    // Single-use even on failure: the id cannot be approved afterwards.
+    let (s, e) = answer(
+        &rig.state,
+        "m3",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(e["error_code"], "decision_used");
+
+    let (s, e) = answer(
+        &rig.state,
+        "m4",
+        serde_json::json!({"id": "x", "value": "approve", "text": "both"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(e["error_code"], "invalid_order");
+
+    let expired = redemption_rig(Duration::ZERO, ExecBehavior::Ok(serde_json::json!(null)));
+    let id = freeze_tx(&expired.state);
+    let (s, e) = answer(
+        &expired.state,
+        "m1",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::GONE);
+    assert_eq!(e["error_code"], "decision_expired");
+    assert!(rig.executor.calls.lock().unwrap().is_empty());
+    assert!(expired.executor.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn free_text_answer_runs_the_model_and_never_dispatches() {
+    let rig = redemption_rig(
+        Duration::from_secs(600),
+        ExecBehavior::Ok(serde_json::json!(null)),
+    );
+    let id = freeze_tx(&rig.state);
+    let (status, resp) = answer(
+        &rig.state,
+        "m1",
+        serde_json::json!({"id": id, "text": "make it 50"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        resp["text"], "it's sunny today",
-        "fell through to normal_path"
+        resp["text"], "unused — model bypassed at execution",
+        "normal path ran"
     );
-    assert_eq!(
-        rig.executor.calls.lock().unwrap().len(),
-        0,
-        "not dispatched"
+    assert!(
+        rig.executor.calls.lock().unwrap().is_empty(),
+        "free text never approves"
     );
 
-    // The pending action is untouched (peek_latest never consumes) — a
-    // real confirmation_token redemption still works afterward.
-    let redeem_body =
-        serde_json::json!({"session_id": "s1", "text": "", "confirmation_token": token});
-    let (redeem_status, redeem_resp) = post_order(
-        api_router(rig.state.clone()),
-        &redeem_body.to_string(),
-        Some("tok-cli"),
-    )
-    .await;
-    assert_eq!(redeem_status, StatusCode::OK);
-    assert_eq!(redeem_resp["text"], "Executed `securo.create_transaction`.");
+    let history = rig
+        .state
+        .sessions
+        .snapshot(&("cli".to_owned(), "s1".to_owned()));
+    assert!(history.iter().any(|m| m.content.contains("NOT executed")));
+    assert!(history.iter().any(|m| m.content == "make it 50"));
 }
 
 #[tokio::test]
-async fn classifier_failure_fails_closed_nothing_executes() {
-    let rig = confirm_rig(
-        ScriptedProvider {
-            // Neither a valid classify verdict nor parseable in any way —
-            // classify() returns None, which must behave identically to
-            // Unrelated: fall through, never confirm.
-            confirm_reply: "I cannot decide.",
-            normal_reply: "here's an ordinary answer",
-        },
-        ExecBehavior::Ok(serde_json::json!({"id": "tx_1"})),
+async fn plain_yes_never_executes_and_supersedes_the_pending_decision() {
+    let rig = redemption_rig(
+        Duration::from_secs(600),
+        ExecBehavior::Ok(serde_json::json!(null)),
     );
-    rig.state.pending.freeze(
-        "cli",
-        "s1",
-        "securo.create_transaction".into(),
-        serde_json::json!({"amount": 42}),
-    );
-
+    let id = freeze_tx(&rig.state);
     let body = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m1"});
-    let (status, resp) =
-        post_order(api_router(rig.state), &body.to_string(), Some("tok-cli")).await;
+    let (status, _) = post_order(
+        api_router(rig.state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["text"], "here's an ordinary answer");
-    assert_eq!(
-        rig.executor.calls.lock().unwrap().len(),
-        0,
-        "a classifier failure must never execute a pending write"
+    assert!(
+        rig.executor.calls.lock().unwrap().is_empty(),
+        "plain text must never approve"
     );
+
+    // Superseded: neither the decision nor its legacy token can approve now.
+    let (s, e) = answer(
+        &rig.state,
+        "m2",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(e["error_code"], "decision_used");
+    assert!(rig.executor.calls.lock().unwrap().is_empty());
+}
+
+// SPEC §11 #20: a backend's `checks` are relayed verbatim, and a number the
+// final answer invents is named — both without another model pass.
+#[tokio::test]
+async fn final_answer_relays_tool_checks_and_names_invented_numbers() {
+    let result = serde_json::Value::String(
+        serde_json::json!({
+            "text": "Item Q 70.46\nFee Q 10\nTotal a Pagar Q 30.46",
+            "checks": ["\"30.46\" may be a misread of 80.46 (= 70.46 + 10)"],
+        })
+        .to_string(),
+    );
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(result));
+    let provider = Arc::new(CapturingProvider {
+        script: SequencedProvider(std::sync::Mutex::new(vec![
+            CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+                id: "c1".into(),
+                name: "ocr.extract_text".into(),
+                args: serde_json::json!({"image_ref": "att_x"}),
+            }]),
+            CompletionOutput::Final("Total Q30.46, or Q38.01 with tax.".into()),
+        ])),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        provider.clone(),
+        Arc::new(executor.clone()),
+    );
+    pin_safe(&state, "ocr.extract_text").await;
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["text"],
+        "Total Q30.46, or Q38.01 with tax.\n\n⚠ Checks:\n- \"30.46\" may be a misread of 80.46 (= 70.46 + 10)\n\n⚠ Not found in the source data: 38.01",
+        "{body}"
+    );
+    // The model reads the tool result without `checks` (SPEC §4.2).
+    let seen = provider.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[1].contains("Total a Pagar"),
+        "tool result reached the model"
+    );
+    assert!(!seen[1].contains("checks"), "{}", seen[1]);
+}
+
+/// Records every message the model is given, then answers from a script.
+struct CapturingProvider {
+    script: SequencedProvider,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for CapturingProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        let all: Vec<String> = req.messages.iter().map(|m| m.content.clone()).collect();
+        self.seen.lock().unwrap().push(all.join("\n"));
+        self.script.complete(req).await
+    }
 }

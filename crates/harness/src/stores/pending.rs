@@ -1,9 +1,12 @@
-//! Pending destructive actions + confirmation tokens (SPEC §4.3).
+//! Pending decisions: frozen destructive actions keyed by decision id, which
+//! doubles as the legacy confirmation token (SPEC §4.3).
 //!
 //! Invariants (AGENTS.md #3):
-//! - The token is deleted from the store *before* dispatch — single-use even
-//!   on failure; a replay of a consumed token answers `confirmation_used`.
-//! - Tokens are 128-bit CSPRNG, bound to (client, session), TTL-limited.
+//! - The id is deleted from the store *before* dispatch — single-use even
+//!   on failure; a replay of a consumed id answers `*_used`.
+//! - Ids are 128-bit CSPRNG, bound to (client, session), TTL-limited.
+//! - At most one live decision per (client, session): a new proposal or any
+//!   non-answer order supersedes the old one (`discard_session`).
 
 use rand::TryRng;
 use rand::rngs::SysRng;
@@ -15,6 +18,8 @@ use std::time::{Duration, Instant};
 pub struct PendingAction {
     pub tool: String,
     pub args: serde_json::Value,
+    /// Option values a `decision_answer` may carry for this decision.
+    pub options: Vec<String>,
     pub created: Instant,
 }
 
@@ -58,13 +63,15 @@ impl PendingStore {
         session_id: &str,
         tool: String,
         args: serde_json::Value,
+        options: Vec<String>,
     ) -> String {
-        let token = mint_token();
+        let token = format!("dcs_{}", mint_token());
         self.0.lock().expect("pending lock").live.insert(
             (client_id.to_owned(), session_id.to_owned(), token.clone()),
             PendingAction {
                 tool,
                 args,
+                options,
                 created: Instant::now(),
             },
         );
@@ -112,43 +119,25 @@ impl PendingStore {
         inner.used.retain(|_, t| t.elapsed() < ttl);
     }
 
-    /// Read-only lookup for model-interpreted confirmation (SPEC §4.3
-    /// revised): the newest unexpired pending action for this client+session,
-    /// without consuming it. Same client/session isolation as `take`.
-    pub fn peek_latest(
-        &self,
-        client_id: &str,
-        session_id: &str,
-        ttl: Duration,
-    ) -> Option<(String, PendingAction)> {
-        let inner = self.0.lock().expect("pending lock");
-        inner
-            .live
-            .iter()
-            .filter(|((c, s, _), action)| {
-                c == client_id && s == session_id && action.created.elapsed() < ttl
-            })
-            .max_by_key(|(_, action)| action.created)
-            .map(|((_, _, token), action)| (token.clone(), action.clone()))
-    }
-
-    /// Discards a pending action without dispatching it (explicit rejection,
-    /// SPEC §4.3 revised) — same single-use move to `used` as `take`, so it
-    /// can never later be redeemed. `false` if the token was already gone.
-    pub fn cancel(&self, client_id: &str, session_id: &str, token: &str) -> bool {
-        let key: PendingKey = (
-            client_id.to_owned(),
-            session_id.to_owned(),
-            token.to_owned(),
-        );
+    /// Consumes every live decision for this client+session without
+    /// dispatching (supersede rule, SPEC §4.3): stale buttons can then never
+    /// approve an older payload. Returns what was discarded.
+    pub fn discard_session(&self, client_id: &str, session_id: &str) -> Vec<PendingAction> {
         let mut inner = self.0.lock().expect("pending lock");
-        match inner.live.remove(&key) {
-            Some(_) => {
-                inner.used.insert(key, Instant::now());
-                true
+        let keys: Vec<PendingKey> = inner
+            .live
+            .keys()
+            .filter(|(c, s, _)| c == client_id && s == session_id)
+            .cloned()
+            .collect();
+        let mut discarded = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(action) = inner.live.remove(&key) {
+                discarded.push(action);
             }
-            None => false,
+            inner.used.insert(key, Instant::now());
         }
+        discarded
     }
 }
 
@@ -166,6 +155,10 @@ fn mint_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts() -> Vec<String> {
+        vec!["approve".into(), "reject".into()]
+    }
 
     #[test]
     fn tokens_are_128_bit_hex_and_unique() {
@@ -189,6 +182,7 @@ mod tests {
             "s",
             "securo.create_transaction".into(),
             serde_json::json!({"x":1}),
+            opts(),
         );
         let taken = store.take("cli", "s", &token, Duration::from_secs(10));
         match taken {
@@ -208,7 +202,7 @@ mod tests {
     #[test]
     fn expired_still_counts_as_consumed_and_is_distinct_from_used() {
         let store = PendingStore::new();
-        let token = store.freeze("cli", "s", "t".into(), serde_json::json!(null));
+        let token = store.freeze("cli", "s", "t".into(), serde_json::json!(null), opts());
         // Zero TTL ⇒ deterministically expired at first take.
         assert_eq!(
             store.take("cli", "s", &token, Duration::ZERO),
@@ -219,7 +213,7 @@ mod tests {
             TakeOutcome::Used
         );
         // Bound to issuing client+session: another namespace sees Unknown.
-        let other = store.freeze("tg", "s2", "t".into(), serde_json::json!(null));
+        let other = store.freeze("tg", "s2", "t".into(), serde_json::json!(null), opts());
         assert_eq!(
             store.take("cli", "DIFFERENT", &other, Duration::from_secs(10)),
             TakeOutcome::Unknown
@@ -229,13 +223,13 @@ mod tests {
     #[test]
     fn sweep_removes_expired_entries() {
         let store = PendingStore::new();
-        store.freeze("cli", "s", "t".into(), serde_json::json!(null));
+        store.freeze("cli", "s", "t".into(), serde_json::json!(null), opts());
         store.sweep(Duration::ZERO);
         // Token minted inside freeze is not exposed here; sweeping with zero
         // TTL must have removed it, so any take is Unknown/Used — never Action.
         // (Direct check via a fresh token we keep:)
         let store2 = PendingStore::new();
-        let tok = store2.freeze("cli", "s", "t".into(), serde_json::json!(null));
+        let tok = store2.freeze("cli", "s", "t".into(), serde_json::json!(null), opts());
         store2.sweep(Duration::from_secs(3600));
         assert!(matches!(
             store2.take("cli", "s", &tok, Duration::from_secs(3600)),
@@ -244,74 +238,40 @@ mod tests {
     }
 
     #[test]
-    fn peek_latest_returns_the_newest_of_several_pendings() {
+    fn discard_session_supersedes_only_that_session() {
         let store = PendingStore::new();
-        let first = store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = store.freeze("cli", "s", "tool.b".into(), serde_json::json!({}));
+        let ttl = Duration::from_secs(10);
+        let old = store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}), opts());
+        let other = store.freeze("cli", "s2", "tool.b".into(), serde_json::json!({}), opts());
+        let foreign = store.freeze("tg", "s", "tool.c".into(), serde_json::json!({}), opts());
 
-        let (token, action) = store
-            .peek_latest("cli", "s", Duration::from_secs(10))
-            .expect("a pending action exists");
-        assert_eq!(token, second, "the more recently frozen action wins");
-        assert_eq!(action.tool, "tool.b");
-        assert_ne!(token, first);
-    }
-
-    #[test]
-    fn peek_latest_respects_ttl_and_does_not_consume() {
-        let store = PendingStore::new();
-        store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
+        let discarded = store.discard_session("cli", "s");
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].tool, "tool.a");
         assert_eq!(
-            store.peek_latest("cli", "s", Duration::ZERO),
-            None,
-            "expired"
+            store.take("cli", "s", &old, ttl),
+            TakeOutcome::Used,
+            "a superseded decision must never be redeemable"
         );
-
-        let token = store
-            .peek_latest("cli", "s", Duration::from_secs(10))
-            .map(|(t, _)| t);
-        assert!(token.is_some());
-        // Peeking must not consume — take() still sees a live Action after.
-        let (real_token, _) = store
-            .peek_latest("cli", "s", Duration::from_secs(10))
-            .unwrap();
         assert!(matches!(
-            store.take("cli", "s", &real_token, Duration::from_secs(10)),
+            store.take("cli", "s2", &other, ttl),
             TakeOutcome::Action(_)
         ));
+        assert!(matches!(
+            store.take("tg", "s", &foreign, ttl),
+            TakeOutcome::Action(_)
+        ));
+        assert!(store.discard_session("cli", "s").is_empty());
     }
 
     #[test]
-    fn peek_latest_never_crosses_client_or_session_boundaries() {
+    fn ids_carry_prefix_and_options() {
         let store = PendingStore::new();
-        store.freeze("cli", "s1", "tool.a".into(), serde_json::json!({}));
-        assert_eq!(
-            store.peek_latest("telegram", "s1", Duration::from_secs(10)),
-            None
-        );
-        assert_eq!(
-            store.peek_latest("cli", "s2", Duration::from_secs(10)),
-            None
-        );
-    }
-
-    #[test]
-    fn cancel_makes_a_subsequent_take_report_used_not_action() {
-        let store = PendingStore::new();
-        let token = store.freeze("cli", "s", "tool.a".into(), serde_json::json!({}));
-        assert!(store.cancel("cli", "s", &token));
-        assert_eq!(
-            store.take("cli", "s", &token, Duration::from_secs(10)),
-            TakeOutcome::Used,
-            "a cancelled action must never be redeemable"
-        );
-        assert_eq!(store.peek_latest("cli", "s", Duration::from_secs(10)), None);
-    }
-
-    #[test]
-    fn cancel_on_an_unknown_token_returns_false() {
-        let store = PendingStore::new();
-        assert!(!store.cancel("cli", "s", "never-minted"));
+        let id = store.freeze("cli", "s", "t".into(), serde_json::json!(null), opts());
+        assert!(id.starts_with("dcs_") && id.len() == 36, "{id}");
+        match store.take("cli", "s", &id, Duration::from_secs(10)) {
+            TakeOutcome::Action(a) => assert_eq!(a.options, opts()),
+            other => panic!("expected action, got {other:?}"),
+        }
     }
 }

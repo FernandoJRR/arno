@@ -32,6 +32,27 @@ See `SPEC.md §9` for the milestone list.
 | `crates/adapter-cli` | Throwaway stdin/stdout adapter — useful for local testing. |
 | `crates/adapter-telegram` | Telegram long-polling interface adapter. |
 | `crates/mcp-linux` | First-party MCP backend: read-only Linux diagnostics (disk, services, ports). |
+| `crates/mcp-ocr` | First-party MCP backend: read-only OCR (`extract_text`) — Tesseract, CPU-only. |
+
+## Decisions (approving writes)
+
+When the model proposes a write, the harness does not run it. The reply
+carries a `decision` (prompt, argument details, `approve`/`reject` options)
+and the order ends. Adapters render it natively — Telegram shows inline
+buttons, the CLI a numbered menu — and send the choice back as
+`decision_answer` in a new order. Only `approve` on a live decision executes
+the frozen payload; free text or a plain "yes" never does (SPEC §4.3). A new
+adapter only needs to render `decision.options` and echo the chosen `value`
+with `decision.id`.
+
+## Answers
+
+Answers are short by default (a few lines of key facts; ask for more
+detail). When a tool reports `checks` — e.g. OCR noticing that a faded
+"30.46" is probably 80.46 — they are appended to the answer verbatim (OCR
+corrects the text itself when the evidence is strong), and
+numbers the answer states that appear in no tool result or message are
+named in a note (SPEC §11 #20).
 
 ## Quick start
 
@@ -55,9 +76,14 @@ cp .env.example .env   # fill in secrets — see comments in the file
 docker compose up -d --build
 ```
 
-This starts `harness`, `mcp-linux`, and `telegram-adapter` on an isolated
-compose network. `harness`'s API is published to `127.0.0.1` only; the
-Telegram adapter is outbound-only (long-polling) and publishes no ports.
+This starts `harness`, `mcp-linux`, `mcp-ocr`, and `telegram-adapter` on an
+isolated compose network. `harness`'s API is published to `127.0.0.1` only;
+the Telegram adapter is outbound-only (long-polling) and publishes no ports.
+
+Send a photo of a bill or document and ask about it: the harness persists the
+image to a shared ephemeral scratch volume, tells the model a handle exists,
+and the model calls `ocr.extract_text` (Tesseract, read-only, no GPU) to read
+it back as text — see `SPEC.md §4.4` for the attachment-ingestion mechanism.
 
 ## Chain-store logs (audit, transcript)
 

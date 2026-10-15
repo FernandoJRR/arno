@@ -99,7 +99,7 @@ async fn orders(
         .map_err(|_| ApiError(ErrorCode::BackendUnavailable))?; // worker gone = shutting down
 
     match reply_rx.await {
-        Ok(Outcome::Ok(response)) => Ok((StatusCode::OK, Json(response)).into_response()),
+        Ok(Outcome::Ok(response)) => Ok((StatusCode::OK, Json(*response)).into_response()),
         Ok(Outcome::Err(err)) => Err(err),
         Err(_recv_dropped) => Err(ApiError(ErrorCode::BackendUnavailable)),
     }
