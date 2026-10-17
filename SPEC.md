@@ -1,4 +1,4 @@
-# Home Server Harness — Spec v0.11 (draft)
+# Home Server Harness — Spec v0.12 (draft)
 
 Supersedes v0.9 (v0.10 was the log-rotation revision, §11 #15, which never
 bumped this header). Restructured around a single principle: **three independently
@@ -8,6 +8,15 @@ the companion file `STACK.md`; agent-facing rules in `AGENTS.md`.
 
 > Status: draft for review. Assumptions needing confirmation are marked
 > **[CONFIRM]**. Open decisions are in §11.
+>
+> **New in v0.12** — Plugins (§4.5, §11 #21–#24). Each MCP backend is a
+> versioned TOML manifest in `PLUGINS_DIR` (one explicit exception to
+> env-only config) with tool groups, attachment params and declared
+> permissions. Per-plugin secrets in `<id>.env`. Plugin trust
+> (untrusted = every call needs approval) lives in the tool policy file; a
+> disclosure report is written at every load. A flagged tool-group router
+> (`ROUTER_ENABLED`) narrows what a small model sees. Reload between orders
+> on SIGHUP. `MCP_SERVERS` is deprecated.
 >
 > **Also in v0.11** — OCR accuracy (§4.4, §11 #19): image preprocessing,
 > confidence-picked multi-read, `[?word]` doubt marks, `tessdata_best`,
@@ -198,9 +207,9 @@ the contracts guarantee they'll drop in later.
 
 ### 4.2 Contract 2 — MCP (tool boundary)
 
-- The harness is an MCP client. At startup it connects to a configured list of MCP servers, discovers their tools, namespaces them (`linux.get_disk_usage`, `securo.propose_create_transaction`, `ocr.extract_text`), and presents one merged schema to the orchestrator.
+- The harness is an MCP client. At startup it connects to the MCP server of each plugin (§4.5), discovers their tools, namespaces them (`linux.get_disk_usage`, `securo.propose_create_transaction`, `ocr.extract_text`), and presents one merged schema to the orchestrator.
 - **`mcp-ocr`** (§11 decision #17) is the OCR backend: one read-only tool, `extract_text`, that turns an attachment handle (§4.4) into recognized text via Tesseract (CPU, no VRAM contention with the tool-calling model — the right default on a GPU already saturated by qwen3). Read-only by construction, so it auto-classifies `safe` (§4.2 classifier below) with zero backend-specific harness code.
-- **Securo is one entry in that list.** Replacing it with another app is a config change; if the replacement speaks MCP, the harness needs no code change.
+- **Securo is one plugin.** Replacing it with another app is a manifest change; if the replacement speaks MCP, the harness needs no code change.
 - Any app-specific *policy* (e.g. "bill data goes to Securo") lives in configuration, not in the core — so the policy moves with the config when you swap backends.
 
 **Tool safety classification (M3).** Every discovered tool must be classified
@@ -311,20 +320,34 @@ bridges the gap with a generic, tool-agnostic handle:
   injects one extra `System` message into that order's prompt assembly (never
   into the persistent session store, so it never leaks into a later order):
   `"Attached files available to tools: [handle=..., type=...]. To read or act
-  on a file, pass its handle as the relevant tool's *_ref argument."` This
+  on a file, pass its handle as that tool's `image_ref` argument."` (the
+  declared attachment parameter names). This
   names a handle and a mime type, **never a specific tool** (AGENTS.md #1) — any
   attachment-consuming backend (`mcp-ocr` today, others later) wires in purely
-  via `MCP_SERVERS` config, no core change. It sits right after the latest
-  user turn, and until the first tool runs the model is offered only tools
-  with a `*_ref` parameter (small models ignore the file otherwise).
+  by declaring `tools.attachment_params` in its plugin manifest (§4.5), no core
+  change. It sits right after the latest user turn, and until the first tool
+  runs the model is offered only tools with an attachment parameter (small
+  models ignore the file otherwise). Legacy `MCP_SERVERS` backends keep the
+  old `*_ref` name-suffix convention.
 - **`checks` convention (§11 #20):** any tool result may carry a top-level
   `checks: [string]` (a JSON object, or a string holding one). The harness
   appends them verbatim to that order's final answer under "⚠ Checks:"
   (deduplicated, at most 5, 300 chars each), so a deterministic backend
   finding reaches the user even when the model ignores it. The model is
   given the result **without** `checks` (it would only repeat them); the
-  transcript keeps the full result. Tool-agnostic, like `*_ref`.
-- **Handle repair:** with exactly one attachment on the order, a `*_ref`
+  transcript keeps the full result. Tool-agnostic, like attachment params.
+- **Read first (§11 #25):** when exactly one tool offered on the first turn
+  takes attachments, with one attachment param and no other required
+  argument, the harness calls it itself for each handle before the model's
+  first turn. The calls are recorded and gated exactly like model calls
+  (transcript `tool_call` id `prefill-N`; an untrusted or destructive tool
+  ends the order on a decision instead). The model then answers from the
+  result, with the full catalogue (or routed `related` groups) available.
+- **Nudge:** when no read-first applies (several attachment tools, or
+  extra required arguments) and the model answers in plain text without
+  having called any tool, the answer is withheld once and the model is told
+  to call the tool that takes the file. At most one nudge per order.
+- **Handle repair:** with exactly one attachment on the order, an attachment
   argument naming an unknown handle is rewritten to that handle before
   logging, classification and dispatch (small models drop characters when
   copying 32-hex handles). With several attachments nothing is guessed.
@@ -362,6 +385,111 @@ bridges the gap with a generic, tool-agnostic handle:
   process exit is stale by construction. This is scratch, not durable state
   (AGENTS.md #7): unlike the tool-policy/audit/transcript exceptions, nothing
   here needs to survive a restart.
+
+### 4.5 Plugins (§11 #21–#24)
+
+A plugin is how a hosted service's MCP tools reach the model. It contributes
+**only tools and text** — no hooks, no code in the core path. The core reads
+generic metadata from it and never names an app (AGENTS.md #1).
+
+**Manifest.** `PLUGINS_DIR/<id>.toml`, file name equal to `id`:
+
+```toml
+arno_manifest = 1                 # unknown version or key → load fails loudly
+id = "securo"                     # [a-z0-9-]; the tool namespace (securo.<tool>)
+name = "Securo finance"
+version = "1.4.0"
+provenance = "first-party"        # first-party | third-party (label only)
+
+[server]
+kind = "remote"                   # remote | container (operator-run, image pinned)
+url = "https://host:3130/mcp"
+# image = "registry/x@sha256:..." # required for container
+auth = { kind = "bearer", secret = "SECURO_MCP_AUTH" }
+
+[permissions]                     # declared, shown in the disclosure report
+egress = ["host:3130"]
+volumes = []                      # e.g. ["attachments:/attachments:ro"]
+secrets = ["SECURO_MCP_AUTH"]     # read from <id>.env, never the process env
+
+[tools]
+enabled = ["*"]                   # operator allowlist, `*`/`?` globs on bare names
+attachment_params = []            # params taking an attachment handle (§4.4)
+
+[[groups]]
+id = "transactions"
+when = "Log, list or change expenses and income"   # routing hint, ≤ 80 chars
+how = "Resolve account names first."               # ≤ 400 chars, shown only when active
+tools = ["list_transactions", "propose_create_transaction"]
+related = ["accounts", "ocr.read"]                 # local or <plugin>.<group>
+```
+
+- Group ids are qualified as `<plugin>.<group>`. A plugin without groups is
+  one implicit group `<plugin>`; ungrouped tools go to `<plugin>.other`. A
+  group naming an undiscovered tool is a warning (servers drift).
+- Disabled tools are removed from both the prompt and dispatch.
+- `when`/`how`/`name` are stripped of control characters and capped at load;
+  third-party tool descriptions are capped at 400 chars. Group text reaches
+  the model only inside a delimited data block, never as instructions.
+- **No manifest field can loosen policy.** There is no "safe" field; the
+  classifier, operator pins and `DESTRUCTIVE_TOOLS` stay authoritative.
+
+**Secrets.** `<id>.env` (`KEY=VALUE`, no expansion) beside the manifest. The
+harness reads it at load and attaches values only to that plugin's
+connection; values never enter the process env, logs, errors or the
+transcript. A missing declared secret fails that plugin only.
+
+**Failures.** A manifest parse error aborts the load. A plugin whose secrets,
+connection or discovery fail is kept as `failed` and skipped; the rest load.
+An unreachable legacy `MCP_SERVERS` backend still aborts boot (unchanged).
+When any manifest plugin failed, one summary warning follows, e.g.
+`1 of 3 enabled plugins could not be reached — running without them`.
+
+**Containers.** The harness never gets the Docker socket. For
+`kind = "container"` the disclosure report carries a compose snippet; the
+operator adds and runs it.
+
+**Trust (§11 #22).** Stored per plugin in the tool policy file under
+`plugins` — no new persistent store (AGENTS.md #7):
+
+- A new plugin is `untrusted`: **every** call produces a decision, reads
+  included, regardless of classifier output.
+- `trusted`: the normal classifier policy (§4.2) applies.
+- First-party plugins whose tools were already classified before plugins
+  existed are migrated as `trusted`.
+- Any change to the manifest hash, or any new or changed tool schema
+  fingerprint, sets the plugin back to `untrusted`.
+- Promotion is by the operator: set `plugins.<id>.level` to `"trusted"` and
+  `source` to `"operator"` in the policy file, then restart or reload.
+- Legacy `MCP_SERVERS` backends have no trust entry and keep classifier-only
+  behavior.
+
+**Disclosure.** At every load the harness logs one line per plugin and writes
+`PLUGINS_REPORT_PATH` (JSON): kind, server host, egress, volumes, secret
+*names*, status, trust, tool count and safe/conditional/destructive/pending
+counts, groups, and a compose snippet for container plugins. It is a derived
+snapshot, overwritten each load and never read back — not a store.
+
+**Router (§11 #23), behind `ROUTER_ENABLED` (default off).** Before the main
+loop of an order, one small completion with structured output (Ollama
+`format`, a JSON schema whose enum is the candidate group ids plus `none` and
+`all`) picks a group from `id: when` lines, the latest message and up to four
+earlier turns. The pick is sticky for the order; after the first dispatch the
+group's `related` groups are added. `none` offers no tools; `all`, an unknown
+id or a router error fall back to the unrouted selection. With attachments,
+candidates are limited to groups holding a tool with an attachment param. The
+pick is recorded as a `router_pick` transcript event with its latency. Flag
+off = exactly the unrouted behavior. No auto-retry with `all` on a wrong pick
+in v1: measure first (`arno-replay`).
+
+**Reload (§11 #24).** The loaded set sits behind one swappable handle; each
+order works on a snapshot. A reload re-reads the policy file (to pick up
+promotions) and `PLUGINS_DIR`, connects, discovers, reconciles trust and
+classification, writes the disclosure, then swaps. It runs as a job on the
+FIFO queue, so it always lands between orders (§8). Triggered at boot and by
+SIGHUP. There is no admin API: a future one must be separate from Contract 1
+with its own token, and adapters must never be able to install or reload
+plugins.
 
 ## 5. Components
 
@@ -435,7 +563,15 @@ TRANSCRIPT_LOG_ROTATE_BYTES=10485760  # rotate transcript at next boot past this
 LOG_KEEP_SEGMENTS=12                  # rotated segments retained per store (oldest pruned first)
 LOG_VERIFY_ON_BOOT=false              # full-chain verify (all segments) at boot; fails boot on any break
 
-MCP_SERVERS=linux-mcp:<endpoint>      # endpoint: scheme://… (Streamable HTTP)
+# added at v0.12 — plugins (§4.5):
+PLUGINS_DIR=./config/plugins          # <id>.toml manifests + optional <id>.env secrets
+PLUGINS_REPORT_PATH=./data/arno-plugins-report.json  # disclosure report, rewritten every load
+ROUTER_ENABLED=false                  # tool-group router (§11 #23)
+
+MCP_SERVERS=                          # DEPRECATED (§11 #21): each entry becomes an implicit
+                                      #   legacy plugin, with a warning at boot; the same id
+                                      #   in a manifest and here fails loudly.
+                                      # Format, name:<endpoint>: scheme://… (Streamable HTTP)
                                       #   or [Header=Value;Header2=Value2]scheme://…
                                       #   (Streamable HTTP with per-backend request
                                       #   headers — e.g. an Authorization bearer
@@ -461,12 +597,9 @@ MCP_OCR_LANG=eng+spa                  # tesseract -l language code(s); bills ske
 MCP_OCR_ENGINE=tesseract              # only "tesseract" is built; "ollama-vision" is a
                                       #   documented future OcrEngine impl (STACK.md §3)
 MCP_OCR_PREPROCESS=on                 # on|off; off reads only the original image (§11 #19)
-# added at M2 — Securo is external; not a harness-known var. Its bearer token
-# and URL are composed into one MCP_SERVERS entry at the deployment layer
-# (compose/.env interpolation), e.g.:
-#   securo:[Authorization=Bearer <token>]http://host:8765/mcp
-# The harness never reads a var named SECURO_* — the header form above is a
-# generic mechanism, not Securo-specific code (§5.2, AGENTS.md #6).
+# Securo is external and, since v0.12, a plugin: URL in
+# config/plugins/securo.toml, bearer token in config/plugins/securo.env.
+# The harness never reads a var named SECURO_* (§4.5, AGENTS.md #1).
 
 # Telegram adapter (separate process/config)
 TELEGRAM_BOT_TOKEN=...
@@ -564,7 +697,7 @@ Each milestone is independently useful.
 
 ## 11. Decisions
 
-### Resolved (v0.4–v0.11)
+### Resolved (v0.4–v0.12)
 
 | # | Question | Outcome | Notes |
 |---|---|---|---|
@@ -587,6 +720,11 @@ Each milestone is independently useful.
 | 20 | Wrong or slow numeric answers from a 4B model | **Short answers + deterministic number hygiene on the output side: `OLLAMA_NUM_PREDICT` cap and a ≤6-line instruction; backend `checks` relayed verbatim (§4.4 convention); OCR misread checks by confusable-digit repair; an ungrounded-number note** | Live: the model copied faded digits faithfully (`Q30.46` while its own line items summed to 80.46 and the amount in words said *Ochenta*; meter 5114 → 5104 with 80 kWh used) and in earlier runs invented totals (Q38.01, Q230.48); answers took ~2 min. qwen3:4b neither cross-checks nor computes reliably, so arithmetic moved into code: `mcp-ocr` searches for single confusable-digit repairs that satisfy `a + b`, `b − a` or a words amount — generic over document types (no field names), limited by three-distinct-lines partners, a ±3-line "already explained" window, a unique-repair rule and letter-glued integers being codes; on the sample bill it yields exactly 30.46→80.46 and 5104→5194. The harness appends any tool's `checks` and names answer numbers absent from tool results/user messages (sums and differences of two sources count as grounded; integers <10 ignored) — a note, never a re-prompt, so no added latency (`NUMBER_GUARD=false` to disable). Rejected: a calculator tool (the model must think to call it; each call ≈ another 20–60 s pass), two-pass structured extraction (slowest; needs per-document rules again), a bigger model (no VRAM headroom on 6 GB, slower), prompt-only cross-checking (unreliable at 4B, longer output). Ollama prompt/output timings are now logged per completion. Prompt wording matters: "offer more detail instead of restating whole documents or tool results" made the model stop calling OCR (0/4 phrasings in a replay against the live model, vs 2/4 for the old wording); "keep final answers to at most 6 short lines … Always call a tool when one is needed to answer" called it 4/4. Follow-up the same day: the live answer still said Q30.46 (the model copies the printed digit) and repeated the relayed checks, and took 99 s — 89 s of it generating at 3.8 tok/s. Measured with a ~9.9k-token prompt: `num_ctx` 32768 → 61% of the model on the GPU, 3.9 tok/s; 16384 → 94%, 19 tok/s; 12288 → 100%, 50 tok/s. Adopted 16384 (12288 left ~2k tokens of history beside the ~9.5k-token tool catalogue), an output reserve in prompt assembly, and a 3-bytes-per-token estimate so a tight window never shifts out the system prompt. Strong OCR repairs are applied in the text (option C — deterministic, plays to the model's strength of copying; rejected: instructing the model to correct, unreliable at 4B), and `checks` are hidden from the model. Writes stay gated: a corrected amount reaches Securo only through a decision the user approves (§4.3). |
 | 19 | OCR accuracy on phone photos | **In-process preprocessing (Rust `image`/`imageproc`, no extra system software) + parallel multi-read picked by Tesseract's own word confidence + `[?word]` doubt marks + pinned `tessdata_best` eng/spa** | Measured on a real 720×1280 Telegram photo of a bill. Baseline (original image, psm 3, Debian fast models) misread `Q 10`→`ato`, `0.00`→`co.`, `Consumo 80`→`60`, and lost `Lectura Anterior` entirely. Binarizing (Sauvola) and median filtering were tried and **rejected**: they erased faint digit strokes that grayscale kept. Adopted: upscale to ~2800 px long side (≤3×), 1–99 percentile contrast stretch, projection-profile deskew, white border, then reads of {original/psm 3, cleaned/psm 3, cleaned/psm 6}, keeping the highest Σconf/100 over words ≥30%. With `tessdata_best` the chosen reading gets every field right except digits the paper itself prints faded (the totals' "8" prints as "3"), which Tesseract reads at ~90% confidence — no threshold can flag those, so the words-vs-digits cross-check stays the model's job. Latency ≈5 s per photo (3 single-threaded Tesseract processes). `MCP_OCR_PREPROCESS=off` is the rollback. Noise trimming (follow-up, same day): the live answer still promoted edge debris to a fact ("Service Provider: Seraclo…"); dropping rule fragments and all-doubtful non-numeric lines cut the sample from 44 to 32 lines (1299 → 977 chars, doubtful words 36 → 6) with every bill field intact. Rejected: ImageMagick/OpenCV (extra system software), perspective correction (needs OpenCV; photos are mostly flat). |
 | 18 | Human-in-the-loop choices | **Generic `decision` in Contract 1; core owns options, adapters own rendering; model-interpreted confirmation removed (supersedes #14's interpretation half)** | Rejected: keeping plain-text consent judged by the model — with buttons available it only adds a path where a 4B model's guess executes a real write. Rejected: suspending orders while waiting for an answer — breaks "one order in flight" and the MCP timeout; a decision ends the order instead. Adopted: options/details built deterministically from the frozen payload and schema; single live decision per session (supersede); free text never approves; legacy `needs_confirmation`/`confirmation_token` kept (token == decision id) until `/v2`; `CONFIRM_MODE` parsed but ignored for one release. Telegram renders inline keyboards with short callback keys (64-byte `callback_data` limit); CLI renders a numbered menu. Future consumers: `choose` from schema validation, an `ask_user` meta-tool, MCP elicitation as `form` |
+| 21 | How a hosted service plugs in | **Plugin = versioned TOML manifest in `PLUGINS_DIR` pointing at an MCP server (remote URL or operator-run container); contributes only tools and text; per-plugin `<id>.env` secrets; `MCP_SERVERS` deprecated** | The flat catalogue (38 tools, ~9.8k prompt tokens) overwhelms qwen3:4b: OCR was 0/3 with it and 3/3 alone, and a 10.5k-token completion took 89 s. The core needed generic metadata (groups, attachment params, permissions) without app knowledge. **Explicit exception to env-only config (AGENTS.md #6)**: a manifest is structured, versioned, per-plugin data that env vars encode badly; unknown versions and keys still fail loudly. Rejected: plugin hooks/code in the core path (attack surface, no need yet); the harness running containers (would need the Docker socket — it generates a compose snippet instead). The `*_ref` suffix convention moved into `tools.attachment_params`. The Linux plugin keeps id `linux-mcp` so tool names and policy keys survive the migration. |
+| 22 | Trusting third-party plugins | **Disclosure report + enforced per-plugin trust (`untrusted`: every call needs a decision; `trusted`: classifier) + provenance label; operator promotes; any manifest or tool-schema change demotes** | Classifier verdicts are model-made and can be confidently wrong (#11); for code written by someone else, reads can leak too. Trust is stored in the existing tool policy file (no new store, AGENTS.md #7). Manifests only tighten policy: no field can mark a tool safe. Provenance is a label only, not enforced. Rejected for now: signing (cosign), egress enforcement (declared and disclosed, not sandboxed). Author text is sanitized, capped and fenced as data. |
+| 23 | Shrinking what the model sees | **Operator allowlist (always on) → one structured-output router call picking a tool group → sticky group plus `related` groups after the first dispatch; behind `ROUTER_ENABLED`, default off** | Ollama has no `tool_choice` (see the tool-recognition lesson), so the only lever is what the model is offered. Ollama `format` with an enum makes the pick parseable by construction. Rejected: keyword preselection (punishes loose phrasing, #16); embedding retrieval and a tool-search meta-tool (more moving parts; revisit after measuring). Failure mode to watch: a wrong pick hides the right tool; no auto-retry with `all` in v1. Enable only when `arno-replay` shows equal-or-better first-call accuracy with fewer prompt tokens and lower latency. |
+| 24 | Adding plugins without a restart | **Swappable registry + reload job on the FIFO queue (boot, SIGHUP); no admin API yet** | The queue already guarantees one order in flight (§8), so a reload queued there lands between orders and an in-flight order keeps its snapshot by construction. A future TUI install flow needs an admin API; it must be separate from Contract 1, use its own token, and never be reachable by adapters. |
+| 25 | Small model ignores an attached file | **Read first: when exactly one offered tool takes attachments (one attachment param, no other required arg), the harness calls it before the model's first turn; otherwise one nudge after a plain answer** | `arno-replay` showed OCR depending on the caption even with `ocr.extract_text` as the only tool offered: "What this says?" and an empty caption 0/3, "Please tell me what this says" 3/3 (greedy decoding makes it deterministic). Ollama has no `tool_choice`, so no prompt wording forces the call. Reading first is safe: the call goes through the same policy gate (an untrusted or destructive tool yields a decision), the arguments are only the handle, and it only runs when there is exactly one candidate. Every photo gets read, which is what nearly every photo order wants (~5 s of OCR). Rejected: filling in empty captions (guesses intent, leaves short captions failing); retrying with different sampling (undoes #16). |
 
 ### Still open
 

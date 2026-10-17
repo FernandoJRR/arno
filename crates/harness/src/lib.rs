@@ -10,6 +10,7 @@ pub mod config;
 pub mod mcp;
 pub mod model;
 pub mod orchestrator;
+pub mod plugins;
 pub mod policy;
 pub mod queue;
 pub mod state;

@@ -3,9 +3,9 @@
 use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::model::ModelProvider;
-use crate::orchestrator::ToolExecutor;
+use crate::plugins::PluginRegistry;
 use crate::policy::ToolPolicy;
-use crate::queue::OrderJob;
+use crate::queue::Job;
 use crate::stores::{dedup::DedupStore, pending::PendingStore, sessions::SessionStore};
 use crate::transcript::TranscriptLog;
 use std::sync::Arc;
@@ -16,8 +16,9 @@ pub struct AppState {
     pub dedup: DedupStore,
     pub pending: PendingStore,
     pub provider: std::sync::Arc<dyn ModelProvider>,
-    pub executor: std::sync::Arc<dyn ToolExecutor>,
-    pub order_tx: tokio::sync::mpsc::Sender<OrderJob>,
+    /// Loaded plugins; each order works on one snapshot (SPEC §11 #24).
+    pub plugins: Arc<PluginRegistry>,
+    pub order_tx: tokio::sync::mpsc::Sender<Job>,
     /// Model-classified tool-safety rules (SPEC §4.2, M3) — an `Arc` since the
     /// background retry task (`main.rs`) holds its own handle alongside the
     /// orchestrator's.

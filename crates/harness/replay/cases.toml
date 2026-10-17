@@ -1,0 +1,92 @@
+# arno-replay cases (SPEC §11 #23). `expect` lists acceptable FIRST tool
+# calls; "none" means a plain answer with no tool call is correct.
+# Phrasings come from the tool-recognition live eval and real transcripts.
+
+[[case]]
+name = "disk"
+text = "How much disk space is left on the server?"
+expect = ["linux-mcp.disk_free"]
+
+[[case]]
+name = "services"
+text = "is everything running ok on the box?"
+expect = ["linux-mcp.services_status"]
+
+[[case]]
+name = "ports"
+text = "which ports are listening?"
+expect = ["linux-mcp.ports_listening"]
+
+[[case]]
+name = "ocr-what"
+text = "What this says?"
+attachment = "image/jpeg"
+expect = ["ocr.extract_text"]
+
+[[case]]
+name = "ocr-es"
+text = "¿Qué dice esta factura?"
+attachment = "image/jpeg"
+expect = ["ocr.extract_text"]
+
+[[case]]
+name = "ocr-empty-caption"
+text = ""
+attachment = "image/jpeg"
+expect = ["ocr.extract_text"]
+
+[[case]]
+name = "ocr-record"
+text = "add this bill as an expense"
+attachment = "image/jpeg"
+expect = ["ocr.extract_text"]
+
+[[case]]
+name = "spend-month"
+text = "how much did I spend this month?"
+expect = ["securo.get_income_expenses", "securo.list_transactions", "securo.aggregate", "securo.get_cash_flow"]
+
+[[case]]
+name = "recent-tx"
+text = "show my last transactions"
+expect = ["securo.list_transactions"]
+
+[[case]]
+name = "accounts"
+text = "what accounts do I have?"
+expect = ["securo.list_accounts", "securo.get_account_summary"]
+
+[[case]]
+name = "net-worth"
+text = "what's my net worth?"
+expect = ["securo.get_net_worth"]
+
+[[case]]
+name = "budget"
+text = "am I over budget on groceries?"
+expect = ["securo.get_budget_vs_actual", "securo.list_budgets"]
+
+[[case]]
+name = "create-precise"
+text = "Create an expense of Q45.50 for lunch today on my BI card"
+expect = ["securo.propose_create_transaction", "securo.list_accounts", "securo.list_categories"]
+
+[[case]]
+name = "create-loose-amazon"
+text = "put that Amazon purchase of Q120 on my card"
+expect = ["securo.propose_create_transaction", "securo.list_accounts", "securo.list_transactions"]
+
+[[case]]
+name = "create-loose-yesterday"
+text = "jot down Q30 for gas yesterday"
+expect = ["securo.propose_create_transaction", "securo.list_accounts", "securo.list_categories"]
+
+[[case]]
+name = "recurring"
+text = "what subscriptions do I pay every month?"
+expect = ["securo.list_recurring_transactions"]
+
+[[case]]
+name = "greeting"
+text = "thanks, that's all!"
+expect = ["none"]

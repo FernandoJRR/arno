@@ -2,7 +2,7 @@
 
 use crate::api::auth::AuthedClient;
 use crate::api::error::ApiError;
-use crate::queue::{OrderJob, Outcome};
+use crate::queue::{Job, OrderJob, Outcome};
 use crate::state::SharedState;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -90,11 +90,11 @@ async fn orders(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     state
         .order_tx
-        .send(OrderJob {
+        .send(Job::Order(Box::new(OrderJob {
             client_id: auth.0,
             order,
             reply: reply_tx,
-        })
+        })))
         .await
         .map_err(|_| ApiError(ErrorCode::BackendUnavailable))?; // worker gone = shutting down
 

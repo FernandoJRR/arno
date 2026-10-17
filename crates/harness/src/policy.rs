@@ -87,6 +87,43 @@ pub struct ToolEntry {
     pub classified_at_ms: u64,
 }
 
+/// Per-plugin trust (SPEC §11 #22). Lives in this same file so trust adds
+/// no new persistent store (AGENTS.md #7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    /// Every call needs an explicit approval, reads included.
+    Untrusted,
+    /// The tool classifier decides, as for any tool.
+    Trusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustSource {
+    /// Set by the harness (new plugin, migration, or a change).
+    Auto,
+    /// Set by a human editing this file.
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginTrust {
+    pub level: TrustLevel,
+    pub source: TrustSource,
+    /// Manifest hash the level was granted for; any edit demotes.
+    pub manifest_hash: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// What [`ToolPolicy::reconcile_plugins`] needs to know about one plugin.
+pub struct PluginFacts<'a> {
+    pub id: &'a str,
+    pub manifest_hash: &'a str,
+    pub first_party: bool,
+}
+
 /// On-disk shape (SPEC §5.7 `TOOL_POLICY_PATH`) — plain, human-editable JSON.
 /// `_note` is written on every save purely so a human opening the file finds
 /// the hand-editing convention in the file itself, not just in docs.
@@ -95,12 +132,16 @@ struct PolicyFile {
     #[serde(rename = "_note")]
     note: String,
     tools: HashMap<String, ToolEntry>,
+    #[serde(default)]
+    plugins: HashMap<String, PluginTrust>,
 }
 
 const NOTE: &str = "Hand-editable. Set \"source\":\"operator\" on an entry to pin it \
 — automatic reconciliation will never overwrite an operator entry, even if the \
 tool's schema changes later (a drift warning is logged instead). Entries with \
-\"source\":\"model\" or \"pending\" are safe to delete; they regenerate at boot.";
+\"source\":\"model\" or \"pending\" are safe to delete; they regenerate at boot. \
+To trust a plugin, set its \"level\" to \"trusted\" and \"source\" to \"operator\", \
+then restart or reload; any manifest or tool schema change sets it back to untrusted.";
 
 /// Persisted, model-classified tool safety rules, plus the env-level override
 /// set that always wins (SPEC §5.7 `DESTRUCTIVE_TOOLS` — unchanged semantics,
@@ -109,6 +150,7 @@ tool's schema changes later (a drift warning is logged instead). Entries with \
 pub struct ToolPolicy {
     env_overrides: HashSet<String>,
     entries: RwLock<HashMap<String, ToolEntry>>,
+    plugins: RwLock<HashMap<String, PluginTrust>>,
     path: PathBuf,
 }
 
@@ -118,42 +160,31 @@ impl ToolPolicy {
     /// than blocking boot — every tool simply starts `Pending` (fail-closed)
     /// and gets reclassified.
     pub fn load(path: PathBuf, env_overrides: HashSet<String>) -> Self {
-        let entries = match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<PolicyFile>(&text) {
-                Ok(file) => file.tools,
-                Err(e) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        error = %e,
-                        "tool policy file corrupt — starting empty (every tool pending, fail-closed)"
-                    );
-                    HashMap::new()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %e,
-                    "tool policy file unreadable — starting empty (every tool pending, fail-closed)"
-                );
-                HashMap::new()
-            }
-        };
+        let (entries, plugins) = read_file(&path);
         Self {
             env_overrides,
             entries: RwLock::new(entries),
+            plugins: RwLock::new(plugins),
             path,
         }
+    }
+
+    /// Picks up hand edits (e.g. a plugin promotion) before a reload.
+    pub fn reload_from_disk(&self) {
+        let (entries, plugins) = read_file(&self.path);
+        *self.entries.write().expect("policy lock") = entries;
+        *self.plugins.write().expect("policy lock") = plugins;
     }
 
     /// Best-effort atomic save (write-then-rename): a crash mid-save leaves
     /// the previous, still-valid file in place rather than a torn write.
     fn save(&self) {
         let entries = self.entries.read().expect("policy lock").clone();
+        let plugins = self.plugins.read().expect("policy lock").clone();
         let file = PolicyFile {
             note: NOTE.to_owned(),
             tools: entries,
+            plugins,
         };
         let body = match serde_json::to_string_pretty(&file) {
             Ok(b) => b,
@@ -180,6 +211,10 @@ impl ToolPolicy {
         if self.env_overrides.contains(tool) {
             return true;
         }
+        // An untrusted plugin gets a decision for every call (SPEC §11 #22).
+        if self.is_untrusted_tool(tool) {
+            return true;
+        }
         match self.entries.read().expect("policy lock").get(tool) {
             Some(entry) => entry.rule.is_destructive_for(args),
             None => true,
@@ -196,6 +231,8 @@ impl ToolPolicy {
     /// classification.
     pub fn reconcile(&self, schemas: &[serde_json::Value]) -> Vec<String> {
         let mut pending = Vec::new();
+        // Plugins whose tool surface changed: trust resets (SPEC §11 #22).
+        let mut changed: HashSet<String> = HashSet::new();
         {
             let mut entries = self.entries.write().expect("policy lock");
             for schema in schemas {
@@ -216,6 +253,7 @@ impl ToolPolicy {
                             },
                         );
                         pending.push(name.to_owned());
+                        changed.insert(namespace(name).to_owned());
                     }
                     Some(entry) if entry.fingerprint == fingerprint => {
                         // Unchanged. A prior Pending entry still needs classifying.
@@ -224,6 +262,7 @@ impl ToolPolicy {
                         }
                     }
                     Some(entry) if entry.source == RuleSource::Operator => {
+                        changed.insert(namespace(name).to_owned());
                         tracing::warn!(
                             tool = name,
                             "tool schema changed but an operator-pinned policy entry \
@@ -241,12 +280,89 @@ impl ToolPolicy {
                         entry.fingerprint = fingerprint;
                         entry.reason.clear();
                         pending.push(name.to_owned());
+                        changed.insert(namespace(name).to_owned());
                     }
+                }
+            }
+        }
+        {
+            let mut plugins = self.plugins.write().expect("policy lock");
+            for id in changed {
+                if let Some(t) = plugins.get_mut(&id)
+                    && t.level == TrustLevel::Trusted
+                {
+                    tracing::warn!(plugin = %id, "plugin tools changed — trust reset to untrusted");
+                    t.level = TrustLevel::Untrusted;
+                    t.source = TrustSource::Auto;
+                    t.reason = "tool schemas changed".into();
                 }
             }
         }
         self.save();
         pending
+    }
+
+    /// Syncs plugin trust with the loaded manifests (SPEC §11 #22): new
+    /// plugins start untrusted, an edited manifest demotes, and first-party
+    /// plugins that already have classified tools are migrated as trusted.
+    /// Call before [`Self::reconcile`], which may demote further.
+    pub fn reconcile_plugins(&self, facts: &[PluginFacts<'_>]) {
+        let entries = self.entries.read().expect("policy lock");
+        let mut plugins = self.plugins.write().expect("policy lock");
+        for f in facts {
+            match plugins.get_mut(f.id) {
+                Some(t) if t.manifest_hash == f.manifest_hash => {}
+                Some(t) => {
+                    tracing::warn!(plugin = %f.id, "manifest changed — plugin trust reset to untrusted");
+                    *t = PluginTrust {
+                        level: TrustLevel::Untrusted,
+                        source: TrustSource::Auto,
+                        manifest_hash: f.manifest_hash.to_owned(),
+                        reason: "manifest changed".into(),
+                    };
+                }
+                None => {
+                    let prefix = format!("{}.", f.id);
+                    let migrated = f.first_party && entries.keys().any(|k| k.starts_with(&prefix));
+                    let (level, reason) = if migrated {
+                        (TrustLevel::Trusted, "migrated first-party backend")
+                    } else {
+                        (TrustLevel::Untrusted, "new plugin")
+                    };
+                    tracing::info!(plugin = %f.id, ?level, reason, "plugin trust recorded");
+                    plugins.insert(
+                        f.id.to_owned(),
+                        PluginTrust {
+                            level,
+                            source: TrustSource::Auto,
+                            manifest_hash: f.manifest_hash.to_owned(),
+                            reason: reason.into(),
+                        },
+                    );
+                }
+            }
+        }
+        drop(plugins);
+        drop(entries);
+        self.save();
+    }
+
+    pub fn trust(&self, plugin: &str) -> Option<PluginTrust> {
+        self.plugins
+            .read()
+            .expect("policy lock")
+            .get(plugin)
+            .cloned()
+    }
+
+    /// Only plugins with a trust entry can be untrusted; legacy
+    /// `MCP_SERVERS` backends have none and keep the classifier alone.
+    fn is_untrusted_tool(&self, tool: &str) -> bool {
+        self.plugins
+            .read()
+            .expect("policy lock")
+            .get(namespace(tool))
+            .is_some_and(|t| t.level == TrustLevel::Untrusted)
     }
 
     /// Classifies exactly `names` (expected: a subset of the tools `reconcile`
@@ -308,12 +424,24 @@ impl ToolPolicy {
 
     /// `(safe, destructive, conditional, pending)` counts, for the boot summary log.
     pub fn counts(&self) -> (usize, usize, usize, usize) {
+        self.counts_where(|_| true)
+    }
+
+    /// Same counts restricted to the given tool names.
+    pub fn counts_for(&self, tools: &[&str]) -> (usize, usize, usize, usize) {
+        self.counts_where(|name| tools.contains(&name))
+    }
+
+    fn counts_where(&self, keep: impl Fn(&str) -> bool) -> (usize, usize, usize, usize) {
         let entries = self.entries.read().expect("policy lock");
         let mut safe = 0;
         let mut destructive = 0;
         let mut conditional = 0;
         let mut pending = 0;
-        for entry in entries.values() {
+        for (name, entry) in entries.iter() {
+            if !keep(name) {
+                continue;
+            }
             if entry.source == RuleSource::Pending {
                 pending += 1;
                 continue;
@@ -328,11 +456,40 @@ impl ToolPolicy {
     }
 }
 
+fn read_file(path: &std::path::Path) -> (HashMap<String, ToolEntry>, HashMap<String, PluginTrust>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<PolicyFile>(&text) {
+            Ok(file) => (file.tools, file.plugins),
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "tool policy file corrupt — starting empty (every tool pending, fail-closed)"
+                );
+                (HashMap::new(), HashMap::new())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), HashMap::new()),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "tool policy file unreadable — starting empty (every tool pending, fail-closed)"
+            );
+            (HashMap::new(), HashMap::new())
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn namespace(tool: &str) -> &str {
+    tool.split_once('.').map_or(tool, |(ns, _)| ns)
 }
 
 fn tool_name(schema: &serde_json::Value) -> Option<&str> {
@@ -388,6 +545,7 @@ async fn classify_one(
         ],
         tools: Vec::new(),
         context_tokens: 4096,
+        format: None,
     };
 
     let text = match provider.complete(req).await {
@@ -471,6 +629,117 @@ mod tests {
             std::process::id(),
             now_ms()
         ))
+    }
+
+    const SAFE: &str = r#"{"class":"safe","key":null,"equals":null,"reason":"reads"}"#;
+
+    async fn classified_safe(tag: &str, tools: &[&str]) -> ToolPolicy {
+        let policy = ToolPolicy::load(tmp_path(tag), HashSet::new());
+        let schemas: Vec<_> = tools.iter().map(|t| schema(t, "reads")).collect();
+        let pending = policy.reconcile(&schemas);
+        policy
+            .classify_pending(&FixedProvider(SAFE), &schemas, &pending)
+            .await;
+        policy
+    }
+
+    fn facts<'a>(id: &'a str, hash: &'a str, first_party: bool) -> PluginFacts<'a> {
+        PluginFacts {
+            id,
+            manifest_hash: hash,
+            first_party,
+        }
+    }
+
+    #[tokio::test]
+    async fn new_plugin_is_untrusted_and_every_call_needs_a_decision() {
+        let policy = classified_safe("untrusted", &["notes.read"]).await;
+        assert!(!policy.is_destructive("notes.read", &serde_json::json!({})));
+        policy.reconcile_plugins(&[facts("notes", "h1", false)]);
+        // Classifier says safe; untrusted plugin wins.
+        assert!(policy.is_destructive("notes.read", &serde_json::json!({})));
+        assert_eq!(policy.trust("notes").unwrap().level, TrustLevel::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn first_party_plugin_with_classified_tools_migrates_as_trusted() {
+        let policy = classified_safe("migrate", &["linux-mcp.disk_free"]).await;
+        policy.reconcile_plugins(&[facts("linux-mcp", "h1", true), facts("fresh", "h2", true)]);
+        assert_eq!(
+            policy.trust("linux-mcp").unwrap().level,
+            TrustLevel::Trusted
+        );
+        assert!(!policy.is_destructive("linux-mcp.disk_free", &serde_json::json!({})));
+        // First-party but never seen before: still untrusted.
+        assert_eq!(policy.trust("fresh").unwrap().level, TrustLevel::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn promotion_restores_classifier_and_a_manifest_edit_demotes() {
+        let path = tmp_path("promote");
+        let policy = ToolPolicy::load(path.clone(), HashSet::new());
+        let schemas = vec![schema("notes.read", "reads")];
+        let pending = policy.reconcile(&schemas);
+        policy
+            .classify_pending(&FixedProvider(SAFE), &schemas, &pending)
+            .await;
+        policy.reconcile_plugins(&[facts("notes", "h1", false)]);
+
+        // Operator promotes by hand-editing the file.
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        file["plugins"]["notes"]["level"] = "trusted".into();
+        file["plugins"]["notes"]["source"] = "operator".into();
+        std::fs::write(&path, file.to_string()).unwrap();
+        policy.reload_from_disk();
+        policy.reconcile_plugins(&[facts("notes", "h1", false)]);
+        assert!(!policy.is_destructive("notes.read", &serde_json::json!({})));
+
+        policy.reconcile_plugins(&[facts("notes", "h2", false)]);
+        assert_eq!(policy.trust("notes").unwrap().level, TrustLevel::Untrusted);
+        assert!(policy.is_destructive("notes.read", &serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn tool_schema_change_demotes_a_trusted_plugin() {
+        let policy = classified_safe("drift", &["linux-mcp.disk_free"]).await;
+        policy.reconcile_plugins(&[facts("linux-mcp", "h1", true)]);
+        assert_eq!(
+            policy.trust("linux-mcp").unwrap().level,
+            TrustLevel::Trusted
+        );
+        policy.reconcile(&[schema("linux-mcp.disk_free", "now also deletes files")]);
+        assert_eq!(
+            policy.trust("linux-mcp").unwrap().level,
+            TrustLevel::Untrusted
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_never_loosens_an_env_override() {
+        let policy = ToolPolicy::load(
+            tmp_path("override"),
+            ["linux-mcp.disk_free".to_owned()].into_iter().collect(),
+        );
+        let schemas = vec![schema("linux-mcp.disk_free", "reads")];
+        let pending = policy.reconcile(&schemas);
+        policy
+            .classify_pending(&FixedProvider(SAFE), &schemas, &pending)
+            .await;
+        policy.reconcile_plugins(&[facts("linux-mcp", "h1", true)]);
+        assert_eq!(
+            policy.trust("linux-mcp").unwrap().level,
+            TrustLevel::Trusted
+        );
+        assert!(policy.is_destructive("linux-mcp.disk_free", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn policy_file_without_plugins_section_still_loads() {
+        let path = tmp_path("old-format");
+        std::fs::write(&path, r#"{"_note":"x","tools":{}}"#).unwrap();
+        let policy = ToolPolicy::load(path, HashSet::new());
+        assert!(policy.trust("anything").is_none());
     }
 
     #[test]

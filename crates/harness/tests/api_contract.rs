@@ -54,6 +54,9 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
             .into_iter()
             .collect(),
         mcp_servers: Vec::new(),
+        plugins_dir: unique_temp_path("plugins"),
+        plugins_report_path: unique_temp_path("plugins-report.json"),
+        router_enabled: false,
         tool_policy_path: unique_temp_path("policy.json"),
         audit_log_path: unique_temp_path("audit.jsonl"),
         transcript_log_path: unique_temp_path("transcript.jsonl"),
@@ -143,7 +146,7 @@ fn build_state(
         dedup: harness::stores::dedup::DedupStore::new(),
         pending: harness::stores::pending::PendingStore::new(),
         provider,
-        executor,
+        plugins: Arc::new(harness::plugins::PluginRegistry::from_executor(executor)),
         cfg,
         order_tx,
         policy,

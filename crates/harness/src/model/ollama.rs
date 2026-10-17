@@ -7,7 +7,8 @@
 //! Nothing outside this module may speak HTTP to a model provider.
 
 use crate::model::{
-    ChatMessage, CompletionOutput, CompletionRequest, ModelError, ModelProvider, Role, ToolCall,
+    ChatMessage, CompletionOutput, CompletionRequest, CompletionStats, ModelError, ModelProvider,
+    Role, ToolCall,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -140,6 +141,9 @@ impl OllamaProvider {
         if !req.tools.is_empty() {
             body["tools"] = Value::Array(req.tools.clone());
         }
+        if let Some(format) = &req.format {
+            body["format"] = format.clone();
+        }
         body
     }
 }
@@ -153,6 +157,13 @@ const TOOL_SELECTION_REPEAT_PENALTY: f32 = 1.05;
 #[async_trait]
 impl ModelProvider for OllamaProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        self.complete_with_stats(req).await.map(|(out, _)| out)
+    }
+
+    async fn complete_with_stats(
+        &self,
+        req: CompletionRequest,
+    ) -> Result<(CompletionOutput, Option<CompletionStats>), ModelError> {
         let body = self.request_body(&req);
 
         let started = std::time::Instant::now();
@@ -195,8 +206,13 @@ impl ModelProvider for OllamaProvider {
             done_reason,
             "ollama completion"
         );
+        let stats = CompletionStats {
+            prompt_tokens: num("prompt_eval_count"),
+            output_tokens: num("eval_count"),
+            elapsed_ms,
+        };
 
-        parse_output(&payload)
+        parse_output(&payload).map(|out| (out, Some(stats)))
     }
 }
 
@@ -318,6 +334,7 @@ mod tests {
             messages: vec![ChatMessage::new(Role::User, "hi")],
             tools: Vec::new(),
             context_tokens: 4096,
+            format: None,
         };
         let body = provider.request_body(&req);
         assert_eq!(body["think"], json!("max"));
@@ -335,6 +352,28 @@ mod tests {
             (body["options"]["repeat_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-6,
             "{body}"
         );
+        assert!(body.get("format").is_none(), "absent unless requested");
+    }
+
+    #[test]
+    fn request_body_carries_format_only_when_set() {
+        let provider = OllamaProvider::new(
+            "http://127.0.0.1:11434".parse().unwrap(),
+            "qwen3:8b",
+            Duration::from_secs(5),
+            ThinkMode::Off,
+            0,
+            0,
+            0,
+        );
+        let schema = json!({"type": "object", "properties": {"group": {"enum": ["a", "none"]}}});
+        let req = CompletionRequest {
+            messages: vec![ChatMessage::new(Role::User, "hi")],
+            tools: Vec::new(),
+            context_tokens: 4096,
+            format: Some(schema.clone()),
+        };
+        assert_eq!(provider.request_body(&req)["format"], schema);
     }
 
     #[test]

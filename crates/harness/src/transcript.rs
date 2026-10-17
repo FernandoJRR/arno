@@ -98,6 +98,11 @@ pub enum Event<'a> {
         tool: &'a str,
         args: &'a serde_json::Value,
     },
+    /// The tool group the router chose for this order (SPEC §11 #23).
+    RouterPick {
+        group: &'a str,
+        latency_ms: u64,
+    },
 }
 
 #[derive(Serialize)]

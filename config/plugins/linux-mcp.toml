@@ -1,0 +1,19 @@
+# First-party plugin: read-only Linux diagnostics (crates/mcp-linux).
+# The id stays `linux-mcp` so tool names and policy entries keep their keys.
+arno_manifest = 1
+id = "linux-mcp"
+name = "Server diagnostics"
+version = "0.1.0"
+provenance = "first-party"
+
+[server]
+kind = "remote"
+url = "http://mcp-linux:9001/mcp"
+
+[permissions]
+egress = []
+
+[[groups]]
+id = "system"
+when = "Server health: disk space, running services, listening ports"
+tools = ["disk_free", "services_status", "ports_listening"]

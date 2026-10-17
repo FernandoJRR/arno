@@ -82,6 +82,17 @@ pub struct CompletionRequest {
     pub tools: Vec<Value>,
     /// Provider-neutral context budget (SPEC §8); Ollama maps it to num_ctx.
     pub context_tokens: u32,
+    /// JSON schema the reply must match (structured output), e.g. the
+    /// router's group enum (SPEC §11 #23). `None` = free text / tool calls.
+    pub format: Option<Value>,
+}
+
+/// Prompt/latency figures for measurement (the replay tool); never content.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CompletionStats {
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,4 +121,12 @@ pub enum ModelError {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError>;
+
+    /// Same as [`Self::complete`], plus stats when the provider reports them.
+    async fn complete_with_stats(
+        &self,
+        req: CompletionRequest,
+    ) -> Result<(CompletionOutput, Option<CompletionStats>), ModelError> {
+        self.complete(req).await.map(|out| (out, None))
+    }
 }

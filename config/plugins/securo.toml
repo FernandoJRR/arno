@@ -1,0 +1,64 @@
+# First-party plugin: Securo personal finance (external MCP server).
+# Groups are a draft from the discovered tool list; review before turning on
+# ROUTER_ENABLED.
+arno_manifest = 1
+id = "securo"
+name = "Securo finance"
+version = "0.1.0"
+provenance = "first-party"
+
+[server]
+kind = "remote"
+url = "https://server.tail338c0b.ts.net:3130/mcp"
+auth = { kind = "bearer", secret = "SECURO_MCP_AUTH" }
+
+[permissions]
+egress = ["server.tail338c0b.ts.net:3130"]
+secrets = ["SECURO_MCP_AUTH"]
+
+[[groups]]
+id = "transactions"
+when = "Log, list, find or categorize expenses and income"
+how = "Resolve account and category names with list_accounts and list_categories before proposing. Take amounts and dates only from the user or a tool result."
+tools = ["list_transactions", "propose_create_transaction", "propose_categorize"]
+related = ["accounts", "categories"]
+
+[[groups]]
+id = "accounts"
+when = "Accounts, balances, cards and assets"
+tools = ["list_accounts", "get_account_summary", "list_assets"]
+related = ["transactions"]
+
+[[groups]]
+id = "categories"
+when = "Categories, payees and auto-categorization rules"
+tools = ["list_categories", "propose_create_category", "list_payees", "list_rules", "preview_rule", "propose_create_rule", "propose_update_rule", "propose_delete_rule", "propose_create_payee_rule"]
+related = ["transactions"]
+
+[[groups]]
+id = "budgets"
+when = "Budgets and savings goals, and spending against them"
+tools = ["list_budgets", "get_budget_vs_actual", "propose_create_budget", "list_goals", "propose_create_goal"]
+related = ["categories", "reports"]
+
+[[groups]]
+id = "recurring"
+when = "Recurring payments and subscriptions"
+tools = ["list_recurring_transactions", "propose_create_recurring_transaction", "propose_update_recurring_transaction", "propose_cancel_recurring_transaction"]
+related = ["accounts", "categories"]
+
+[[groups]]
+id = "reports"
+when = "Totals and summaries: spending, income, cash flow, net worth"
+tools = ["get_income_expenses", "get_cash_flow", "get_net_worth", "get_dashboard_snapshot", "aggregate"]
+related = ["accounts", "categories"]
+
+[[groups]]
+id = "shared"
+when = "Shared expense groups, balances and settlements"
+tools = ["list_groups", "get_group_balances", "list_group_settlements"]
+
+[[groups]]
+id = "search"
+when = "Search across all finance data or the help knowledge base"
+tools = ["search_all", "search_knowledge_base"]

@@ -73,6 +73,7 @@ RUST_LOG=debug cargo run -p adapter-cli -- --token <client-token>
 
 ```sh
 cp .env.example .env   # fill in secrets — see comments in the file
+cp config/plugins/securo.env.example config/plugins/securo.env   # Securo token
 docker compose up -d --build
 ```
 
@@ -84,6 +85,62 @@ Send a photo of a bill or document and ask about it: the harness persists the
 image to a shared ephemeral scratch volume, tells the model a handle exists,
 and the model calls `ocr.extract_text` (Tesseract, read-only, no GPU) to read
 it back as text — see `SPEC.md §4.4` for the attachment-ingestion mechanism.
+
+## Plugins
+
+Every MCP backend is a plugin: a manifest in `config/plugins/<id>.toml`
+plus, if it needs secrets, `config/plugins/<id>.env` (gitignored). See
+`SPEC.md §4.5` for the format. The harness reads the directory at boot and
+on `SIGHUP`, between orders.
+
+Adding a plugin:
+
+1. Write `config/plugins/<id>.toml` (and `<id>.env` for declared secrets).
+   For `kind = "container"`, run the service yourself; the disclosure report
+   below includes a compose snippet for it.
+2. Reload: `docker compose kill -s HUP harness` (or restart).
+3. Review the disclosure: `docker compose logs harness | grep "plugin disclosure"`
+   or `jq . data/arno-plugins-report.json`. Check egress, volumes, secret
+   names, and the safe/conditional/destructive counts.
+4. A new plugin is **untrusted**: every call, reads included, asks for
+   approval. To promote it, edit `data/arno-tool-policy.json`:
+   `"plugins": {"<id>": {"level": "trusted", "source": "operator", ...}}`,
+   then reload. Any later edit to the manifest, or a tool schema change,
+   makes it untrusted again.
+
+`MCP_SERVERS` still works for one release (with a boot warning); the same id
+in both places fails at boot. A plugin that can't be reached (or is missing
+a secret) is skipped, and the log says `N of M enabled plugins could not be
+reached — running without them`.
+
+Photos: when exactly one tool takes attachments (OCR today), the harness
+reads the photo with it before the model answers, so a bare caption like
+"what's this?" still works (SPEC §11 #25).
+
+### Tool-group router
+
+`ROUTER_ENABLED=true` makes one small, structured call per order to pick a
+tool group, so the model sees a few tools instead of the whole catalogue.
+Measure before turning it on:
+
+```sh
+docker compose exec harness arno-replay --runs 3            # full vs routed
+docker compose exec harness arno-replay --mode routed --only ocr-what
+```
+
+It prints the first tool picked per case, prompt tokens and latency, plus a
+summary per mode. Turn the router on only if routed accuracy is equal or
+better with fewer tokens and lower latency. The cases live in
+`crates/harness/replay/cases.toml` (`--cases FILE` to use another file).
+
+Router picks in the transcript:
+
+```sh
+jq -r 'select(.kind=="router_pick")|"\(.group) \(.latency_ms)ms"' data/arno-transcript.jsonl \
+    | sort | uniq -c | sort -rn
+# tool usage counts:
+jq -r 'select(.kind=="tool_call")|.tool' data/arno-transcript.jsonl | sort | uniq -c | sort -rn
+```
 
 ## Chain-store logs (audit, transcript)
 
@@ -150,7 +207,8 @@ want more answer variety.
 
 ## Configuration
 
-All configuration is env-only — no config files, no CLI flags for secrets.
-Every component fails loudly on an unrecognized env var under its own
-namespace. See `SPEC.md §5.7` for the full list of knobs and `STACK.md §7`
+All configuration is env-only — no CLI flags for secrets — except plugin
+manifests and their env files in `PLUGINS_DIR` (see Plugins above). Every
+component fails loudly on an unrecognized env var under its own namespace,
+and the harness fails loudly on an unknown manifest key or version. See `SPEC.md §5.7` for the full list of knobs and `STACK.md §7`
 for which component owns which variable. `.env.example` is a starting point.

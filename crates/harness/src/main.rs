@@ -3,7 +3,8 @@
 use harness::{api, config, queue, stores};
 
 use harness::model::ollama::OllamaProvider;
-use harness::orchestrator::{NoBackends, ToolExecutor};
+use harness::orchestrator::ToolExecutor;
+use harness::plugins::{LoadSpec, PluginRegistry};
 use harness::state::{AppState, SharedState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     stores::attachments::purge_all(&cfg.attach_dir);
 
-    let (order_tx, order_rx) = tokio::sync::mpsc::channel::<queue::OrderJob>(64);
+    let (order_tx, order_rx) = tokio::sync::mpsc::channel::<queue::Job>(64);
 
     let provider = Arc::new(OllamaProvider::new(
         cfg.ollama_url.clone(),
@@ -47,17 +48,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         cfg.ollama_top_k,
         cfg.ollama_num_predict,
     ));
-    let executor: Arc<dyn ToolExecutor> = if cfg.mcp_servers.is_empty() {
-        tracing::info!("MCP_SERVERS empty — tool dispatch reports backend_unavailable");
-        Arc::new(NoBackends)
-    } else {
-        // Fail fast: an unreachable configured backend is a config error.
-        // Runtime failures stay soft via backend_unavailable (SPEC §5.5).
-        match harness::mcp::McpRegistry::connect(&cfg.mcp_servers, cfg.mcp_tool_timeout).await {
-            Ok(registry) => Arc::new(registry),
-            Err(e) => return Err(anyhow::anyhow!("mcp registry startup failed: {e}")),
-        }
-    };
+    // Fail fast on manifest errors and unreachable legacy backends; a broken
+    // manifest plugin is skipped and reported instead (SPEC §11 #21).
+    let plugin_set = harness::plugins::load(&LoadSpec::from_config(&cfg))
+        .await
+        .map_err(|e| anyhow::anyhow!("plugin load failed: {e}"))?;
 
     // Tamper-evidence is the point (SPEC §12.1) — a corrupt audit log aborts
     // boot rather than silently starting a fresh chain, same fail-loud
@@ -78,25 +73,26 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("transcript log open failed: {e}"))?;
 
-    // Adaptive tool-safety classification (SPEC §4.2, M3): reconcile the
-    // persisted policy against what's actually discovered, then classify
-    // anything unknown/changed right now. A down model provider leaves those
-    // tools `Pending` (fail-closed to destructive) rather than blocking boot
-    // — the retry task below picks them up once Ollama answers.
+    // Adaptive tool-safety classification (SPEC §4.2, M3) and plugin trust
+    // (SPEC §11 #22): reconcile the persisted policy against what's actually
+    // discovered, then classify anything unknown/changed right now. A down
+    // model provider leaves those tools `Pending` (fail-closed to
+    // destructive) rather than blocking boot — the retry task below picks
+    // them up once Ollama answers.
     let policy = Arc::new(harness::policy::ToolPolicy::load(
         cfg.tool_policy_path.clone(),
         cfg.destructive_tools.clone(),
     ));
-    let schemas = executor.tool_schemas().to_vec();
-    let newly_pending = policy.reconcile(&schemas);
-    if !newly_pending.is_empty() {
-        let (resolved, still_pending) = policy
-            .classify_pending(provider.as_ref(), &schemas, &newly_pending)
-            .await;
-        tracing::info!(resolved, still_pending, "boot-time tool classification");
+    harness::plugins::activate(
+        &plugin_set,
+        &policy,
+        provider.as_ref(),
+        &cfg.plugins_report_path,
+    )
+    .await;
+    if cfg.router_enabled {
+        tracing::info!("tool-group router enabled (SPEC §11 #23)");
     }
-    let (safe, destructive, conditional, pending) = policy.counts();
-    tracing::info!(safe, destructive, conditional, pending, "tool policy ready");
     if cfg.confirm_mode.is_some() {
         tracing::warn!("CONFIRM_MODE is deprecated and ignored (SPEC §11 #18)");
     }
@@ -106,13 +102,14 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         dedup: stores::dedup::DedupStore::new(),
         pending: stores::pending::PendingStore::new(),
         provider,
-        executor,
+        plugins: Arc::new(PluginRegistry::new(plugin_set)),
         cfg,
         order_tx: order_tx.clone(),
         policy,
         audit: Some(audit),
         transcript: Some(transcript),
     });
+    spawn_reload_on_sighup(order_tx.clone());
     drop(order_tx); // router holds its clone; keep only one producer handle alive in state
 
     tokio::spawn(queue::spawn_worker(state.clone(), order_rx));
@@ -159,7 +156,7 @@ fn spawn_policy_retry(state: SharedState) {
             if pending.is_empty() {
                 continue;
             }
-            let schemas = state.executor.tool_schemas().to_vec();
+            let schemas = state.plugins.snapshot().tool_schemas().to_vec();
             let (resolved, still_pending) = state
                 .policy
                 .classify_pending(state.provider.as_ref(), &schemas, &pending)
@@ -176,6 +173,30 @@ fn spawn_policy_retry(state: SharedState) {
         }
     });
 }
+
+/// SIGHUP queues a plugin reload; it runs between orders (SPEC §11 #24).
+#[cfg(unix)]
+fn spawn_reload_on_sighup(tx: tokio::sync::mpsc::Sender<queue::Job>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "SIGHUP handler not installed; reload needs a restart");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            tracing::info!("SIGHUP: plugin reload queued");
+            if tx.send(queue::Job::Reload(None)).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_on_sighup(_tx: tokio::sync::mpsc::Sender<queue::Job>) {}
 
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()

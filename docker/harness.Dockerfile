@@ -17,6 +17,7 @@ RUN apt-get update \
     && mkdir -p /data /attachments \
     && chown arno:arno /data /attachments
 COPY --from=build /build/target/release/harness /usr/local/bin/harness
+COPY --from=build /build/target/release/arno-replay /usr/local/bin/arno-replay
 USER arno
 # /data is the arno-state volume (TOOL_POLICY_PATH, AUDIT_LOG_PATH) — Docker
 # would otherwise create the mount point as root, and the non-root arno user

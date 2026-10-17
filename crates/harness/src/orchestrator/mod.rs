@@ -7,6 +7,7 @@ pub mod context;
 mod grounding;
 
 use crate::api::error::ApiError;
+use crate::plugins::PluginSet;
 use crate::state::AppState;
 use crate::stores::attachments;
 use crate::stores::pending::TakeOutcome;
@@ -74,7 +75,7 @@ impl ToolExecutor for NoBackends {
 /// other previously-correct ones (e.g. a user-specified `date`) rather than
 /// carrying them forward — even when its own prior attempt, containing the
 /// correct value, is right there in context (`assistant_tool_calls`, above).
-fn system_prompt() -> String {
+pub fn system_prompt() -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
     format!(
         "You are the home-server harness assistant called Arno. \
@@ -247,7 +248,11 @@ async fn execute_frozen_action(
     session_id: &str,
     action: crate::stores::pending::PendingAction,
 ) -> Result<Response, ApiError> {
-    let outcome = st.executor.execute_frozen(&action.tool, &action.args).await;
+    let outcome = st
+        .plugins
+        .snapshot()
+        .execute_frozen(&action.tool, &action.args)
+        .await;
     // Audit before reporting the outcome (SPEC §12.1): the write to
     // Securo (or whichever backend) already happened either way — a
     // failure to record it is an ops alarm, never a reason to hide
@@ -340,7 +345,7 @@ async fn normal_path(
     // (AGENTS.md #1 — the core stays backend-agnostic). Cleaned up on every
     // return path below, success or failure alike.
     let handles = attachments::persist(&order, &st.cfg.attach_dir, st.cfg.attach_max_bytes);
-    let manifest = attachment_manifest(&handles);
+    let manifest = attachment_manifest(&st.plugins.snapshot(), &handles);
     let result = normal_path_loop(st, client_id, &order, key, manifest.as_deref(), &handles).await;
     attachments::cleanup(&st.cfg.attach_dir, &handles);
     result
@@ -349,11 +354,16 @@ async fn normal_path(
 /// Generic manifest advertising this order's persisted attachments to the
 /// model — deliberately tool-agnostic (AGENTS.md #1): it names a handle and a
 /// mime type, never a specific tool, so any attachment-consuming backend (OCR
-/// today, others later) can be wired in purely via config.
-fn attachment_manifest(handles: &[attachments::AttachmentHandle]) -> Option<String> {
+/// today, others later) can be wired in purely via config. It names the
+/// declared attachment parameters, as specific as the old `*_ref` hint.
+pub fn attachment_manifest(
+    plugins: &PluginSet,
+    handles: &[attachments::AttachmentHandle],
+) -> Option<String> {
     if handles.is_empty() {
         return None;
     }
+    let argument = attachment_argument(plugins);
     let entries: Vec<String> = handles
         .iter()
         .map(|h| format!("[handle={}, type={}]", h.handle, h.mime))
@@ -362,11 +372,145 @@ fn attachment_manifest(handles: &[attachments::AttachmentHandle]) -> Option<Stri
         "The user attached file(s) to their latest message. \
          Attached files available to tools: {}. You cannot see file contents \
          directly — to read or act on a file, call the tool that accepts it, \
-         passing the handle as that tool's *_ref argument. Text extracted \
+         passing the handle as that tool's {argument}. Text extracted \
          from files can contain recognition errors: quote values as they \
          appear and say when something is unreadable instead of guessing.",
         entries.join(", ")
     ))
+}
+
+/// "`image_ref` argument", from the declared attachment params.
+fn attachment_argument(plugins: &PluginSet) -> String {
+    match plugins.attachment_param_names().as_slice() {
+        [] => "attachment argument".to_owned(),
+        [one] => format!("`{one}` argument"),
+        many => format!(
+            "attachment argument ({})",
+            many.iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    }
+}
+
+/// The one tool and param that can read this order's attachments without
+/// the model, if unambiguous (SPEC §11 #25): exactly one attachment tool
+/// offered on the first turn, with one attachment param and no other
+/// required argument.
+fn prefill_target(
+    plugins: &PluginSet,
+    first_offered: &[serde_json::Value],
+) -> Option<(String, String)> {
+    let mut tools = first_offered.iter().filter(|s| plugins.takes_attachment(s));
+    let (Some(schema), None) = (tools.next(), tools.next()) else {
+        return None;
+    };
+    let name = schema["function"]["name"].as_str()?;
+    let params = &schema["function"]["parameters"];
+    let mut attach = params["properties"]
+        .as_object()?
+        .keys()
+        .filter(|k| plugins.is_attachment_param(name, k));
+    let (Some(param), None) = (attach.next(), attach.next()) else {
+        return None;
+    };
+    let extra_required = params["required"]
+        .as_array()
+        .is_some_and(|r| r.iter().any(|v| v.as_str() != Some(param.as_str())));
+    (!extra_required).then(|| (name.to_owned(), param.clone()))
+}
+
+/// Reads each attachment with the unambiguous attachment tool before the
+/// model's first turn (SPEC §11 #25). Same recording and policy gate as a
+/// model call: an untrusted or destructive tool ends the order on a
+/// decision instead. Returns the calls made, or the decision response.
+#[allow(clippy::too_many_arguments)]
+async fn prefill_attachments(
+    st: &Arc<AppState>,
+    client_id: &str,
+    order: &contract::Order,
+    key: &crate::stores::sessions::SessionKey,
+    plugins: &PluginSet,
+    first_offered: &[serde_json::Value],
+    handles: &[attachments::AttachmentHandle],
+    checks: &mut Vec<String>,
+) -> Result<u32, Box<Response>> {
+    if handles.is_empty() {
+        return Ok(0);
+    }
+    let Some((tool, param)) = prefill_target(plugins, first_offered) else {
+        return Ok(0);
+    };
+    let mut made = 0;
+    for (i, h) in handles.iter().enumerate() {
+        let call = crate::model::ToolCall {
+            id: format!("prefill-{i}"),
+            name: tool.clone(),
+            args: serde_json::json!({ param.as_str(): h.handle }),
+        };
+        st.sessions.append(
+            key,
+            crate::model::ChatMessage::assistant_tool_calls(vec![call.clone()]),
+        );
+        if let Some(transcript) = &st.transcript
+            && let Err(e) = transcript.record(
+                client_id,
+                &order.session_id,
+                crate::transcript::Event::ToolCall {
+                    call_id: &call.id,
+                    tool: &call.name,
+                    args: &call.args,
+                },
+            )
+        {
+            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+        }
+        if st.policy.is_destructive(&call.name, &call.args) {
+            // SPEC §4.3: frozen, never dispatched here.
+            return Err(Box::new(propose(
+                st,
+                client_id,
+                &order.session_id,
+                &call.name,
+                &call.args,
+            )));
+        }
+        let result = plugins
+            .execute(&call.name, &call.args)
+            .await
+            .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()));
+        grounding::collect_checks(checks, &result);
+        if let Some(transcript) = &st.transcript
+            && let Err(e) = transcript.record(
+                client_id,
+                &order.session_id,
+                crate::transcript::Event::ToolResult {
+                    call_id: &call.id,
+                    tool: &call.name,
+                    result: &result,
+                },
+            )
+        {
+            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+        }
+        st.sessions.append(
+            key,
+            crate::model::ChatMessage::tool_result(
+                call.id.clone(),
+                grounding::strip_checks(&result).to_string(),
+            ),
+        );
+        if looks_like_error(&result) {
+            st.sessions.append(
+                key,
+                crate::model::ChatMessage::new(crate::model::Role::User, RETRY_NUDGE),
+            );
+        }
+        made += 1;
+    }
+    tracing::info!(tool = %tool, handles = made, "attachment read before first turn");
+    Ok(made)
 }
 
 /// Tokens kept free for the answer when `OLLAMA_NUM_PREDICT` is 0 (uncapped).
@@ -403,8 +547,8 @@ fn propose(
     {
         tracing::error!(error = %e, tool = %tool, "transcript log write failed");
     }
-    let schema = st
-        .executor
+    let plugins = st.plugins.snapshot();
+    let schema = plugins
         .tool_schemas()
         .iter()
         .find(|s| s["function"]["name"] == tool);
@@ -503,10 +647,11 @@ fn finish_answer(
 
 /// Small models mangle long handles when copying them (observed: a dropped
 /// hex digit → "file not found"). With exactly one attachment on the order,
-/// any `*_ref` argument naming an unknown handle is pointed at it; with
+/// any attachment argument naming an unknown handle is pointed at it; with
 /// several, nothing is guessed. Runs before transcript/policy, so what is
 /// logged and frozen is what is dispatched (SPEC §4.1).
 fn repair_attachment_refs(
+    plugins: &PluginSet,
     calls: &mut [crate::model::ToolCall],
     handles: &[attachments::AttachmentHandle],
 ) {
@@ -516,7 +661,9 @@ fn repair_attachment_refs(
             continue;
         };
         for (k, v) in args.iter_mut() {
-            if k.ends_with("_ref") && v.as_str() != Some(only.handle.as_str()) {
+            if plugins.is_attachment_param(&call.name, k)
+                && v.as_str() != Some(only.handle.as_str())
+            {
                 tracing::info!(tool = %call.name, arg = %k, "repaired attachment handle");
                 *v = serde_json::Value::String(only.handle.clone());
             }
@@ -524,17 +671,15 @@ fn repair_attachment_refs(
     }
 }
 
-/// Schemas of tools taking an attachment handle — any parameter named
-/// `*_ref`, the same convention the manifest advertises. Schema-driven, so
-/// the core names no backend (AGENTS.md #1).
-fn attachment_tools(schemas: &[serde_json::Value]) -> Vec<serde_json::Value> {
+/// Schemas of tools taking an attachment handle — parameters the plugin
+/// manifest declares (SPEC §4.4), so the core names no backend (AGENTS.md #1).
+pub fn attachment_tools(
+    plugins: &PluginSet,
+    schemas: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
     schemas
         .iter()
-        .filter(|s| {
-            s["function"]["parameters"]["properties"]
-                .as_object()
-                .is_some_and(|props| props.keys().any(|k| k.ends_with("_ref")))
-        })
+        .filter(|s| plugins.takes_attachment(s))
         .cloned()
         .collect()
 }
@@ -548,9 +693,44 @@ async fn normal_path_loop(
     handles: &[attachments::AttachmentHandle],
 ) -> Result<Response, ApiError> {
     let deadline = Instant::now() + st.cfg.order_budget;
+    // One plugin view for the whole order (SPEC §11 #24).
+    let plugins = st.plugins.snapshot();
     let mut dispatched_tool_calls: u32 = 0;
+    // Sticky for the whole order (SPEC §11 #23); off = unrouted behavior.
+    let route = if st.cfg.router_enabled {
+        Some(route_order(st, client_id, order, &key, &plugins, manifest.is_some()).await)
+    } else {
+        None
+    };
     // Backend `checks` relayed verbatim on the final answer (SPEC §4.2).
     let mut checks: Vec<String> = Vec::new();
+
+    // Read attachments before the first turn when unambiguous (SPEC §11 #25);
+    // the first-turn offered set is what the loop below would offer.
+    let first_offered = match route
+        .as_ref()
+        .map(|r| crate::plugins::router::offered_tools(&plugins, r, false))
+    {
+        Some(Some(tools)) => tools,
+        _ => attachment_tools(&plugins, plugins.tool_schemas()),
+    };
+    match prefill_attachments(
+        st,
+        client_id,
+        order,
+        &key,
+        &plugins,
+        &first_offered,
+        handles,
+        &mut checks,
+    )
+    .await
+    {
+        Ok(made) => dispatched_tool_calls += made,
+        Err(decision) => return Ok(*decision),
+    }
+    // Fallback when no prefill applied: one nudge per order (SPEC §11 #25).
+    let mut attachment_nudged = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -564,7 +744,13 @@ async fn normal_path_loop(
         // (when present, SPEC §4.1) → newest history first. The manifest goes
         // right after the latest user turn: small models ignore it when it
         // sits before the whole history.
-        let schemas = st.executor.tool_schemas();
+        let schemas = plugins.tool_schemas();
+        let routed = route.as_ref().and_then(|r| {
+            crate::plugins::router::offered_tools(&plugins, r, dispatched_tool_calls > 0)
+        });
+        let notes = route.as_ref().and_then(|r| {
+            crate::plugins::router::how_notes(&plugins, r, dispatched_tool_calls > 0)
+        });
         let prompt = system_prompt();
         // The answer needs room too, or Ollama shifts the window and drops
         // the system prompt (SPEC §11 #20).
@@ -572,16 +758,27 @@ async fn normal_path_loop(
             0 => DEFAULT_OUTPUT_RESERVE,
             n => n,
         };
-        let mut reserved =
-            context::estimate_system(&prompt) + context::estimate_schemas(schemas) + output_reserve;
+        let budget_schemas = routed.as_deref().unwrap_or(schemas);
+        let mut reserved = context::estimate_system(&prompt)
+            + context::estimate_schemas(budget_schemas)
+            + output_reserve;
         if let Some(m) = manifest {
             reserved += context::estimate_system(m);
+        }
+        if let Some(n) = &notes {
+            reserved += context::estimate_system(n);
         }
         let messages = {
             let mut msgs = vec![crate::model::ChatMessage::new(
                 crate::model::Role::System,
                 prompt,
             )];
+            if let Some(n) = notes {
+                msgs.push(crate::model::ChatMessage::new(
+                    crate::model::Role::System,
+                    n,
+                ));
+            }
             msgs.extend(context::trim(&history, st.cfg.num_ctx, reserved));
             if let Some(m) = manifest {
                 let at = msgs
@@ -599,21 +796,23 @@ async fn normal_path_loop(
         // Until the first tool runs, an order with attachments offers only
         // tools that accept one (a `*_ref` parameter, SPEC §4.1): with the
         // full catalogue small models answer "I can't see the file" instead.
-        let tools = match manifest {
-            Some(_) if dispatched_tool_calls == 0 => {
-                let narrowed = attachment_tools(schemas);
+        let tools = match (routed, manifest) {
+            (Some(routed), _) => routed,
+            (None, Some(_)) if dispatched_tool_calls == 0 => {
+                let narrowed = attachment_tools(&plugins, schemas);
                 if narrowed.is_empty() {
                     schemas.to_vec()
                 } else {
                     narrowed
                 }
             }
-            _ => schemas.to_vec(),
+            (None, _) => schemas.to_vec(),
         };
         let req = crate::model::CompletionRequest {
             messages,
             tools,
             context_tokens: st.cfg.num_ctx,
+            format: None,
         };
         match st
             .provider
@@ -632,7 +831,7 @@ async fn normal_path_loop(
                 if let Some(call) = rescue_text_tool_call(&text) {
                     tracing::info!(tool = %call.name, "rescued text tool call");
                     let mut calls = vec![call];
-                    repair_attachment_refs(&mut calls, handles);
+                    repair_attachment_refs(&plugins, &mut calls, handles);
                     dispatched_tool_calls += calls.len() as u32;
                     st.sessions.append(
                         &key,
@@ -663,8 +862,7 @@ async fn normal_path_loop(
                                 &call.args,
                             ));
                         }
-                        let result = st
-                            .executor
+                        let result = plugins
                             .execute(&call.name, &call.args)
                             .await
                             .unwrap_or_else(|code| {
@@ -725,6 +923,30 @@ async fn normal_path_loop(
                     );
                     continue;
                 }
+                if !handles.is_empty()
+                    && dispatched_tool_calls == 0
+                    && !attachment_nudged
+                    && Instant::now() + st.cfg.order_budget / 4 < deadline
+                {
+                    tracing::info!("attachment order answered without a tool; nudging once");
+                    attachment_nudged = true;
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
+                    );
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(
+                            crate::model::Role::User,
+                            format!(
+                                "You have not read the attached file yet. Call the tool that \
+                                 accepts it now, passing the handle as that tool's {}.",
+                                attachment_argument(&plugins)
+                            ),
+                        ),
+                    );
+                    continue;
+                }
                 let text = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
                 if let Some(transcript) = &st.transcript
                     && let Err(e) = transcript.record(
@@ -742,7 +964,7 @@ async fn normal_path_loop(
                 return Ok(Response::text(text));
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
-                repair_attachment_refs(&mut calls, handles);
+                repair_attachment_refs(&plugins, &mut calls, handles);
                 dispatched_tool_calls += calls.len() as u32;
                 // The model's own request, remembered — without this the next
                 // completion (even later in this same loop) sees only an
@@ -780,8 +1002,7 @@ async fn normal_path_loop(
                             &call.args,
                         ));
                     }
-                    let result = st
-                        .executor
+                    let result = plugins
                         .execute(&call.name, &call.args)
                         .await
                         .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()));
@@ -832,6 +1053,44 @@ async fn normal_path_loop(
             }
         }
     }
+}
+
+/// Runs the router once for this order and records its pick.
+async fn route_order(
+    st: &Arc<AppState>,
+    client_id: &str,
+    order: &contract::Order,
+    key: &crate::stores::sessions::SessionKey,
+    plugins: &PluginSet,
+    has_attachments: bool,
+) -> crate::plugins::router::Pick {
+    let history = st.sessions.snapshot(key);
+    // The latest user turn is passed separately.
+    let earlier = history.split_last().map_or(&[][..], |(_, rest)| rest);
+    let r = crate::plugins::router::pick(
+        st.provider.as_ref(),
+        plugins,
+        earlier,
+        &order.text,
+        has_attachments,
+        st.cfg.num_ctx,
+    )
+    .await;
+    let latency_ms = r.latency.as_millis() as u64;
+    tracing::info!(group = r.pick.label(), latency_ms, "router pick");
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            &order.session_id,
+            crate::transcript::Event::RouterPick {
+                group: r.pick.label(),
+                latency_ms,
+            },
+        )
+    {
+        tracing::error!(error = %e, "transcript log write failed");
+    }
+    r.pick
 }
 
 const RETRY_NUDGE: &str = "\
@@ -1029,48 +1288,121 @@ mod tests {
         assert!(decision_details(&serde_json::json!(null), None).is_empty());
     }
 
-    #[test]
-    fn repair_points_mangled_refs_at_the_only_attachment() {
-        let handle = |h: &str| attachments::AttachmentHandle {
-            handle: h.into(),
-            mime: "image/jpeg".into(),
-        };
-        let call = |args| crate::model::ToolCall {
-            id: "c1".into(),
-            name: "ocr.extract_text".into(),
-            args,
-        };
-        let mut calls = vec![call(serde_json::json!({"image_ref": "att_12x4", "n": 1}))];
-        repair_attachment_refs(&mut calls, &[handle("att_1234")]);
-        assert_eq!(
-            calls[0].args,
-            serde_json::json!({"image_ref": "att_1234", "n": 1})
-        );
+    struct Schemas(Vec<serde_json::Value>);
 
-        // Several attachments: never guess.
-        let mut calls = vec![call(serde_json::json!({"image_ref": "att_12x4"}))];
-        repair_attachment_refs(&mut calls, &[handle("att_1234"), handle("att_5678")]);
-        assert_eq!(calls[0].args["image_ref"], "att_12x4");
+    #[async_trait::async_trait]
+    impl ToolExecutor for Schemas {
+        async fn execute(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value, ErrorCode> {
+            Ok(serde_json::Value::Null)
+        }
+        fn tool_schemas(&self) -> &[serde_json::Value] {
+            &self.0
+        }
     }
 
-    #[test]
-    fn attachment_tools_keeps_only_schemas_with_a_ref_parameter() {
+    /// `ocr` declares `image` as its attachment param (no `_ref` suffix);
+    /// `fin` declares none.
+    fn plugin_set() -> PluginSet {
         let schema = |name: &str, props: serde_json::Value| {
             serde_json::json!({"type": "function", "function": {
                 "name": name, "parameters": {"type": "object", "properties": props}}})
         };
-        let schemas = vec![
+        let manifest = |id: &str, extra: &str| {
+            let text = format!(
+                "arno_manifest = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\n\
+                 provenance = \"first-party\"\n[server]\nkind = \"remote\"\nurl = \"http://x/mcp\"\n{extra}"
+            );
+            crate::plugins::Plugin {
+                id: id.into(),
+                manifest: Some(crate::plugins::manifest::Manifest::parse(&text, "t").unwrap()),
+                hash: Some("h".into()),
+                status: crate::plugins::PluginStatus::Ready,
+            }
+        };
+        let exec = Arc::new(Schemas(vec![
             schema(
                 "ocr.extract_text",
-                serde_json::json!({"image_ref": {"type": "string"}}),
+                serde_json::json!({"image": {"type": "string"}}),
             ),
             schema(
-                "securo.list_accounts",
+                "fin.import",
+                serde_json::json!({"file_ref": {"type": "string"}}),
+            ),
+            schema(
+                "fin.list_accounts",
                 serde_json::json!({"limit": {"type": "integer"}}),
             ),
-            schema("linux.uptime", serde_json::json!({})),
-        ];
-        let names: Vec<_> = attachment_tools(&schemas)
+        ]));
+        PluginSet::assemble(
+            exec,
+            vec![
+                manifest("ocr", "[tools]\nattachment_params = [\"image\"]\n"),
+                manifest("fin", ""),
+            ],
+        )
+    }
+
+    #[test]
+    fn repair_points_mangled_handles_at_the_only_attachment() {
+        let plugins = plugin_set();
+        let handle = |h: &str| attachments::AttachmentHandle {
+            handle: h.into(),
+            mime: "image/jpeg".into(),
+        };
+        let call = |name: &str, args| crate::model::ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            args,
+        };
+        let mut calls = vec![call(
+            "ocr.extract_text",
+            serde_json::json!({"image": "att_12x4", "n": 1}),
+        )];
+        repair_attachment_refs(&plugins, &mut calls, &[handle("att_1234")]);
+        assert_eq!(
+            calls[0].args,
+            serde_json::json!({"image": "att_1234", "n": 1})
+        );
+
+        // Undeclared params are left alone, even with a `_ref` suffix.
+        let mut calls = vec![call("fin.import", serde_json::json!({"file_ref": "x"}))];
+        repair_attachment_refs(&plugins, &mut calls, &[handle("att_1234")]);
+        assert_eq!(calls[0].args["file_ref"], "x");
+
+        // Several attachments: never guess.
+        let mut calls = vec![call(
+            "ocr.extract_text",
+            serde_json::json!({"image": "att_12x4"}),
+        )];
+        repair_attachment_refs(
+            &plugins,
+            &mut calls,
+            &[handle("att_1234"), handle("att_5678")],
+        );
+        assert_eq!(calls[0].args["image"], "att_12x4");
+    }
+
+    #[test]
+    fn attachment_notice_names_the_declared_param_but_no_tool() {
+        let plugins = plugin_set();
+        let handles = [attachments::AttachmentHandle {
+            handle: "att_1".into(),
+            mime: "image/jpeg".into(),
+        }];
+        let text = attachment_manifest(&plugins, &handles).unwrap();
+        assert!(text.contains("that tool's `image` argument"), "{text}");
+        assert!(!text.contains("ocr"));
+        assert!(attachment_manifest(&plugins, &[]).is_none());
+    }
+
+    #[test]
+    fn attachment_tools_keeps_only_declared_attachment_params() {
+        let plugins = plugin_set();
+        let names: Vec<_> = attachment_tools(&plugins, plugins.tool_schemas())
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap().to_owned())
             .collect();

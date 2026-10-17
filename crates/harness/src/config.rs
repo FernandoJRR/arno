@@ -105,8 +105,15 @@ pub struct Config {
     /// [`crate::policy::ToolPolicy`] for the model-driven classifier that
     /// handles tools unlisted here (M3, SPEC §4.2).
     pub destructive_tools: HashSet<String>,
-    /// (server_name, endpoint) pairs from `NAME:endpoint,...`.
+    /// (server_name, endpoint) pairs from `NAME:endpoint,...`. Deprecated:
+    /// each entry becomes an implicit plugin (SPEC §11 #21).
     pub mcp_servers: Vec<(String, BackendAddr)>,
+    /// Directory of plugin manifests and their env files (SPEC §4.5).
+    pub plugins_dir: PathBuf,
+    /// Per-plugin disclosure report, rewritten at every load (SPEC §11 #22).
+    pub plugins_report_path: PathBuf,
+    /// Pick a tool group before each order (SPEC §11 #23).
+    pub router_enabled: bool,
     /// Where the model-classified tool-safety policy persists across restarts
     /// (SPEC §11, AGENTS.md #7 exception #1).
     pub tool_policy_path: PathBuf,
@@ -169,6 +176,9 @@ impl Config {
             attach_dir: path_var("ATTACH_DIR", "./data/attachments"),
             destructive_tools: list("DESTRUCTIVE_TOOLS")?.into_iter().collect(),
             mcp_servers: servers("MCP_SERVERS")?,
+            plugins_dir: path_var("PLUGINS_DIR", "./config/plugins"),
+            plugins_report_path: path_var("PLUGINS_REPORT_PATH", "./data/arno-plugins-report.json"),
+            router_enabled: parsed("ROUTER_ENABLED", Some(false))?,
             tool_policy_path: path_var("TOOL_POLICY_PATH", "./data/arno-tool-policy.json"),
             audit_log_path: path_var("AUDIT_LOG_PATH", "./data/arno-audit.jsonl"),
             transcript_log_path: path_var("TRANSCRIPT_LOG_PATH", "./data/arno-transcript.jsonl"),
@@ -197,6 +207,9 @@ const KNOWN_VARS: &[&str] = &[
     "OLLAMA_TIMEOUT_S",
     "MCP_TOOL_TIMEOUT_S",
     "MCP_SERVERS",
+    "PLUGINS_DIR",
+    "PLUGINS_REPORT_PATH",
+    "ROUTER_ENABLED",
     "ORDER_BUDGET_S",
     "MAX_TOOL_CALLS",
     "DEDUP_WINDOW_MIN",
@@ -232,6 +245,8 @@ const OWNED_PREFIXES: &[&str] = &[
     "AUDIT_LOG_",
     "TRANSCRIPT_LOG_",
     "NUMBER_GUARD",
+    "PLUGINS_",
+    "ROUTER_",
 ];
 
 fn reject_unknown() -> Result<(), ConfigError> {
@@ -545,6 +560,9 @@ mod tests {
             "OLLAMA_TIMEOUT_S",
             "MCP_TOOL_TIMEOUT_S",
             "MCP_SERVERS",
+            "PLUGINS_DIR",
+            "PLUGINS_REPORT_PATH",
+            "ROUTER_ENABLED",
             "ORDER_BUDGET_S",
             "MAX_TOOL_CALLS",
             "DEDUP_WINDOW_MIN",
@@ -580,6 +598,8 @@ mod tests {
         assert_eq!(cfg.ollama_top_k, 1);
         assert_eq!(cfg.ollama_num_predict, 400);
         assert!(cfg.number_guard);
+        assert!(!cfg.router_enabled);
+        assert_eq!(cfg.plugins_dir, PathBuf::from("./config/plugins"));
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
         assert_eq!(cfg.session_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(cfg.confirm_ttl, Duration::from_secs(600));

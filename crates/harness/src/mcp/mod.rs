@@ -62,72 +62,115 @@ impl McpRegistry {
         servers: &[(String, BackendAddr)],
         timeout: Duration,
     ) -> Result<Self, RegistryError> {
-        let mut backends = Vec::with_capacity(servers.len());
-        let mut routes = HashMap::new();
-        let mut schemas = Vec::new();
-
+        let mut reg = Self::empty(timeout);
         for (name, addr) in servers {
-            let service = match connect_backend(addr).await {
-                Ok(s) => s,
-                Err(ConnectFailure::Io(source)) => {
-                    return Err(RegistryError::Spawn {
-                        server: name.clone(),
-                        source,
-                    });
-                }
-                Err(ConnectFailure::Connect(source)) => {
-                    return Err(RegistryError::Connect {
-                        server: name.clone(),
-                        source,
-                    });
-                }
-            };
-
-            // Discovery walks pagination until exhausted; schemas are static
-            // for the process lifetime (compose-managed backends, SPEC §11.6).
-            let mut cursor = None;
-            let mut count = 0usize;
-            loop {
-                let params = cursor.map(|c| {
-                    let mut p = PaginatedRequestParams::default();
-                    p.cursor = Some(c);
-                    p
-                });
-                let page = service.list_tools(params).await.map_err(|source| {
-                    RegistryError::Discovery {
-                        server: name.clone(),
-                        source: Box::new(source),
-                    }
-                })?;
-                for tool in page.tools {
-                    let original = tool.name.to_string();
-                    let namespaced = format!("{name}.{original}");
-                    tracing::debug!(tool = %namespaced, "registered mcp tool");
-                    routes.insert(
-                        namespaced.clone(),
-                        Route {
-                            backend: backends.len(),
-                            tool: original,
-                        },
-                    );
-                    schemas.push(schema_value(&tool, &namespaced));
-                    count += 1;
-                }
-                match page.next_cursor {
-                    Some(next) => cursor = Some(next),
-                    None => break,
-                }
-            }
-            tracing::info!(server = %name, tools = count, "mcp backend ready");
-            backends.push(Backend { service });
+            reg.add(name, addr).await?;
         }
+        Ok(reg)
+    }
 
-        Ok(Self {
-            backends,
-            routes,
-            schemas,
+    /// Like [`Self::connect`], but a failing backend is skipped and reported
+    /// instead of aborting: one broken plugin must not take the rest down.
+    pub async fn connect_lenient(
+        servers: &[(String, BackendAddr)],
+        timeout: Duration,
+    ) -> (Self, Vec<(String, RegistryError)>) {
+        let mut reg = Self::empty(timeout);
+        let mut failed = Vec::new();
+        for (name, addr) in servers {
+            if let Err(e) = reg.add(name, addr).await {
+                failed.push((name.clone(), e));
+            }
+        }
+        (reg, failed)
+    }
+
+    fn empty(timeout: Duration) -> Self {
+        Self {
+            backends: Vec::new(),
+            routes: HashMap::new(),
+            schemas: Vec::new(),
             timeout,
-        })
+        }
+    }
+
+    async fn add(&mut self, name: &str, addr: &BackendAddr) -> Result<(), RegistryError> {
+        let service = match connect_backend(addr).await {
+            Ok(s) => s,
+            Err(ConnectFailure::Io(source)) => {
+                return Err(RegistryError::Spawn {
+                    server: name.to_owned(),
+                    source,
+                });
+            }
+            Err(ConnectFailure::Connect(source)) => {
+                return Err(RegistryError::Connect {
+                    server: name.to_owned(),
+                    source,
+                });
+            }
+        };
+
+        // Discovery walks pagination until exhausted; schemas are static
+        // until the next reload (SPEC §11 #24). Collected first so a
+        // discovery failure leaves the registry untouched.
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let params = cursor.map(|c| {
+                let mut p = PaginatedRequestParams::default();
+                p.cursor = Some(c);
+                p
+            });
+            let page =
+                service
+                    .list_tools(params)
+                    .await
+                    .map_err(|source| RegistryError::Discovery {
+                        server: name.to_owned(),
+                        source: Box::new(source),
+                    })?;
+            found.extend(page.tools);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let backend = self.backends.len();
+        for tool in &found {
+            let original = tool.name.to_string();
+            let namespaced = format!("{name}.{original}");
+            tracing::debug!(tool = %namespaced, "registered mcp tool");
+            self.routes.insert(
+                namespaced.clone(),
+                Route {
+                    backend,
+                    tool: original,
+                },
+            );
+            self.schemas.push(schema_value(tool, &namespaced));
+        }
+        tracing::info!(server = %name, tools = found.len(), "mcp backend ready");
+        self.backends.push(Backend { service });
+        Ok(())
+    }
+
+    /// Drops tools outside the operator allowlist from both the prompt and
+    /// dispatch, so a hallucinated call to a disabled tool cannot reach it.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.routes.retain(|name, _| keep(name));
+        let routes = &self.routes;
+        self.schemas.retain(|s| {
+            s["function"]["name"]
+                .as_str()
+                .is_some_and(|n| routes.contains_key(n))
+        });
+    }
+
+    /// Rewrites discovered schemas in place (description hygiene for
+    /// untrusted authors, SPEC §11 #22). Names must not change.
+    pub fn map_schemas(&mut self, f: impl FnMut(&mut serde_json::Value)) {
+        self.schemas.iter_mut().for_each(f);
     }
 }
 

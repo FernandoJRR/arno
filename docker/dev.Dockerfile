@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release --workspace \
     && mkdir -p /out \
-    && cp target/release/harness target/release/mcp-linux target/release/mcp-ocr target/release/adapter-telegram /out/
+    && cp target/release/harness target/release/arno-replay target/release/mcp-linux target/release/mcp-ocr target/release/adapter-telegram /out/
 # Binaries are copied out of the cache-mounted target dir here: that mount's
 # contents do not persist into the image layer once this RUN ends.
 
@@ -39,6 +39,7 @@ RUN apt-get update \
     && mkdir -p /data /attachments \
     && chown arno:arno /data /attachments
 COPY --from=build /out/harness /usr/local/bin/harness
+COPY --from=build /out/arno-replay /usr/local/bin/arno-replay
 USER arno
 ENV HARNESS_API_BIND=0.0.0.0:${HARNESS_API_PORT}
 EXPOSE ${HARNESS_API_PORT}

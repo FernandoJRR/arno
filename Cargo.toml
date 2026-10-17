@@ -26,6 +26,8 @@ async-trait = "0.1"
 teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
+arc-swap = "1.9"
 
 [profile.release]
 strip = true

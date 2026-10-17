@@ -25,13 +25,12 @@ services:
       # Raised from 120s: a cold model load alone can take ~42s, and a real
       # order adds prompt + tool schemas + history on top.
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-180}
-      # Securo (M2) is external — its bearer token is composed into this
-      # entry's header block at deploy time. The harness never reads a
-      # SECURO_*-named var itself (AGENTS.md #6): the generic
-      # `name:[Header=Value;...]url` form is how any authenticated HTTP MCP
-      # backend receives credentials, not a Securo-specific code path.
-      MCP_SERVERS: >-
-        linux-mcp:http://mcp-linux:${MCP_LINUX_PORT:-9001}/mcp,ocr:http://mcp-ocr:${MCP_OCR_PORT:-9002}/mcp,securo:[Authorization=Bearer ${SECURO_MCP_AUTH:?set in .env}]${SECURO_MCP_URL:?set in .env}
+      # Plugins (SPEC §4.5, §11 #21): one manifest + optional env file per
+      # MCP backend in ./config/plugins. Secrets stay in those env files and
+      # never enter this environment.
+      PLUGINS_DIR: /config/plugins
+      PLUGINS_REPORT_PATH: /data/arno-plugins-report.json
+      ROUTER_ENABLED: ${ROUTER_ENABLED:-false}
       # Non-owned name on purpose: anything HARNESS_*-prefixed is rejected by
       # the harness's own strict env validator (SPEC §5.7), even if unread.
       HEALTHCHECK_PORT: ${HARNESS_API_PORT:-8080}
@@ -68,6 +67,8 @@ services:
       # images, not durable state — cleared on `down -v`, purged again at
       # harness boot regardless (SPEC §4.1). Shared with mcp-ocr below.
       - attachments:/attachments
+      # Plugin manifests and per-plugin env files, read-only.
+      - ./config/plugins:/config/plugins:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

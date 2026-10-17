@@ -1,0 +1,23 @@
+# First-party plugin: OCR of attached images (crates/mcp-ocr).
+arno_manifest = 1
+id = "ocr"
+name = "Image text reader"
+version = "0.1.0"
+provenance = "first-party"
+
+[server]
+kind = "remote"
+url = "http://mcp-ocr:9002/mcp"
+
+[permissions]
+volumes = ["attachments:/attachments:ro"]
+
+[tools]
+attachment_params = ["image_ref"]
+
+[[groups]]
+id = "read"
+when = "Read the text in an attached image, photo, bill or receipt"
+tools = ["extract_text"]
+# Photo of a bill -> OCR -> record it as an expense.
+related = ["securo.transactions", "securo.accounts"]

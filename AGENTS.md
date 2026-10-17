@@ -19,6 +19,7 @@ cargo clippy --workspace -- -D warnings   # lint gate — must be clean
 cargo fmt --all -- --check           # format gate — run cargo fmt, don't hand-format
 cargo test --workspace               # unit + contract tests; no network needed
 RUST_LOG=debug cargo run -p adapter-cli   # smoke loop against a local harness
+docker compose exec harness arno-replay   # live tool-selection replay (full vs routed); never in tests
 docker compose up -d --build         # full deployment topology
 ```
 
@@ -31,7 +32,7 @@ you are doing it wrong.
 | Crate | Role |
 |---|---|
 | `crates/contract` | Wire types: Order, Response, ErrorCode, attachments. Shared vocabulary of Contract 1. |
-| `crates/harness` | Part B core: axum API, FIFO queue, stores, orchestrator, MCP client, ModelProvider trait, adaptive tool policy, audit log. Binary. |
+| `crates/harness` | Part B core: axum API, FIFO queue, stores, orchestrator, MCP client, plugins (manifests, trust, router, reload), ModelProvider trait, adaptive tool policy, audit log. Binaries: `harness`, `arno-replay`. |
 | `crates/adapter-cli` | Throwaway M0 interface adapter (stdin ↔ Order/Response). |
 | `crates/adapter-telegram` | Part A v1: teloxide long-polling bridge. |
 | `crates/mcp-linux` | First MCP backend: read-only Linux diagnostics (rmcp server side). |
@@ -42,8 +43,8 @@ Adapters must not depend on `harness`; `harness` must not depend on adapters.
 ## Hard rules — violating any of these is a design bug, not a style issue
 
 1. **No app-specific code in the core.** The harness contains zero
-   Telegram- or Securo-specific logic. All per-app knowledge lives in adapters or
-   configuration (`MCP_SERVERS`, `DESTRUCTIVE_TOOLS`). If you're adding a string
+   Telegram- or Securo-specific logic. All per-app knowledge lives in adapters,
+   plugin manifests (`PLUGINS_DIR`) or configuration (`DESTRUCTIVE_TOOLS`). If you're adding a string
    like `"securo"` or `"telegram"` inside `crates/harness`, stop.
 2. **Contract 1 is additive-only.** Never change or remove fields of Order /
    Response / ErrorCode under `/v1`; never repurpose an error code. Breaking
@@ -64,7 +65,14 @@ Adapters must not depend on `harness`; `harness` must not depend on adapters.
    execution paths around it (SPEC §8).
 6. **Config arrives exclusively via env vars**, parsed into typed structs at
    startup; unknown vars fail loudly. Every new knob must also be documented in
-   SPEC §5.7 and STACK.md §7.
+   SPEC §5.7 and STACK.md §7. **One narrowly-scoped exception (SPEC §4.5,
+   §11 #21):** plugin manifests (`PLUGINS_DIR/<id>.toml`) and their per-plugin
+   `<id>.env` secret files. A manifest is versioned, per-plugin structured
+   data; unknown versions and keys fail loudly, like unknown env vars.
+   **Manifests only tighten policy**: no manifest field may mark a tool safe
+   or loosen the classifier, operator pins or `DESTRUCTIVE_TOOLS`, and plugin
+   secrets never enter the process env. Do not add other file-based config
+   without a spec revision.
 7. **In-memory stores stay in-memory** (sessions, dedup LRU, pending actions) —
    restart-clears is accepted behavior, not a gap. Persistence proposals need a
    spec revision first. **Three narrowly-scoped exceptions exist (M3, SPEC

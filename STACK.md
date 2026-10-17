@@ -19,7 +19,7 @@ seam, deployment topology, and config ownership.
 | Harness API | axum, all routes under `/v1` |
 | Model runtime | **ModelProvider trait** with Ollama as first adapter impl (`/api/chat`, native API — not `/v1` compat) |
 | Interface adapter v1 | teloxide long-polling |
-| Config | env vars only, parsed into typed structs with serde defaults |
+| Config | env vars, parsed into typed structs with serde defaults; plus plugin manifests (TOML) and per-plugin env files in `PLUGINS_DIR` (SPEC §4.5, §11 #21) |
 | Serialization | serde / serde_json everywhere; one wire schema owned by `contract` crate |
 | Deployment | Docker multi-stage builds + compose, one service per part; **Ollama stays on the host** |
 | Testing | cargo test; wiremock for Harness API contract tests; rmcp-based mock MCP server |
@@ -49,6 +49,8 @@ Versions are current stable majors at decision time (`major.minor` shown for ori
 | subtle | 2.6 | harness | constant-time bearer-token comparison |
 | clap | 4.6 | binaries | CLI arg parsing (adapters, harness flags) |
 | async-trait | 0.1 | harness | dyn-compatible async traits (`ModelProvider`, `ToolExecutor`) |
+| toml | 1.1 | harness | plugin manifests (SPEC §4.5); `deny_unknown_fields` gives the fail-loudly behavior of unknown env vars |
+| arc-swap | 1.9 | harness | lock-free swappable plugin set: orders load a snapshot, a reload stores a new one between orders (SPEC §11 #24) |
 | wiremock | 0.6 | tests | stub HTTP server for contract tests |
 
 Notes:
@@ -251,11 +253,11 @@ Every SPEC §5.7 knob belongs to exactly one component; unknown vars fail startu
 
 | Component | Owns |
 |---|---|
-| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/TIMEOUT_S/THINK`, `OLLAMA_NUM_CTX` (default 16384 — fits qwen3:4b ~94% on a 6 GB GPU, SPEC §11 #20), `OLLAMA_SEED` (default 42, 0=provider default), `OLLAMA_TOP_K` (default 1 greedy, 0=provider default) — deterministic tool-selection sampler per SPEC §11 decision #16, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (deprecated, ignored with a boot warning — SPEC §11 #18), `ATTACH_MAX_BYTES`, `ATTACH_DIR` (default `./data/attachments` — ephemeral scratch for inbound image attachments, SPEC §4.4/§11 decision #17), `DESTRUCTIVE_TOOLS`, `MCP_SERVERS`, `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3), `AUDIT_LOG_ROTATE_BYTES` (default 2 MiB, 0=off), `TRANSCRIPT_LOG_ROTATE_BYTES` (default 10 MiB, 0=off), `LOG_KEEP_SEGMENTS` (default 12), `LOG_VERIFY_ON_BOOT` (default `false`) — rotation/verification knobs per SPEC §11 decision #15, `OLLAMA_NUM_PREDICT` (default 400, 0=provider default), `NUMBER_GUARD` (default `true`) — answer length and number hygiene per SPEC §11 #20 |
+| harness | `HARNESS_API_BIND`, `HARNESS_API_CLIENT_TOKENS`, `OLLAMA_URL/MODEL/TIMEOUT_S/THINK`, `OLLAMA_NUM_CTX` (default 16384 — fits qwen3:4b ~94% on a 6 GB GPU, SPEC §11 #20), `OLLAMA_SEED` (default 42, 0=provider default), `OLLAMA_TOP_K` (default 1 greedy, 0=provider default) — deterministic tool-selection sampler per SPEC §11 decision #16, `MCP_TOOL_TIMEOUT_S`, `ORDER_BUDGET_S`, `MAX_TOOL_CALLS`, `DEDUP_WINDOW_MIN`, `SESSION_TTL_H`, `CONFIRM_TTL_MIN`, `CONFIRM_MODE` (deprecated, ignored with a boot warning — SPEC §11 #18), `ATTACH_MAX_BYTES`, `ATTACH_DIR` (default `./data/attachments` — ephemeral scratch for inbound image attachments, SPEC §4.4/§11 decision #17), `DESTRUCTIVE_TOOLS`, `MCP_SERVERS` (deprecated, SPEC §11 #21), `PLUGINS_DIR` (default `./config/plugins`), `PLUGINS_REPORT_PATH` (default `./data/arno-plugins-report.json`), `ROUTER_ENABLED` (default `false`, SPEC §11 #23), `TOOL_POLICY_PATH`, `AUDIT_LOG_PATH`, `TRANSCRIPT_LOG_PATH`, `TOOL_POLICY_RETRY_S` (M3), `AUDIT_LOG_ROTATE_BYTES` (default 2 MiB, 0=off), `TRANSCRIPT_LOG_ROTATE_BYTES` (default 10 MiB, 0=off), `LOG_KEEP_SEGMENTS` (default 12), `LOG_VERIFY_ON_BOOT` (default `false`) — rotation/verification knobs per SPEC §11 decision #15, `OLLAMA_NUM_PREDICT` (default 400, 0=provider default), `NUMBER_GUARD` (default `true`) — answer length and number hygiene per SPEC §11 #20 |
 | adapter-telegram | `TELEGRAM_BOT_TOKEN`, `ALLOWED_CHAT_IDS`, `HARNESS_API_URL`, `HARNESS_API_TOKEN`, `TELEGRAM_HTTP_TIMEOUT_S` (default 240s, must exceed `ORDER_BUDGET_S`) |
 | mcp-linux | `MCP_LINUX_TRANSPORT` (`http`\|`stdio`), `MCP_LINUX_BIND` |
 | mcp-ocr | `MCP_OCR_TRANSPORT` (`http`\|`stdio`), `MCP_OCR_BIND`, `MCP_OCR_ATTACH_DIR` (its own mount of the `attachments` volume shared with the harness, SPEC §4.4), `MCP_OCR_LANG` (default `eng+spa`), `MCP_OCR_ENGINE` (only `tesseract` today; `ollama-vision` documented, not built — SPEC §11 decision #17), `MCP_OCR_PREPROCESS` (`on`\|`off`, default `on` — SPEC §11 #19) |
-| deployment layer (compose/.env, not the harness) | `SECURO_MCP_URL`, `SECURO_MCP_AUTH` — composed into the harness's `MCP_SERVERS` entry as a header block (SPEC §5.7); the harness itself owns only `MCP_SERVERS` and never reads a `SECURO_*` var (AGENTS.md #6). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
+| plugins (`config/plugins/`, not env) | `<id>.toml` manifests and `<id>.env` secrets, e.g. `securo.toml` (URL, groups) + `securo.env` (`SECURO_MCP_AUTH`). Read by the harness at load; secret values never enter its process env (SPEC §4.5). No workspace var: the bearer JWT's own `ws_id` claim scopes every call server-side (confirmed live, M2) |
 
 ## 8. Testing strategy
 
