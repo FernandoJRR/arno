@@ -315,6 +315,192 @@ async fn false_claim_delivered_when_budget_exhausts_recovery() {
     );
 }
 
+/// Scripted like `SequencedProvider`, and keeps every prompt it was sent.
+struct PromptLogProvider {
+    script: std::sync::Mutex<Vec<CompletionOutput>>,
+    prompts: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+impl PromptLogProvider {
+    fn new(script: Vec<CompletionOutput>) -> (Self, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                script: std::sync::Mutex::new(script),
+                prompts: prompts.clone(),
+            },
+            prompts,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for PromptLogProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(req.messages.iter().map(|m| m.content.clone()).collect());
+        let mut q = self.script.lock().unwrap();
+        Ok(if q.len() > 1 {
+            q.remove(0)
+        } else {
+            q[0].clone()
+        })
+    }
+}
+
+fn propose_call(id: &str, args: serde_json::Value) -> CompletionOutput {
+    CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+        id: id.into(),
+        name: "securo.propose_create_transaction".into(),
+        args,
+    }])
+}
+
+fn preview_nudges(prompts: &[Vec<String>]) -> usize {
+    prompts
+        .last()
+        .map(|p| {
+            p.iter()
+                .filter(|m| m.contains("only prepared a preview"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn success_claim_after_preview_nudges_toward_a_decision() {
+    // Preview → false "created" → nudge → the acting call → decision.
+    let (provider, prompts) = PromptLogProvider::new(vec![
+        propose_call("call_1", serde_json::json!({"amount": 250})),
+        CompletionOutput::Final("Expense created successfully.".into()),
+        propose_call("call_2", serde_json::json!({"amount": 250, "apply": true})),
+    ]);
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!(
+        {"proposed": {"amount": 250}}
+    )));
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(provider),
+        Arc::new(executor.clone()),
+    );
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["decision"].is_object(), "{body}");
+    let calls = executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "only the preview ran");
+    assert!(calls[0].1.get("apply").is_none());
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(preview_nudges(&prompts), 1);
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("apply=true")),
+        "nudge names the acting argument from the policy rule"
+    );
+}
+
+#[tokio::test]
+async fn repeated_success_claim_after_preview_becomes_a_decision() {
+    // The model ignores the nudge: the harness asks the user with the
+    // previewed args plus the acting argument; nothing more runs.
+    let (provider, prompts) = PromptLogProvider::new(vec![
+        propose_call("call_1", serde_json::json!({"amount": 250})),
+        CompletionOutput::Final("Expense created successfully.".into()),
+        propose_call("call_2", serde_json::json!({"amount": 250})),
+        CompletionOutput::Final("Created expense: 250.".into()),
+    ]);
+    let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!(
+        {"proposed": {"amount": 250}}
+    )));
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(provider),
+        Arc::new(executor.clone()),
+    );
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+    let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body["text"].as_str().unwrap().contains("Created"),
+        "{body}"
+    );
+    let details = body["decision"]["details"].as_array().expect("decision");
+    assert!(
+        details
+            .iter()
+            .any(|d| d["label"] == "apply" && d["value"] == "true"),
+        "{body}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d["label"] == "amount" && d["value"] == "250")
+    );
+    assert_eq!(
+        executor.calls.lock().unwrap().len(),
+        2,
+        "both previews only"
+    );
+    assert_eq!(
+        preview_nudges(&prompts.lock().unwrap()),
+        1,
+        "nudged once only"
+    );
+}
+
+#[tokio::test]
+async fn honest_preview_gets_only_the_footer_and_reads_are_untouched() {
+    for (tool, conditional, reply) in [
+        (
+            "securo.propose_create_transaction",
+            true,
+            "Here is the proposal. Should I apply it?",
+        ),
+        (
+            "securo.list_transactions",
+            false,
+            "Your payment was successfully processed on Oct 5.",
+        ),
+    ] {
+        let (provider, prompts) = PromptLogProvider::new(vec![
+            CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+                id: "call_1".into(),
+                name: tool.into(),
+                args: serde_json::json!({}),
+            }]),
+            CompletionOutput::Final(reply.into()),
+        ]);
+        let state = build_state(
+            test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+            Arc::new(provider),
+            Arc::new(RecordingExecutor::new(ExecBehavior::Ok(
+                serde_json::json!({"ok": 1}),
+            ))),
+        );
+        if conditional {
+            pin_conditional_on_apply(&state, tool).await;
+        } else {
+            pin_safe(&state, tool).await;
+        }
+        let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = if conditional {
+            format!(
+                "{reply}\n\nℹ Not saved yet: this is only a preview. Ask me to apply it to make the change."
+            )
+        } else {
+            reply.to_owned()
+        };
+        assert_eq!(body["text"], expected, "{body}");
+        assert_eq!(prompts.lock().unwrap().len(), 2, "no extra turn for {tool}");
+    }
+}
+
 // ---- /v1/logs/verify (SPEC §11 decision #15) ----
 
 #[tokio::test]
@@ -618,7 +804,11 @@ async fn tool_call_not_matching_the_conditional_predicate_dispatches_directly() 
 
     let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["text"], "here's a preview");
+    assert_eq!(
+        body["text"],
+        "here's a preview\n\nℹ Not saved yet: this is only a preview. Ask me to apply it to make the change.",
+        "a preview always says so (SPEC §11 #16)"
+    );
     assert_eq!(
         body["needs_confirmation"],
         serde_json::Value::Null,
@@ -799,7 +989,7 @@ async fn transcript_records_user_tool_call_result_and_final_answer_in_order() {
     cfg.destructive_tools.clear();
     let transcript_path = cfg.transcript_log_path.clone();
     let state = build_state(cfg, provider, Arc::new(executor));
-    pin_conditional_on_apply(&state, "securo.list_transactions").await;
+    pin_safe(&state, "securo.list_transactions").await;
 
     let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
     assert_eq!(status, StatusCode::OK);

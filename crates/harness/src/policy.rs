@@ -221,6 +221,23 @@ impl ToolPolicy {
         }
     }
 
+    /// For a dispatchable call to a `destructive_when` tool that did not set
+    /// its acting argument, the `(key, value)` that would have made it act:
+    /// the call was only a preview (SPEC §11 #16).
+    pub fn preview_of(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<(String, serde_json::Value)> {
+        if self.is_destructive(tool, args) {
+            return None;
+        }
+        match &self.entries.read().expect("policy lock").get(tool)?.rule {
+            ToolRule::DestructiveWhen { key, value } => Some((key.clone(), value.clone())),
+            _ => None,
+        }
+    }
+
     /// Syncs against freshly discovered tool schemas (SPEC §4.2): inserts
     /// never-seen tools as `Pending`; flips `Model`-sourced entries back to
     /// `Pending` when their fingerprint no longer matches (the backend
@@ -771,6 +788,37 @@ mod tests {
         assert!(!rule.is_destructive_for(&serde_json::json!({})));
         assert!(!rule.is_destructive_for(&serde_json::json!({"apply": false})));
         assert!(rule.is_destructive_for(&serde_json::json!({"apply": true})));
+    }
+
+    #[test]
+    fn preview_of_names_the_acting_arg_only_for_unmet_destructive_when() {
+        let policy = ToolPolicy::load(tmp_path("preview-of"), HashSet::new());
+        policy.reconcile(&[
+            schema("mock.safe", "reads"),
+            schema("mock.kill", "deletes"),
+            schema("mock.propose", "previews unless apply"),
+        ]);
+        {
+            let mut entries = policy.entries.write().unwrap();
+            entries.get_mut("mock.safe").unwrap().rule = ToolRule::Safe;
+            entries.get_mut("mock.kill").unwrap().rule = ToolRule::Destructive;
+            entries.get_mut("mock.propose").unwrap().rule = ToolRule::DestructiveWhen {
+                key: "apply".into(),
+                value: serde_json::json!(true),
+            };
+        }
+        let none = serde_json::json!({});
+        assert_eq!(policy.preview_of("mock.safe", &none), None);
+        assert_eq!(policy.preview_of("mock.kill", &none), None);
+        assert_eq!(policy.preview_of("mock.unknown", &none), None);
+        assert_eq!(
+            policy.preview_of("mock.propose", &serde_json::json!({"apply": true})),
+            None
+        );
+        assert_eq!(
+            policy.preview_of("mock.propose", &none),
+            Some(("apply".into(), serde_json::json!(true)))
+        );
     }
 
     #[test]
