@@ -87,7 +87,11 @@ pub fn system_prompt() -> String {
          When a tool call fails and you retry it, change only the argument(s) \
          that caused the failure — copy every other value from your own \
          previous attempt exactly. Never drop or reset a field the user \
-         already gave you just because you're also fixing something else."
+         already gave you just because you're also fixing something else. \
+         The user approves changes here, in this conversation: when a change \
+         needs approval they are shown an approve or cancel choice. Never tell \
+         them to approve, confirm or apply anything in another app or \
+         interface, and never mention tool argument names to them."
     )
 }
 
@@ -731,9 +735,6 @@ async fn normal_path_loop(
     }
     // Fallback when no prefill applied: one nudge per order (SPEC §11 #25).
     let mut attachment_nudged = false;
-    // Calls that only previewed a `destructive_when` tool (SPEC §11 #16).
-    let mut previews: Vec<Preview> = Vec::new();
-    let mut preview_nudged = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -900,8 +901,10 @@ async fn normal_path_loop(
                                     RETRY_NUDGE,
                                 ),
                             );
-                        } else {
-                            previews.extend(Preview::of(st, &call));
+                        } else if let Some(decision) =
+                            preview_decision(st, client_id, &order.session_id, &call, &checks)
+                        {
+                            return Ok(decision);
                         }
                     }
                     if dispatched_tool_calls > st.cfg.max_tool_calls {
@@ -914,8 +917,7 @@ async fn normal_path_loop(
                 // qwen3:4b lie. Withhold it, correct the model, loop —
                 // bounded by budget; on exhaustion the text IS delivered
                 // (never silently swallowed) with an ops warn.
-                let claims = claims_execution(&text);
-                if claims
+                if claims_execution(&text)
                     && dispatched_tool_calls == 0
                     && Instant::now() + st.cfg.order_budget / 4 < deadline
                 {
@@ -929,38 +931,6 @@ async fn normal_path_loop(
                         crate::model::ChatMessage::new(crate::model::Role::User, FALSE_CLAIM_NUDGE),
                     );
                     continue;
-                }
-                // A success claim after preview-only calls (SPEC §11 #16):
-                // point the model at the acting argument once, so a real
-                // request ends on a decision.
-                if !preview_nudged
-                    && claims_after_preview(&text)
-                    && let Some(p) = previews.last()
-                    && Instant::now() + st.cfg.order_budget / 4 < deadline
-                {
-                    tracing::warn!(tool = %p.tool, "final claims execution after a preview; nudging once");
-                    preview_nudged = true;
-                    st.sessions.append(
-                        &key,
-                        crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
-                    );
-                    st.sessions.append(
-                        &key,
-                        crate::model::ChatMessage::new(crate::model::Role::User, p.nudge()),
-                    );
-                    continue;
-                }
-                // Still claiming after the nudge: the harness asks the user
-                // instead. The payload is the model's own preview arguments
-                // plus the policy's acting argument; nothing runs without an
-                // explicit approve (AGENTS.md #3, SPEC §11 #16).
-                if preview_nudged
-                    && claims_after_preview(&text)
-                    && let Some(args) = previews.last().and_then(Preview::acting_args)
-                {
-                    let tool = &previews.last().expect("checked above").tool;
-                    tracing::warn!(tool = %tool, "final still claims execution after a preview; asking the user");
-                    return Ok(propose(st, client_id, &order.session_id, tool, &args));
                 }
                 if !handles.is_empty()
                     && dispatched_tool_calls == 0
@@ -986,25 +956,23 @@ async fn normal_path_loop(
                     );
                     continue;
                 }
-                let mut text = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
-                // Whatever the model wrote, a preview never reads as done.
-                if !previews.is_empty() {
-                    text.push_str(PREVIEW_FOOTER);
-                }
+                let shown = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
                 if let Some(transcript) = &st.transcript
                     && let Err(e) = transcript.record(
                         client_id,
                         &order.session_id,
-                        crate::transcript::Event::AssistantFinal { text: &text },
+                        crate::transcript::Event::AssistantFinal { text: &shown },
                     )
                 {
                     tracing::error!(error = %e, "transcript log write failed");
                 }
+                // History keeps the model's own words: harness-written lines
+                // would be parroted back as if they were its answer.
                 st.sessions.append(
                     &key,
-                    crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
+                    crate::model::ChatMessage::new(crate::model::Role::Assistant, text),
                 );
-                return Ok(Response::text(text));
+                return Ok(Response::text(shown));
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
                 repair_attachment_refs(&plugins, &mut calls, handles);
@@ -1088,8 +1056,10 @@ async fn normal_path_loop(
                             &key,
                             crate::model::ChatMessage::new(crate::model::Role::User, RETRY_NUDGE),
                         );
-                    } else {
-                        previews.extend(Preview::of(st, &call));
+                    } else if let Some(decision) =
+                        preview_decision(st, client_id, &order.session_id, &call, &checks)
+                    {
+                        return Ok(decision);
                     }
                 }
                 if dispatched_tool_calls > st.cfg.max_tool_calls {
@@ -1304,66 +1274,25 @@ fn claims_execution(text: &str) -> bool {
     FALSE_CLAIM_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
-/// Wider than [`claims_execution`]: after a preview, plain verbs like
-/// "Created expense…" are the observed false claim (SPEC §11 #16).
-fn claims_after_preview(text: &str) -> bool {
-    const VERBS: &[&str] = &[
-        "created",
-        "added",
-        "recorded",
-        "saved",
-        "registered",
-        "applied",
-    ];
-    let lower = text.to_lowercase();
-    claims_execution(text) || VERBS.iter().any(|v| lower.contains(v))
+/// A successful preview of a `destructive_when` tool goes straight to a
+/// decision: the previewed arguments plus the policy's acting argument,
+/// approve-gated like any destructive call (SPEC §11 #16, AGENTS.md #3).
+/// The model never has to word the confirmation or repeat the arguments.
+fn preview_decision(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    call: &crate::model::ToolCall,
+    checks: &[String],
+) -> Option<Response> {
+    let (key, value) = st.policy.preview_of(&call.name, &call.args)?;
+    let mut args = call.args.clone();
+    args.as_object_mut()?.insert(key, value);
+    tracing::info!(tool = %call.name, "preview dispatched; asking the user to apply it");
+    let mut response = propose(st, client_id, session_id, &call.name, &args);
+    response.text = grounding::decorate(&response.text, checks, &[]);
+    Some(response)
 }
-
-/// A dispatched call that did not set its tool's acting argument (SPEC §11
-/// #16). Names come from the policy rule, never from the core.
-struct Preview {
-    tool: String,
-    args: serde_json::Value,
-    key: String,
-    value: serde_json::Value,
-}
-
-impl Preview {
-    fn of(st: &AppState, call: &crate::model::ToolCall) -> Option<Self> {
-        let (key, value) = st.policy.preview_of(&call.name, &call.args)?;
-        Some(Self {
-            tool: call.name.clone(),
-            args: call.args.clone(),
-            key,
-            value,
-        })
-    }
-
-    /// The previewed arguments with the acting argument set.
-    fn acting_args(&self) -> Option<serde_json::Value> {
-        let mut args = self.args.clone();
-        args.as_object_mut()?
-            .insert(self.key.clone(), self.value.clone());
-        Some(args)
-    }
-
-    fn nudge(&self) -> String {
-        let Self {
-            tool, key, value, ..
-        } = self;
-        format!(
-            "The call to {tool} only prepared a preview, so nothing was created or \
-             changed. If the user asked for this to be done, call {tool} again with \
-             the same arguments plus {key}={value}; the user will be asked to \
-             confirm. Otherwise tell the user, in plain words and without argument \
-             names, that it is only a preview."
-        )
-    }
-}
-
-/// Harness-authored, so a false claim never reaches the user unmarked.
-const PREVIEW_FOOTER: &str =
-    "\n\nℹ Not saved yet: this is only a preview. Ask me to apply it to make the change.";
 
 const FALSE_CLAIM_NUDGE: &str = "\
 You just stated that an action was completed, but you did not call any tool \
