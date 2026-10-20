@@ -4,6 +4,7 @@
 //! flight makes session access and confirmation redemption race-free.
 
 mod args;
+mod card;
 pub mod context;
 mod grounding;
 mod intent;
@@ -391,6 +392,7 @@ async fn normal_path(
             &order.session_id,
             &action.tool,
             &action.args,
+            action.preview.as_ref(),
         ));
     }
 
@@ -528,6 +530,7 @@ async fn prefill_attachments(
                 &order.session_id,
                 &call.name,
                 &call.args,
+                None,
             )));
         }
         let result = plugins
@@ -583,14 +586,16 @@ fn propose(
     session_id: &str,
     tool: &str,
     args: &serde_json::Value,
+    preview: Option<&serde_json::Value>,
 ) -> Response {
     supersede(st, client_id, session_id);
-    let id = st.pending.freeze(
+    let id = st.pending.freeze_with_preview(
         client_id,
         session_id,
         tool.to_owned(),
         args.clone(),
         vec![APPROVE.to_owned(), REJECT.to_owned()],
+        preview.cloned(),
     );
     note(
         st,
@@ -616,11 +621,31 @@ fn propose(
         .find(|s| s["function"]["name"] == tool);
     let expires_at = chrono::Utc::now()
         + chrono::Duration::from_std(st.cfg.confirm_ttl).unwrap_or(chrono::Duration::zero());
+    // SPEC §11 #27: the backend's preview of this payload, when there is one.
+    let previewed = preview
+        .map(|p| {
+            let params = schema.map_or(&serde_json::Value::Null, |s| &s["function"]["parameters"]);
+            card::preview_details(p, args, params)
+        })
+        .filter(|rows| !rows.is_empty());
+    let text = match &previewed {
+        Some(rows) => format!(
+            "This would run `{tool}`: {}. Approve or cancel it.",
+            rows.iter()
+                .map(|d| format!("{}: {}", d.label, d.value))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        None => format!(
+            "This would run `{tool}` with {}. Approve or cancel it.",
+            render_args(args)
+        ),
+    };
     let decision = contract::Decision {
         id: id.clone(),
         kind: contract::DecisionKind::Confirm,
         prompt: format!("Run `{tool}`?"),
-        details: decision_details(args, schema),
+        details: previewed.unwrap_or_else(|| decision_details(args, schema)),
         options: vec![
             contract::DecisionOption {
                 value: APPROVE.into(),
@@ -638,10 +663,7 @@ fn propose(
     };
     Response {
         // Readable on its own for adapters that ignore `decision`.
-        text: format!(
-            "This would run `{tool}` with {}. Approve or cancel it.",
-            render_args(args)
-        ),
+        text,
         needs_confirmation: Some(true),
         confirmation_token: Some(id),
         decision: Some(decision),
@@ -1099,14 +1121,37 @@ async fn dispatch_call(
     } else if st.policy.is_destructive(&call.name, &call.args) {
         // Classification is model-authored ahead of time, never ahead of
         // this order (SPEC §4.2). Freeze the exact payload; NEVER dispatch
-        // here, NEVER auto-retry (SPEC §4.3, §8).
-        return Step::Done(Box::new(propose(
-            st,
-            client_id,
-            &order.session_id,
-            &call.name,
-            &call.args,
-        )));
+        // here, NEVER auto-retry (SPEC §4.3, §8). A call that sets its
+        // acting argument is previewed first (SPEC §11 #27): only the
+        // preview runs, and a failing one goes back to the model.
+        let preview = match st.policy.preview_args(&call.name, &call.args) {
+            Some(preview_args) => Some(
+                plugins
+                    .execute(&call.name, &preview_args)
+                    .await
+                    .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned())),
+            ),
+            None => None,
+        };
+        match preview {
+            Some(result) if looks_like_error(&result) => result,
+            preview => {
+                if let Some(result) = &preview {
+                    grounding::collect_checks(checks, result);
+                }
+                let shown = preview.as_ref().map(grounding::strip_checks);
+                let mut response = propose(
+                    st,
+                    client_id,
+                    &order.session_id,
+                    &call.name,
+                    &call.args,
+                    shown.as_ref(),
+                );
+                response.text = grounding::decorate(&response.text, checks, &[]);
+                return Step::Done(Box::new(response));
+            }
+        }
     } else {
         plugins
             .execute(&call.name, &call.args)
@@ -1146,7 +1191,7 @@ async fn dispatch_call(
         );
         return Step::Continue { failed: true };
     }
-    match preview_decision(st, client_id, &order.session_id, &call, checks) {
+    match preview_decision(st, client_id, &order.session_id, &call, &result, checks) {
         Some(decision) => Step::Done(Box::new(decision)),
         None => Step::Continue { failed: false },
     }
@@ -1546,13 +1591,15 @@ fn preview_decision(
     client_id: &str,
     session_id: &str,
     call: &crate::model::ToolCall,
+    result: &serde_json::Value,
     checks: &[String],
 ) -> Option<Response> {
     let (key, value) = st.policy.preview_of(&call.name, &call.args)?;
     let mut args = call.args.clone();
     args.as_object_mut()?.insert(key, value);
     tracing::info!(tool = %call.name, "preview dispatched; asking the user to apply it");
-    let mut response = propose(st, client_id, session_id, &call.name, &args);
+    let shown = grounding::strip_checks(result);
+    let mut response = propose(st, client_id, session_id, &call.name, &args, Some(&shown));
     response.text = grounding::decorate(&response.text, checks, &[]);
     Some(response)
 }

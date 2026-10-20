@@ -238,6 +238,19 @@ impl ToolPolicy {
         }
     }
 
+    /// For a call that sets a `destructive_when` tool's acting argument, the
+    /// same call without it: a dispatchable preview of what would be applied
+    /// (SPEC §11 #27).
+    pub fn preview_args(&self, tool: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
+        let key = match &self.entries.read().expect("policy lock").get(tool)?.rule {
+            ToolRule::DestructiveWhen { key, value } if args.get(key) == Some(value) => key.clone(),
+            _ => return None,
+        };
+        let mut preview = args.clone();
+        preview.as_object_mut()?.remove(&key);
+        self.preview_of(tool, &preview).map(|_| preview)
+    }
+
     /// Syncs against freshly discovered tool schemas (SPEC §4.2): inserts
     /// never-seen tools as `Pending`; flips `Model`-sourced entries back to
     /// `Pending` when their fingerprint no longer matches (the backend
@@ -819,6 +832,35 @@ mod tests {
             policy.preview_of("mock.propose", &none),
             Some(("apply".into(), serde_json::json!(true)))
         );
+    }
+
+    #[test]
+    fn preview_args_drop_the_acting_arg_only_for_destructive_when() {
+        let policy = ToolPolicy::load(tmp_path("preview-args"), HashSet::new());
+        policy.reconcile(&[
+            schema("mock.kill", "deletes"),
+            schema("mock.propose", "previews unless apply"),
+        ]);
+        let apply = serde_json::json!({"n": 1, "apply": true});
+        assert_eq!(policy.preview_args("mock.propose", &apply), None, "pending");
+        {
+            let mut entries = policy.entries.write().unwrap();
+            entries.get_mut("mock.kill").unwrap().rule = ToolRule::Destructive;
+            entries.get_mut("mock.propose").unwrap().rule = ToolRule::DestructiveWhen {
+                key: "apply".into(),
+                value: serde_json::json!(true),
+            };
+        }
+        assert_eq!(
+            policy.preview_args("mock.propose", &apply),
+            Some(serde_json::json!({"n": 1}))
+        );
+        assert_eq!(
+            policy.preview_args("mock.propose", &serde_json::json!({"n": 1})),
+            None
+        );
+        assert_eq!(policy.preview_args("mock.kill", &apply), None);
+        assert_eq!(policy.preview_args("mock.unknown", &apply), None);
     }
 
     #[test]

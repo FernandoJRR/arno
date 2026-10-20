@@ -55,7 +55,8 @@ Adapters must not depend on `harness`; `harness` must not depend on adapters.
    on model output alone and **never auto-retried** (SPEC §4.3, §8). Approval
    is an explicit `approve` answer to a live decision id (or the legacy token)
    — never plain text, never a model verdict (SPEC §11 #18). Decision prompts,
-   details and options are built from the frozen payload and tool schema, not
+   details and options are built from the frozen payload and tool schema (or
+   the backend's preview of that payload, display only — SPEC §11 #27), not
    from model text. If you find yourself letting the model decide or word
    *whether* or *what* executes, stop — that crosses this rule.
 4. **All model access goes through the `ModelProvider` trait.** No direct HTTP to

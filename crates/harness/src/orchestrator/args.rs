@@ -78,7 +78,7 @@ fn breaks_format(v: &Value, schema: &Value) -> bool {
     }
 }
 
-fn is_uuid(s: &str) -> bool {
+pub fn is_uuid(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
         && groups

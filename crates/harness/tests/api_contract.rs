@@ -361,7 +361,8 @@ fn propose_call(id: &str, args: serde_json::Value) -> CompletionOutput {
 #[tokio::test]
 async fn successful_preview_goes_straight_to_a_decision() {
     // The model never words the confirmation: the previewed arguments, plus
-    // the acting argument from the policy rule, become the decision.
+    // the acting argument from the policy rule, become the decision, shown
+    // as the backend previewed them (SPEC §11 #27).
     let (provider, prompts) = PromptLogProvider::new(vec![
         propose_call(
             "call_1",
@@ -370,7 +371,8 @@ async fn successful_preview_goes_straight_to_a_decision() {
         CompletionOutput::Final("Approve it in the other app.".into()),
     ]);
     let executor = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!(
-        {"proposed": {"amount": 250}, "checks": ["Category not set"]}
+        {"proposed": {"amount": 250, "date": "2026-10-16", "currency": "GTQ"},
+         "checks": ["Category not set"]}
     )));
     let state = build_state(
         test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
@@ -381,14 +383,19 @@ async fn successful_preview_goes_straight_to_a_decision() {
     let (status, body) = post_order(api_router(state), ORDER_BODY, Some("tok-cli")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let details = body["decision"]["details"].as_array().expect("decision");
-    for (label, value) in [("amount", "250"), ("date", "2026-10-16"), ("apply", "true")] {
-        assert!(
-            details
-                .iter()
-                .any(|d| d["label"] == label && d["value"] == value),
-            "{label}: {body}"
-        );
-    }
+    let rows: Vec<(&str, &str)> = details
+        .iter()
+        .map(|d| (d["label"].as_str().unwrap(), d["value"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("Amount", "250"),
+            ("Currency", "GTQ"),
+            ("Date", "2026-10-16")
+        ],
+        "{body}"
+    );
     let text = body["text"].as_str().unwrap();
     assert!(!text.contains("other app"), "{body}");
     assert!(
@@ -722,8 +729,8 @@ async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
     assert_eq!(body["needs_confirmation"], true);
     assert!(body["confirmation_token"].is_string());
     assert!(
-        body["text"].as_str().unwrap().contains("apply=true"),
-        "confirmation text renders the proposed args: {body}"
+        body["text"].as_str().unwrap().contains("Ok: true"),
+        "confirmation text renders the preview: {body}"
     );
     let decision = &body["decision"];
     assert_eq!(decision["kind"], "confirm");
@@ -739,13 +746,17 @@ async fn tool_call_matching_the_conditional_predicate_freezes_not_dispatches() {
     assert!(
         details
             .iter()
-            .any(|d| d["label"] == "amount" && d["value"] == "50"),
-        "details derive from frozen args: {details:?}"
+            .any(|d| d["label"] == "Ok" && d["value"] == "true"),
+        "details come from the backend's preview: {details:?}"
     );
+    let calls = executor.calls.lock().unwrap();
     assert_eq!(
-        executor.calls.lock().unwrap().len(),
-        0,
-        "a matching predicate must freeze, never dispatch"
+        *calls,
+        vec![(
+            "securo.propose_create_transaction".to_owned(),
+            serde_json::json!({"amount": 50})
+        )],
+        "a matching predicate freezes; only its preview is dispatched"
     );
 }
 
@@ -1814,5 +1825,134 @@ async fn a_promised_fix_after_a_failure_is_nudged_once() {
         prompts[2]
             .iter()
             .any(|m| m.starts_with("You said you would fix the call"))
+    );
+}
+
+// ---- decision card from the backend's preview (SPEC §11 #27) ----
+
+fn rows(decision: &serde_json::Value) -> Vec<(String, String)> {
+    decision["details"]
+        .as_array()
+        .expect("decision")
+        .iter()
+        .map(|d| {
+            (
+                d["label"].as_str().unwrap().into(),
+                d["value"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+fn resolved_preview() -> serde_json::Value {
+    serde_json::json!({"kind": "create_transaction", "proposed": {
+        "account_id": "d65cf7f5-6fcc-4ba1-a6e6-69fa850c4444",
+        "account_name": "Main", "amount": 250, "date": "2026-10-19"}})
+}
+
+#[tokio::test]
+async fn the_card_shows_the_preview_and_marks_what_the_backend_filled_in() {
+    let args = serde_json::json!({"amount": 250, "account_id": "a1"});
+    let (state, executor, _) = decision_rig(
+        vec![propose_call("call_1", args.clone())],
+        resolved_preview(),
+    )
+    .await;
+    let first = say(&state, "m1", "250 for tacos").await;
+    let expected: Vec<(String, String)> = [
+        ("Account name", "Main"),
+        ("Amount", "250"),
+        ("Date", "2026-10-19 (default)"),
+        ("Kind", "create_transaction"),
+    ]
+    .map(|(l, v)| (l.to_owned(), v.to_owned()))
+    .into();
+    assert_eq!(rows(&first["decision"]), expected, "{first}");
+    assert!(
+        first["text"]
+            .as_str()
+            .unwrap()
+            .contains("Date: 2026-10-19 (default)")
+    );
+
+    // Cancelled and shown again: the same rows, no new preview.
+    let id = first["decision"]["id"].as_str().unwrap().to_owned();
+    answer(
+        &state,
+        "m2",
+        serde_json::json!({"id": id, "value": "reject"}),
+    )
+    .await;
+    let again = say(&state, "m3", "Approve").await;
+    assert_eq!(rows(&again["decision"]), expected);
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+
+    // Approval sends the frozen args, never the preview.
+    let id = again["decision"]["id"].as_str().unwrap().to_owned();
+    answer(
+        &state,
+        "m4",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    let calls = executor.calls.lock().unwrap();
+    let mut frozen = args;
+    frozen["apply"] = serde_json::json!(true);
+    assert_eq!(calls[1].1, frozen);
+}
+
+#[tokio::test]
+async fn a_direct_apply_is_previewed_before_the_card() {
+    let mut apply = tacos();
+    apply["apply"] = serde_json::json!(true);
+    let (state, executor, prompts) = decision_rig(
+        vec![propose_call("call_1", apply.clone())],
+        resolved_preview(),
+    )
+    .await;
+    let body = say(&state, "m1", "250 for tacos").await;
+    assert!(rows(&body["decision"]).contains(&("Account name".into(), "Main".into())));
+    assert_eq!(
+        executor.calls.lock().unwrap().clone(),
+        vec![("securo.propose_create_transaction".to_owned(), tacos())],
+        "only the preview ran"
+    );
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+
+    let id = body["decision"]["id"].as_str().unwrap().to_owned();
+    answer(
+        &state,
+        "m2",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(
+        executor.calls.lock().unwrap()[1].1,
+        apply,
+        "frozen args verbatim"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_apply_whose_preview_fails_goes_back_to_the_model() {
+    let mut apply = tacos();
+    apply["apply"] = serde_json::json!(true);
+    let (state, executor, prompts) = decision_rig(
+        vec![
+            propose_call("call_1", apply),
+            CompletionOutput::Final("Which group?".into()),
+        ],
+        serde_json::json!({"error": "group_id and splits must be provided together"}),
+    )
+    .await;
+    let body = say(&state, "m1", "250 for tacos").await;
+    assert!(body["decision"].is_null(), "{body}");
+    assert_eq!(body["text"], "Which group?");
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    let prompts = prompts.lock().unwrap();
+    assert!(
+        prompts[1]
+            .iter()
+            .any(|m| m.contains("group_id and splits must be provided together"))
     );
 }

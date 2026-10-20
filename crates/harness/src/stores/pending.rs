@@ -9,6 +9,8 @@
 //!   non-answer order supersedes the old one (`discard_session`).
 //! - The last unapproved action per session is remembered (`recent`) only so
 //!   it can be shown again under a new id (SPEC §11 #26); it is never taken.
+//! - `preview` is shown, never sent: execution dispatches `args` only
+//!   (SPEC §11 #27).
 
 use rand::TryRng;
 use rand::rngs::SysRng;
@@ -22,6 +24,8 @@ pub struct PendingAction {
     pub args: serde_json::Value,
     /// Option values a `decision_answer` may carry for this decision.
     pub options: Vec<String>,
+    /// Backend preview of `args`, for the decision card only.
+    pub preview: Option<serde_json::Value>,
     pub created: Instant,
 }
 
@@ -71,6 +75,19 @@ impl PendingStore {
         args: serde_json::Value,
         options: Vec<String>,
     ) -> String {
+        self.freeze_with_preview(client_id, session_id, tool, args, options, None)
+    }
+
+    /// `freeze`, keeping the backend's preview of `args` for display.
+    pub fn freeze_with_preview(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        tool: String,
+        args: serde_json::Value,
+        options: Vec<String>,
+        preview: Option<serde_json::Value>,
+    ) -> String {
         let token = format!("dcs_{}", mint_token());
         let mut inner = self.0.lock().expect("pending lock");
         inner
@@ -82,6 +99,7 @@ impl PendingStore {
                 tool,
                 args,
                 options,
+                preview,
                 created: Instant::now(),
             },
         );
@@ -230,6 +248,26 @@ mod tests {
         assert!(store.recent("cli", "s", ttl).is_none());
         store.remember("cli", "s", action);
         assert_eq!(store.recent("cli", "s", ttl).unwrap().tool, "t.b");
+    }
+
+    #[test]
+    fn the_preview_stays_with_the_action_when_it_stops_being_live() {
+        let store = PendingStore::new();
+        let ttl = Duration::from_secs(10);
+        let preview = serde_json::json!({"proposed": {"date": "2026-10-19"}});
+        store.freeze_with_preview(
+            "cli",
+            "s",
+            "t".into(),
+            serde_json::json!({}),
+            opts(),
+            Some(preview.clone()),
+        );
+        store.discard_session("cli", "s");
+        assert_eq!(
+            store.recent("cli", "s", ttl).unwrap().preview,
+            Some(preview)
+        );
     }
 
     #[test]
