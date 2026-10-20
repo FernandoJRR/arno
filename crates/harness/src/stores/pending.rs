@@ -7,6 +7,8 @@
 //! - Ids are 128-bit CSPRNG, bound to (client, session), TTL-limited.
 //! - At most one live decision per (client, session): a new proposal or any
 //!   non-answer order supersedes the old one (`discard_session`).
+//! - The last unapproved action per session is remembered (`recent`) only so
+//!   it can be shown again under a new id (SPEC §11 #26); it is never taken.
 
 use rand::TryRng;
 use rand::rngs::SysRng;
@@ -33,11 +35,14 @@ pub enum TakeOutcome {
 }
 
 type PendingKey = (String, String, String); // (client_id, session_id, token)
+type SessionKey = (String, String);
 
 #[derive(Default)]
 struct Inner {
     live: HashMap<PendingKey, PendingAction>,
     used: HashMap<PendingKey, Instant>,
+    /// Last discarded or rejected action, with when it stopped being live.
+    recent: HashMap<SessionKey, (PendingAction, Instant)>,
 }
 
 pub struct PendingStore(Mutex<Inner>);
@@ -53,6 +58,7 @@ impl PendingStore {
         Self(Mutex::new(Inner {
             live: HashMap::new(),
             used: HashMap::new(),
+            recent: HashMap::new(),
         }))
     }
 
@@ -66,7 +72,11 @@ impl PendingStore {
         options: Vec<String>,
     ) -> String {
         let token = format!("dcs_{}", mint_token());
-        self.0.lock().expect("pending lock").live.insert(
+        let mut inner = self.0.lock().expect("pending lock");
+        inner
+            .recent
+            .remove(&(client_id.to_owned(), session_id.to_owned()));
+        inner.live.insert(
             (client_id.to_owned(), session_id.to_owned(), token.clone()),
             PendingAction {
                 tool,
@@ -117,6 +127,7 @@ impl PendingStore {
         let mut inner = self.0.lock().expect("pending lock");
         inner.live.retain(|_, a| a.created.elapsed() < ttl);
         inner.used.retain(|_, t| t.elapsed() < ttl);
+        inner.recent.retain(|_, (_, at)| at.elapsed() < ttl);
     }
 
     /// Consumes every live decision for this client+session without
@@ -137,7 +148,46 @@ impl PendingStore {
             }
             inner.used.insert(key, Instant::now());
         }
+        if let Some(last) = discarded.iter().max_by_key(|a| a.created) {
+            inner.recent.insert(
+                (client_id.to_owned(), session_id.to_owned()),
+                (last.clone(), Instant::now()),
+            );
+        }
         discarded
+    }
+
+    /// Remembers an action the user rejected, so it can be shown again.
+    pub fn remember(&self, client_id: &str, session_id: &str, action: PendingAction) {
+        self.0.lock().expect("pending lock").recent.insert(
+            (client_id.to_owned(), session_id.to_owned()),
+            (action, Instant::now()),
+        );
+    }
+
+    /// Forgets the remembered action (it ran, or a new one replaced it).
+    pub fn forget(&self, client_id: &str, session_id: &str) {
+        self.0
+            .lock()
+            .expect("pending lock")
+            .recent
+            .remove(&(client_id.to_owned(), session_id.to_owned()));
+    }
+
+    /// The last unapproved action of this session, if still within `ttl`.
+    pub fn recent(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        ttl: Duration,
+    ) -> Option<PendingAction> {
+        self.0
+            .lock()
+            .expect("pending lock")
+            .recent
+            .get(&(client_id.to_owned(), session_id.to_owned()))
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(a, _)| a.clone())
     }
 }
 
@@ -158,6 +208,28 @@ mod tests {
 
     fn opts() -> Vec<String> {
         vec!["approve".into(), "reject".into()]
+    }
+
+    #[test]
+    fn recent_remembers_the_last_unapproved_action_until_replaced() {
+        let store = PendingStore::new();
+        let ttl = Duration::from_secs(10);
+        store.freeze("cli", "s", "t.a".into(), serde_json::json!({"n":1}), opts());
+        assert!(store.recent("cli", "s", ttl).is_none(), "live, not recent");
+        store.discard_session("cli", "s");
+        assert_eq!(store.recent("cli", "s", ttl).unwrap().args["n"], 1);
+        assert!(store.recent("cli", "other", ttl).is_none());
+        assert!(store.recent("cli", "s", Duration::ZERO).is_none(), "ttl");
+        store.freeze("cli", "s", "t.b".into(), serde_json::json!({}), opts());
+        assert!(
+            store.recent("cli", "s", ttl).is_none(),
+            "freeze replaces it"
+        );
+        let action = store.discard_session("cli", "s").pop().unwrap();
+        store.forget("cli", "s");
+        assert!(store.recent("cli", "s", ttl).is_none());
+        store.remember("cli", "s", action);
+        assert_eq!(store.recent("cli", "s", ttl).unwrap().tool, "t.b");
     }
 
     #[test]

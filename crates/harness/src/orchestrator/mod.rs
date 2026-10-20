@@ -3,8 +3,10 @@
 //! Runs exclusively on the FIFO worker task (AGENTS.md #5): one order in
 //! flight makes session access and confirmation redemption race-free.
 
+mod args;
 pub mod context;
 mod grounding;
+mod intent;
 
 use crate::api::error::ApiError;
 use crate::plugins::PluginSet;
@@ -129,8 +131,8 @@ pub async fn handle(
 
     // Any other order supersedes a pending decision: plain text never
     // approves (SPEC §4.3, §11 #18).
-    let superseded = supersede(st, client_id, &order.session_id);
-    normal_path(st, client_id, order, superseded).await
+    supersede(st, client_id, &order.session_id);
+    normal_path(st, client_id, order).await
 }
 
 /// Resolves a `decision_answer`. The id is consumed before anything else
@@ -162,16 +164,18 @@ async fn answer_decision(
         (Some(APPROVE), _) => execute_frozen_action(st, client_id, &session_id, action).await,
         (Some(_), _) => {
             record_cancelled(st, client_id, &session_id, &action);
+            st.pending.remember(client_id, &session_id, action);
             Ok(Response::text("Cancelled. Nothing was executed."))
         }
         (None, Some(text)) => {
             record_cancelled(st, client_id, &session_id, &action);
+            st.pending.remember(client_id, &session_id, action);
             let order = contract::Order {
                 text,
                 decision_answer: None,
                 ..order
             };
-            normal_path(st, client_id, order, vec![action]).await
+            normal_path(st, client_id, order).await
         }
         (None, None) => Err(ApiError(ErrorCode::InvalidOrder)),
     }
@@ -197,6 +201,17 @@ fn record_cancelled(
     session_id: &str,
     action: &crate::stores::pending::PendingAction,
 ) {
+    note(
+        st,
+        client_id,
+        session_id,
+        format!(
+            "Not executed, the user did not approve: `{tool}` {args}. To do it again or with \
+             changes, call `{tool}` with these arguments, changing only what the user asked.",
+            tool = action.tool,
+            args = action.args,
+        ),
+    );
     if let Some(transcript) = &st.transcript
         && let Err(e) = transcript.record(
             client_id,
@@ -209,6 +224,15 @@ fn record_cancelled(
     {
         tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
     }
+}
+
+/// Decision state for the model (SPEC §11 #26): system-role and terse, so
+/// it is read as state rather than copied as a reply.
+fn note(st: &Arc<AppState>, client_id: &str, session_id: &str, text: String) {
+    st.sessions.append(
+        &(client_id.to_owned(), session_id.to_owned()),
+        crate::model::ChatMessage::new(crate::model::Role::System, text),
+    );
 }
 
 fn validate_attachments(order: &contract::Order, cap: usize) -> Result<(), ApiError> {
@@ -297,6 +321,26 @@ async fn execute_frozen_action(
             tracing::error!(error = %e, tool = %action.tool, "transcript log write failed");
         }
     }
+    st.pending.forget(client_id, session_id);
+    note(
+        st,
+        client_id,
+        session_id,
+        match &outcome {
+            Ok(result) => format!(
+                "Executed after the user approved: `{}` {}. Result: {}",
+                action.tool,
+                action.args,
+                grounding::strip_checks(result)
+            ),
+            Err(code) => format!(
+                "Failed after the user approved (not retried): `{}` {}. Error: {}",
+                action.tool,
+                action.args,
+                code.as_str()
+            ),
+        },
+    );
     match outcome {
         Ok(result) => Ok(Response {
             text: format!("Executed `{}`.", action.tool),
@@ -315,21 +359,8 @@ async fn normal_path(
     st: &Arc<AppState>,
     client_id: &str,
     order: contract::Order,
-    superseded: Vec<crate::stores::pending::PendingAction>,
 ) -> Result<Response, ApiError> {
     let key = (client_id.to_owned(), order.session_id.clone());
-    for action in &superseded {
-        st.sessions.append(
-            &key,
-            crate::model::ChatMessage::new(
-                crate::model::Role::System,
-                format!(
-                    "The proposed `{}` call was NOT executed; the user did not approve it.",
-                    action.tool
-                ),
-            ),
-        );
-    }
     if let Some(transcript) = &st.transcript
         && let Err(e) = transcript.record(
             client_id,
@@ -343,6 +374,25 @@ async fn normal_path(
         &key,
         crate::model::ChatMessage::new(crate::model::Role::User, order.text.clone()),
     );
+
+    // SPEC §11 #26: asking for the buttons shows the last unapproved frozen
+    // payload again under a new id, without the model. Only a press
+    // approves (SPEC §11 #18).
+    if order.attachments.is_empty()
+        && intent::asks_for_decision(&order.text)
+        && let Some(action) = st
+            .pending
+            .recent(client_id, &order.session_id, st.cfg.confirm_ttl)
+    {
+        tracing::info!(tool = %action.tool, "decision shown again on request");
+        return Ok(propose(
+            st,
+            client_id,
+            &order.session_id,
+            &action.tool,
+            &action.args,
+        ));
+    }
 
     // Ephemeral scratch persistence (SPEC §4.1): decoded once per order; the
     // manifest tells the model a handle exists without naming any tool
@@ -542,6 +592,14 @@ fn propose(
         args.clone(),
         vec![APPROVE.to_owned(), REJECT.to_owned()],
     );
+    note(
+        st,
+        client_id,
+        session_id,
+        format!(
+            "Waiting for the user's approval (buttons shown, nothing executed): `{tool}` {args}."
+        ),
+    );
     if let Some(transcript) = &st.transcript
         && let Err(e) = transcript.record(
             client_id,
@@ -630,7 +688,14 @@ fn finish_answer(
         let prompt = system_prompt();
         let mut sources: Vec<&str> = history
             .iter()
-            .filter(|m| matches!(m.role, crate::model::Role::Tool | crate::model::Role::User))
+            .filter(|m| {
+                matches!(
+                    m.role,
+                    crate::model::Role::Tool
+                        | crate::model::Role::User
+                        | crate::model::Role::System
+                )
+            })
             .map(|m| m.content.as_str())
             .collect();
         sources.push(&prompt);
@@ -735,6 +800,9 @@ async fn normal_path_loop(
     }
     // Fallback when no prefill applied: one nudge per order (SPEC §11 #25).
     let mut attachment_nudged = false;
+    // SPEC §11 #26: the latest call failed; one unkept-claim nudge per order.
+    let mut last_failed = false;
+    let mut unkept_nudged = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -836,75 +904,26 @@ async fn normal_path_loop(
                     tracing::info!(tool = %call.name, "rescued text tool call");
                     let mut calls = vec![call];
                     repair_attachment_refs(&plugins, &mut calls, handles);
+                    let missing = clean_calls(&plugins, &mut calls);
                     dispatched_tool_calls += calls.len() as u32;
                     st.sessions.append(
                         &key,
                         crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
                     );
-                    for call in calls {
-                        if let Some(transcript) = &st.transcript
-                            && let Err(e) = transcript.record(
-                                client_id,
-                                &order.session_id,
-                                crate::transcript::Event::ToolCall {
-                                    call_id: &call.id,
-                                    tool: &call.name,
-                                    args: &call.args,
-                                },
-                            )
+                    for (call, missing) in calls.into_iter().zip(missing) {
+                        match dispatch_call(
+                            st,
+                            client_id,
+                            order,
+                            &plugins,
+                            call,
+                            &missing,
+                            &mut checks,
+                        )
+                        .await
                         {
-                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                        }
-                        if st.policy.is_destructive(&call.name, &call.args) {
-                            // Freeze exact payload; NEVER dispatch here, NEVER auto-retry
-                            // (SPEC §4.3, §8).
-                            return Ok(propose(
-                                st,
-                                client_id,
-                                &order.session_id,
-                                &call.name,
-                                &call.args,
-                            ));
-                        }
-                        let result = plugins
-                            .execute(&call.name, &call.args)
-                            .await
-                            .unwrap_or_else(|code| {
-                                serde_json::Value::String(code.as_str().to_owned())
-                            });
-                        grounding::collect_checks(&mut checks, &result);
-                        if let Some(transcript) = &st.transcript
-                            && let Err(e) = transcript.record(
-                                client_id,
-                                &order.session_id,
-                                crate::transcript::Event::ToolResult {
-                                    call_id: &call.id,
-                                    tool: &call.name,
-                                    result: &result,
-                                },
-                            )
-                        {
-                            tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                        }
-                        st.sessions.append(
-                            &key,
-                            crate::model::ChatMessage::tool_result(
-                                call.id.clone(),
-                                grounding::strip_checks(&result).to_string(),
-                            ),
-                        );
-                        if looks_like_error(&result) {
-                            st.sessions.append(
-                                &key,
-                                crate::model::ChatMessage::new(
-                                    crate::model::Role::User,
-                                    RETRY_NUDGE,
-                                ),
-                            );
-                        } else if let Some(decision) =
-                            preview_decision(st, client_id, &order.session_id, &call, &checks)
-                        {
-                            return Ok(decision);
+                            Step::Done(response) => return Ok(*response),
+                            Step::Continue { failed } => last_failed = failed,
                         }
                     }
                     if dispatched_tool_calls > st.cfg.max_tool_calls {
@@ -956,7 +975,38 @@ async fn normal_path_loop(
                     );
                     continue;
                 }
-                let shown = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
+                // SPEC §11 #26: a decision always ends the order, so a Final
+                // that says one is waiting, or that promises a fix after a
+                // failure, is unkept. Nudge once; then the harness says so.
+                let unkept = if claims_proposal(&text) {
+                    Some(Unkept::Proposal)
+                } else if last_failed && promises_action(&text) {
+                    Some(Unkept::Promise)
+                } else {
+                    None
+                };
+                if let Some(kind) = unkept
+                    && !unkept_nudged
+                    && Instant::now() + st.cfg.order_budget / 4 < deadline
+                {
+                    tracing::info!(kind = kind.label(), "unkept claim in final; nudging once");
+                    unkept_nudged = true;
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(crate::model::Role::Assistant, text.clone()),
+                    );
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(crate::model::Role::User, kind.nudge()),
+                    );
+                    continue;
+                }
+                let mut shown = finish_answer(st, &key, &text, &checks, dispatched_tool_calls);
+                if let Some(kind) = unkept {
+                    tracing::warn!(kind = kind.label(), "unkept claim delivered with a footer");
+                    shown.push_str("\n\n⚠ ");
+                    shown.push_str(kind.footer());
+                }
                 if let Some(transcript) = &st.transcript
                     && let Err(e) = transcript.record(
                         client_id,
@@ -972,10 +1022,21 @@ async fn normal_path_loop(
                     &key,
                     crate::model::ChatMessage::new(crate::model::Role::Assistant, text),
                 );
+                if let Some(kind) = unkept {
+                    // State, not reply-shaped, so it is not copied as an answer.
+                    st.sessions.append(
+                        &key,
+                        crate::model::ChatMessage::new(
+                            crate::model::Role::System,
+                            format!("Correction: that reply was wrong. {}", kind.footer()),
+                        ),
+                    );
+                }
                 return Ok(Response::text(shown));
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
                 repair_attachment_refs(&plugins, &mut calls, handles);
+                let missing = clean_calls(&plugins, &mut calls);
                 dispatched_tool_calls += calls.len() as u32;
                 // The model's own request, remembered — without this the next
                 // completion (even later in this same loop) sees only an
@@ -984,82 +1045,12 @@ async fn normal_path_loop(
                     &key,
                     crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
                 );
-                for call in calls {
-                    if let Some(transcript) = &st.transcript
-                        && let Err(e) = transcript.record(
-                            client_id,
-                            &order.session_id,
-                            crate::transcript::Event::ToolCall {
-                                call_id: &call.id,
-                                tool: &call.name,
-                                args: &call.args,
-                            },
-                        )
-                    {
-                        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                    }
-                    // Classification is model-authored ahead of time, never
-                    // ahead of this specific order (SPEC §4.2, AGENTS.md #3):
-                    // this is a synchronous lookup against the persisted
-                    // policy, not a model call.
-                    if st.policy.is_destructive(&call.name, &call.args) {
-                        // Freeze exact payload; NEVER dispatch here, NEVER auto-retry
-                        // (SPEC §4.3, §8).
-                        return Ok(propose(
-                            st,
-                            client_id,
-                            &order.session_id,
-                            &call.name,
-                            &call.args,
-                        ));
-                    }
-                    let result = plugins
-                        .execute(&call.name, &call.args)
+                for (call, missing) in calls.into_iter().zip(missing) {
+                    match dispatch_call(st, client_id, order, &plugins, call, &missing, &mut checks)
                         .await
-                        .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()));
-                    grounding::collect_checks(&mut checks, &result);
-                    if let Some(transcript) = &st.transcript
-                        && let Err(e) = transcript.record(
-                            client_id,
-                            &order.session_id,
-                            crate::transcript::Event::ToolResult {
-                                call_id: &call.id,
-                                tool: &call.name,
-                                result: &result,
-                            },
-                        )
                     {
-                        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
-                    }
-                    st.sessions.append(
-                        &key,
-                        crate::model::ChatMessage::tool_result(
-                            call.id.clone(),
-                            // `checks` are for the user, relayed on the final
-                            // answer; the model would only repeat them.
-                            grounding::strip_checks(&result).to_string(),
-                        ),
-                    );
-                    // A static system-prompt rule competes poorly against
-                    // whatever's most recent in context (small-model recency
-                    // bias — the same effect that drops a field on correction
-                    // also works in our favor here). So instead of only
-                    // relying on system_prompt(), inject a fresh, situational
-                    // instruction right when a failure actually happened,
-                    // maximally recent for the next completion. This cannot
-                    // force a tool call (Ollama's `tool_choice` is a documented
-                    // no-op on this runtime — verified live), only nudge; the
-                    // model can still legitimately choose to ask the user a
-                    // question instead of retrying blind.
-                    if looks_like_error(&result) {
-                        st.sessions.append(
-                            &key,
-                            crate::model::ChatMessage::new(crate::model::Role::User, RETRY_NUDGE),
-                        );
-                    } else if let Some(decision) =
-                        preview_decision(st, client_id, &order.session_id, &call, &checks)
-                    {
-                        return Ok(decision);
+                        Step::Done(response) => return Ok(*response),
+                        Step::Continue { failed } => last_failed = failed,
                     }
                 }
                 if dispatched_tool_calls > st.cfg.max_tool_calls {
@@ -1068,6 +1059,181 @@ async fn normal_path_loop(
             }
         }
     }
+}
+
+/// What one call leaves the order loop with.
+enum Step {
+    Continue { failed: bool },
+    Done(Box<Response>),
+}
+
+/// One model-requested call, already cleaned (`clean_calls`): recorded,
+/// gated by policy, dispatched, and its result fed back to the model.
+async fn dispatch_call(
+    st: &Arc<AppState>,
+    client_id: &str,
+    order: &contract::Order,
+    plugins: &PluginSet,
+    call: crate::model::ToolCall,
+    missing: &[String],
+    checks: &mut Vec<String>,
+) -> Step {
+    let key = (client_id.to_owned(), order.session_id.clone());
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            &order.session_id,
+            crate::transcript::Event::ToolCall {
+                call_id: &call.id,
+                tool: &call.name,
+                args: &call.args,
+            },
+        )
+    {
+        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+    }
+    let result = if !missing.is_empty() {
+        // A call that can only fail is never dispatched or proposed.
+        tracing::info!(tool = %call.name, count = missing.len(), "required arguments empty; not dispatched");
+        missing_arguments(st, plugins, &call.name, missing).await
+    } else if st.policy.is_destructive(&call.name, &call.args) {
+        // Classification is model-authored ahead of time, never ahead of
+        // this order (SPEC §4.2). Freeze the exact payload; NEVER dispatch
+        // here, NEVER auto-retry (SPEC §4.3, §8).
+        return Step::Done(Box::new(propose(
+            st,
+            client_id,
+            &order.session_id,
+            &call.name,
+            &call.args,
+        )));
+    } else {
+        plugins
+            .execute(&call.name, &call.args)
+            .await
+            .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()))
+    };
+    grounding::collect_checks(checks, &result);
+    if let Some(transcript) = &st.transcript
+        && let Err(e) = transcript.record(
+            client_id,
+            &order.session_id,
+            crate::transcript::Event::ToolResult {
+                call_id: &call.id,
+                tool: &call.name,
+                result: &result,
+            },
+        )
+    {
+        tracing::error!(error = %e, tool = %call.name, "transcript log write failed");
+    }
+    st.sessions.append(
+        &key,
+        crate::model::ChatMessage::tool_result(
+            call.id.clone(),
+            // `checks` are for the user, relayed on the final answer; the
+            // model would only repeat them.
+            grounding::strip_checks(&result).to_string(),
+        ),
+    );
+    // A fresh instruction right after the failure beats a system-prompt
+    // rule (small-model recency bias). It can only nudge: Ollama has no
+    // `tool_choice`, and asking the user is still a valid answer.
+    if looks_like_error(&result) {
+        st.sessions.append(
+            &key,
+            crate::model::ChatMessage::new(crate::model::Role::User, RETRY_NUDGE),
+        );
+        return Step::Continue { failed: true };
+    }
+    match preview_decision(st, client_id, &order.session_id, &call, checks) {
+        Some(decision) => Step::Done(Box::new(decision)),
+        None => Step::Continue { failed: false },
+    }
+}
+
+/// Drops placeholder arguments against each tool's schema and returns,
+/// per call, the required parameters left empty (SPEC §11 #26). Runs
+/// before transcript and policy, so what is logged is what is dispatched.
+fn clean_calls(plugins: &PluginSet, calls: &mut [crate::model::ToolCall]) -> Vec<Vec<String>> {
+    calls
+        .iter_mut()
+        .map(|call| {
+            let params = plugins
+                .tool_schemas()
+                .iter()
+                .find(|s| s["function"]["name"] == call.name.as_str())
+                .map(|s| &s["function"]["parameters"])
+                .unwrap_or(&serde_json::Value::Null);
+            let cleaned = args::clean(&call.args, params);
+            if cleaned.args != call.args {
+                tracing::info!(tool = %call.name, "dropped empty arguments");
+                call.args = cleaned.args;
+            }
+            cleaned.missing
+        })
+        .collect()
+}
+
+/// Synthetic tool error for a call with empty required arguments. Matching
+/// read-only lookup tools that take no required argument are run here and
+/// their results attached, so the model only has to pick a value.
+async fn missing_arguments(
+    st: &Arc<AppState>,
+    plugins: &PluginSet,
+    tool: &str,
+    missing: &[String],
+) -> serde_json::Value {
+    let empty = serde_json::json!({});
+    let lookups: Vec<&str> = plugins
+        .tool_schemas()
+        .iter()
+        .filter(|s| {
+            s["function"]["parameters"]["required"]
+                .as_array()
+                .is_none_or(|r| r.is_empty())
+        })
+        .filter_map(|s| s["function"]["name"].as_str())
+        .filter(|n| {
+            !st.policy.is_destructive(n, &empty) && st.policy.preview_of(n, &empty).is_none()
+        })
+        .collect();
+    let mut results = serde_json::Map::new();
+    for param in missing {
+        let Some(lookup) = args::lookup_hint(param, lookups.iter().copied())
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        if results.contains_key(&lookup) {
+            continue;
+        }
+        if let Ok(result) = plugins.execute(&lookup, &empty).await
+            && !looks_like_error(&result)
+        {
+            tracing::info!(tool = %lookup, "lookup run for a missing argument");
+            results.insert(lookup, grounding::strip_checks(&result));
+        }
+    }
+    let mut message = format!(
+        "Required arguments missing, empty or invalid: {}.",
+        missing.join(", ")
+    );
+    if !results.is_empty() {
+        message.push_str(&format!(
+            " The results of {} are attached: take the value from them when the \
+             user's words match one entry or only one exists, and call `{tool}` again \
+             with every other argument unchanged. Ask the user only if several match.",
+            results.keys().cloned().collect::<Vec<_>>().join(" and ")
+        ));
+    }
+    serde_json::json!({
+        "tool_error": "missing_argument",
+        "arguments": missing,
+        "message": message,
+        "lookup_results": results,
+    })
 }
 
 /// Runs the router once for this order and records its pick.
@@ -1257,7 +1423,104 @@ const FALSE_CLAIM_PATTERNS: &[&str] = &[
     "i've recorded",
     "i have recorded",
     "executed the",
+    "i created",
+    "i've created",
+    "i have created",
+    "was created",
+    "has been added",
+    "was added",
+    "i've added",
+    "i have added",
+    "has been saved",
+    "was recorded",
 ];
+
+/// A change described as waiting for approval (SPEC §11 #26). Observed:
+/// "I prepared a proposal… Please confirm with \"approve\"" with no call.
+const PROPOSAL_CLAIM_PATTERNS: &[&str] = &[
+    "prepared a proposal",
+    "i prepared",
+    "i've prepared",
+    "i have prepared",
+    "confirm with",
+    "reply with \"approve",
+    "type \"approve",
+    "say \"approve",
+    "awaiting approval",
+    "awaiting your approval",
+    "must approve",
+    "approval is required",
+];
+
+/// A fix promised instead of made (SPEC §11 #26). Observed: "I will correct
+/// the call by removing those fields." with no call after a tool error.
+const PROMISE_PATTERNS: &[&str] = &[
+    "i will correct",
+    "i'll correct",
+    "i will retry",
+    "i'll retry",
+    "i will fix",
+    "i'll fix",
+    "i will remove",
+    "i'll remove",
+    "i will update",
+    "i'll update",
+    "i will call",
+    "i'll call",
+    "i will try again",
+    "i'll try again",
+    "let me correct",
+    "let me retry",
+    "let me fix",
+];
+
+fn claims_proposal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    PROPOSAL_CLAIM_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+fn promises_action(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    PROMISE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// A Final that describes something the order did not do (SPEC §11 #26).
+#[derive(Clone, Copy)]
+enum Unkept {
+    Proposal,
+    Promise,
+}
+
+impl Unkept {
+    fn label(self) -> &'static str {
+        match self {
+            Unkept::Proposal => "proposal",
+            Unkept::Promise => "promise",
+        }
+    }
+
+    fn nudge(self) -> &'static str {
+        match self {
+            Unkept::Proposal => {
+                "Nothing is waiting for approval: none was prepared in this turn. If you \
+                 have what you need, call the tool now and the user gets approve/cancel \
+                 buttons; otherwise ask for what is missing. Never ask the user to type \
+                 approve."
+            }
+            Unkept::Promise => {
+                "You said you would fix the call but made no call. Make the corrected call \
+                 now, keeping every other value, or ask the user one question."
+            }
+        }
+    }
+
+    fn footer(self) -> &'static str {
+        match self {
+            Unkept::Proposal => "Nothing is waiting for your approval.",
+            Unkept::Promise => "Nothing was done.",
+        }
+    }
+}
 
 /// True when a final answer asserts an action was executed but NO tool call
 /// has run this order — the observed qwen3:4b failure mode. Only these

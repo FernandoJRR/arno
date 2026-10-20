@@ -1447,7 +1447,7 @@ async fn free_text_answer_runs_the_model_and_never_dispatches() {
         .state
         .sessions
         .snapshot(&("cli".to_owned(), "s1".to_owned()));
-    assert!(history.iter().any(|m| m.content.contains("NOT executed")));
+    assert!(history.iter().any(|m| m.content.contains("Not executed")));
     assert!(history.iter().any(|m| m.content == "make it 50"));
 }
 
@@ -1459,7 +1459,7 @@ async fn plain_yes_never_executes_and_supersedes_the_pending_decision() {
     );
     let id = freeze_tx(&rig.state);
     let body = serde_json::json!({"session_id": "s1", "text": "yes", "client_msg_id": "m1"});
-    let (status, _) = post_order(
+    let (status, shown) = post_order(
         api_router(rig.state.clone()),
         &body.to_string(),
         Some("tok-cli"),
@@ -1470,6 +1470,8 @@ async fn plain_yes_never_executes_and_supersedes_the_pending_decision() {
         rig.executor.calls.lock().unwrap().is_empty(),
         "plain text must never approve"
     );
+    // SPEC §11 #26: it shows the same payload again under a new id.
+    assert_ne!(shown["decision"]["id"], id.as_str(), "{shown}");
 
     // Superseded: neither the decision nor its legacy token can approve now.
     let (s, e) = answer(
@@ -1542,4 +1544,275 @@ impl ModelProvider for CapturingProvider {
         self.seen.lock().unwrap().push(all.join("\n"));
         self.script.complete(req).await
     }
+}
+
+// ---- small-model help around decisions (SPEC §11 #26) ----
+
+/// A recording executor that also advertises tool schemas.
+struct SchemaExecutor {
+    inner: RecordingExecutor,
+    schemas: Vec<serde_json::Value>,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for SchemaExecutor {
+    async fn execute(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, contract::ErrorCode> {
+        self.inner.execute(tool, args).await
+    }
+
+    fn tool_schemas(&self) -> &[serde_json::Value] {
+        &self.schemas
+    }
+}
+
+fn create_tx_schemas() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {
+            "name": "securo.propose_create_transaction",
+            "description": "creates a transaction; apply=true persists it",
+            "parameters": {"type": "object", "properties": {
+                "amount": {"type": "number"},
+                "account_id": {"type": "string"},
+                "date": {"type": "string"},
+                "group_id": {"type": "string"},
+                "splits": {"type": "object",
+                    "properties": {"members": {"type": "array", "minItems": 1}},
+                    "required": ["members"]},
+                "apply": {"type": "boolean"}},
+                "required": ["amount", "account_id"]}}}),
+        serde_json::json!({"type": "function", "function": {
+            "name": "securo.list_accounts", "description": "lists accounts",
+            "parameters": {"type": "object", "properties": {}}}}),
+    ]
+}
+
+type Prompts = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+async fn decision_rig(
+    script: Vec<CompletionOutput>,
+    result: serde_json::Value,
+) -> (SharedState, RecordingExecutor, Prompts) {
+    let (provider, prompts) = PromptLogProvider::new(script);
+    let inner = RecordingExecutor::new(ExecBehavior::Ok(result));
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(600)),
+        Arc::new(provider),
+        Arc::new(SchemaExecutor {
+            inner: inner.clone(),
+            schemas: create_tx_schemas(),
+        }),
+    );
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+    pin_safe(&state, "securo.list_accounts").await;
+    (state, inner, prompts)
+}
+
+async fn say(state: &SharedState, msg_id: &str, text: &str) -> serde_json::Value {
+    let body = serde_json::json!({"session_id": "s1", "text": text, "client_msg_id": msg_id});
+    let (status, body) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+fn tacos() -> serde_json::Value {
+    serde_json::json!({"amount": 250, "account_id": "a1", "date": "2026-10-16"})
+}
+
+#[tokio::test]
+async fn empty_required_argument_is_not_dispatched_and_the_lookup_is_attached() {
+    let (state, executor, prompts) = decision_rig(
+        vec![
+            propose_call(
+                "call_1",
+                serde_json::json!({"amount": 250, "account_id": ""}),
+            ),
+            CompletionOutput::Final("Which account?".into()),
+        ],
+        serde_json::json!({"items": [{"id": "acc-1"}]}),
+    )
+    .await;
+    let body = say(&state, "m1", "create it").await;
+    assert_eq!(body["text"], "Which account?");
+    assert_eq!(
+        executor.calls.lock().unwrap().clone(),
+        vec![("securo.list_accounts".to_owned(), serde_json::json!({}))],
+        "only the lookup ran; the incomplete call never did"
+    );
+    let prompts = prompts.lock().unwrap();
+    let second = &prompts[1];
+    assert!(
+        second.iter().any(|m| m.contains("missing_argument")
+            && m.contains("account_id")
+            && m.contains("lookup_results")
+            && m.contains("acc-1")),
+        "{second:?}"
+    );
+    assert!(
+        second.iter().any(|m| m.contains("did not succeed")),
+        "retry nudge"
+    );
+}
+
+#[tokio::test]
+async fn empty_optional_arguments_are_dropped_before_dispatch() {
+    let mut args = tacos();
+    args["group_id"] = "".into();
+    args["splits"] = serde_json::json!({"members": []});
+    let (state, executor, _) = decision_rig(
+        vec![propose_call("call_1", args)],
+        serde_json::json!({"proposed": {}}),
+    )
+    .await;
+    let body = say(&state, "m1", "create it").await;
+    assert!(body["decision"].is_object(), "{body}");
+    assert_eq!(executor.calls.lock().unwrap()[0].1, tacos());
+}
+
+#[tokio::test]
+async fn the_model_sees_decision_state_and_the_frozen_arguments() {
+    let (state, _, prompts) = decision_rig(
+        vec![
+            propose_call("call_1", tacos()),
+            CompletionOutput::Final("Which category?".into()),
+        ],
+        serde_json::json!({"proposed": {}}),
+    )
+    .await;
+    say(&state, "m1", "create it").await;
+    say(&state, "m2", "add a category").await;
+    let prompts = prompts.lock().unwrap();
+    let last = prompts.last().unwrap();
+    assert!(
+        last.iter()
+            .any(|m| m.starts_with("Waiting for the user's approval"))
+    );
+    assert!(
+        last.iter()
+            .any(|m| m.starts_with("Not executed") && m.contains("2026-10-16")),
+        "{last:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_execution_is_noted_for_the_model() {
+    let (state, _, prompts) = decision_rig(
+        vec![
+            propose_call("call_1", tacos()),
+            CompletionOutput::Final("Done.".into()),
+        ],
+        serde_json::json!({"id": "t1"}),
+    )
+    .await;
+    let body = say(&state, "m1", "create it").await;
+    let id = body["decision"]["id"].as_str().unwrap().to_owned();
+    let (s, _) = answer(
+        &state,
+        "m2",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    say(&state, "m3", "did it work?").await;
+    let prompts = prompts.lock().unwrap();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("Executed after the user approved") && m.contains("t1"))
+    );
+}
+
+#[tokio::test]
+async fn asking_for_the_buttons_shows_the_same_decision_again_without_the_model() {
+    let (state, executor, prompts) = decision_rig(
+        vec![
+            propose_call("call_1", tacos()),
+            CompletionOutput::Final("Which category?".into()),
+        ],
+        serde_json::json!({"proposed": {}}),
+    )
+    .await;
+    let first = say(&state, "m1", "create it").await;
+    let again = say(&state, "m2", "Okay show me to approve").await;
+    assert_ne!(again["decision"]["id"], first["decision"]["id"]);
+    assert_eq!(again["decision"]["details"], first["decision"]["details"]);
+    // Cancelled, then asked for again.
+    let id = again["decision"]["id"].as_str().unwrap().to_owned();
+    answer(
+        &state,
+        "m3",
+        serde_json::json!({"id": id, "value": "reject"}),
+    )
+    .await;
+    let third = say(&state, "m4", "Approve").await;
+    assert_eq!(third["decision"]["details"], first["decision"]["details"]);
+    assert_eq!(prompts.lock().unwrap().len(), 1, "no model turn");
+    assert_eq!(executor.calls.lock().unwrap().len(), 1, "only the preview");
+
+    let other = say(&state, "m5", "Add a category").await;
+    assert_eq!(other["text"], "Which category?");
+    assert_eq!(prompts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_claimed_proposal_is_nudged_once_then_flagged() {
+    let claim = "I prepared a proposal. Please confirm with \"approve\".";
+    let (state, _, prompts) = decision_rig(
+        vec![CompletionOutput::Final(claim.into())],
+        serde_json::json!({}),
+    )
+    .await;
+    let body = say(&state, "m1", "add 181 for wings").await;
+    let text = body["text"].as_str().unwrap();
+    assert!(text.starts_with(claim) && text.contains("Nothing is waiting for your approval"));
+    {
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "one nudge");
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|m| m.starts_with("Nothing is waiting for approval"))
+        );
+    }
+    say(&state, "m2", "and?").await;
+    let prompts = prompts.lock().unwrap();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("Correction:"))
+    );
+}
+
+#[tokio::test]
+async fn a_promised_fix_after_a_failure_is_nudged_once() {
+    let (state, _, prompts) = decision_rig(
+        vec![
+            propose_call("call_1", tacos()),
+            CompletionOutput::Final("I will correct the call by removing those fields.".into()),
+            CompletionOutput::Final("Which account?".into()),
+        ],
+        serde_json::json!({"error": "group_id and splits must be provided together"}),
+    )
+    .await;
+    let body = say(&state, "m1", "create it").await;
+    assert_eq!(body["text"], "Which account?");
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[2]
+            .iter()
+            .any(|m| m.starts_with("You said you would fix the call"))
+    );
 }
