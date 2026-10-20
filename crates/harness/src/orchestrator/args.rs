@@ -50,6 +50,26 @@ pub fn clean(args: &Value, params: &Value) -> Cleaned {
     }
 }
 
+/// Copies into `args` each argument of `prev` (an earlier call that missed
+/// a required argument) that `args` leaves absent or empty (SPEC §11 #26).
+/// Returns the keys filled.
+pub fn carry_over(prev: &Value, args: &mut Value, params: &Value) -> Vec<String> {
+    let (Some(prev), Some(args)) = (prev.as_object(), args.as_object_mut()) else {
+        return Vec::new();
+    };
+    let mut filled = Vec::new();
+    for (k, v) in prev {
+        if args
+            .get(k)
+            .is_none_or(|cur| is_empty(cur, &params["properties"][k]))
+        {
+            args.insert(k.clone(), v.clone());
+            filled.push(k.clone());
+        }
+    }
+    filled
+}
+
 /// Placeholder-shaped: null, `""`, `{}`, an array below `minItems` (at
 /// least 1), or an object with an empty required property. `false` and `0`
 /// are real values.
@@ -202,6 +222,21 @@ mod tests {
     fn schemaless_arguments_lose_only_placeholders() {
         let c = clean(&json!({"a": "", "b": "x", "c": {}}), &json!({}));
         assert_eq!(c.args, json!({"b": "x"}));
+    }
+
+    #[test]
+    fn carry_over_fills_only_what_the_new_call_leaves_out() {
+        let prev = json!({"amount": 250, "date": "2026-10-16", "notes": "dinner"});
+        let mut args = json!({"amount": 300, "account_id": "a1", "notes": ""});
+        let filled = carry_over(&prev, &mut args, &params());
+        assert_eq!(filled, vec!["date", "notes"]);
+        assert_eq!(
+            args,
+            json!({"amount": 300, "account_id": "a1", "date": "2026-10-16", "notes": "dinner"})
+        );
+        let before = args.clone();
+        assert!(carry_over(&json!({}), &mut args, &params()).is_empty());
+        assert_eq!(args, before);
     }
 
     #[test]

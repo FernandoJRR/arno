@@ -825,6 +825,10 @@ async fn normal_path_loop(
     // SPEC §11 #26: the latest call failed; one unkept-claim nudge per order.
     let mut last_failed = false;
     let mut unkept_nudged = false;
+    // Cleaned args of calls that missed a required argument, by tool
+    // (SPEC §11 #26); order-scoped.
+    let mut carried: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
 
     loop {
         if Instant::now() >= deadline {
@@ -926,7 +930,7 @@ async fn normal_path_loop(
                     tracing::info!(tool = %call.name, "rescued text tool call");
                     let mut calls = vec![call];
                     repair_attachment_refs(&plugins, &mut calls, handles);
-                    let missing = clean_calls(&plugins, &mut calls);
+                    let missing = clean_calls(&plugins, &mut calls, &mut carried);
                     dispatched_tool_calls += calls.len() as u32;
                     st.sessions.append(
                         &key,
@@ -1058,7 +1062,7 @@ async fn normal_path_loop(
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
                 repair_attachment_refs(&plugins, &mut calls, handles);
-                let missing = clean_calls(&plugins, &mut calls);
+                let missing = clean_calls(&plugins, &mut calls, &mut carried);
                 dispatched_tool_calls += calls.len() as u32;
                 // The model's own request, remembered — without this the next
                 // completion (even later in this same loop) sees only an
@@ -1198,9 +1202,14 @@ async fn dispatch_call(
 }
 
 /// Drops placeholder arguments against each tool's schema and returns,
-/// per call, the required parameters left empty (SPEC §11 #26). Runs
+/// per call, the required parameters left empty (SPEC §11 #26). A retry
+/// after such a miss first inherits what the missed call carried. Runs
 /// before transcript and policy, so what is logged is what is dispatched.
-fn clean_calls(plugins: &PluginSet, calls: &mut [crate::model::ToolCall]) -> Vec<Vec<String>> {
+fn clean_calls(
+    plugins: &PluginSet,
+    calls: &mut [crate::model::ToolCall],
+    carried: &mut std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<Vec<String>> {
     calls
         .iter_mut()
         .map(|call| {
@@ -1210,7 +1219,16 @@ fn clean_calls(plugins: &PluginSet, calls: &mut [crate::model::ToolCall]) -> Vec
                 .find(|s| s["function"]["name"] == call.name.as_str())
                 .map(|s| &s["function"]["parameters"])
                 .unwrap_or(&serde_json::Value::Null);
+            if let Some(prev) = carried.remove(&call.name) {
+                let keys = args::carry_over(&prev, &mut call.args, params);
+                if !keys.is_empty() {
+                    tracing::info!(tool = %call.name, keys = ?keys, "carried arguments from the missing-argument retry");
+                }
+            }
             let cleaned = args::clean(&call.args, params);
+            if !cleaned.missing.is_empty() {
+                carried.insert(call.name.clone(), cleaned.args.clone());
+            }
             if cleaned.args != call.args {
                 tracing::info!(tool = %call.name, "dropped empty arguments");
                 call.args = cleaned.args;

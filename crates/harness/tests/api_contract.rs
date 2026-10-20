@@ -1956,3 +1956,104 @@ async fn a_direct_apply_whose_preview_fails_goes_back_to_the_model() {
             .any(|m| m.contains("group_id and splits must be provided together"))
     );
 }
+
+// ---- carry-over after a missing argument (SPEC §11 #26) ----
+
+/// Args of the executor's last call to the create tool.
+fn last_create(executor: &RecordingExecutor) -> serde_json::Value {
+    executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(tool, _)| tool == "securo.propose_create_transaction")
+        .map(|(_, args)| args.clone())
+        .expect("a create call")
+}
+
+#[tokio::test]
+async fn a_retry_after_a_missing_argument_keeps_what_the_first_call_sent() {
+    let (state, executor, _) = decision_rig(
+        vec![
+            propose_call(
+                "call_1",
+                serde_json::json!({"amount": 250, "date": "2026-10-16"}),
+            ),
+            propose_call(
+                "call_2",
+                serde_json::json!({"amount": 250, "account_id": "a1"}),
+            ),
+        ],
+        resolved_preview(),
+    )
+    .await;
+    let body = say(&state, "m1", "250 for tacos yesterday").await;
+    assert_eq!(
+        last_create(&executor),
+        tacos(),
+        "the preview carried the date"
+    );
+    let id = body["decision"]["id"]
+        .as_str()
+        .expect("decision")
+        .to_owned();
+    answer(
+        &state,
+        "m2",
+        serde_json::json!({"id": id, "value": "approve"}),
+    )
+    .await;
+    let mut frozen = tacos();
+    frozen["apply"] = serde_json::json!(true);
+    assert_eq!(last_create(&executor), frozen);
+}
+
+#[tokio::test]
+async fn nothing_is_carried_after_a_backend_error() {
+    let (state, executor, _) = decision_rig(
+        vec![
+            propose_call("call_1", tacos()),
+            propose_call(
+                "call_2",
+                serde_json::json!({"amount": 250, "account_id": "a1"}),
+            ),
+            CompletionOutput::Final("It failed.".into()),
+        ],
+        serde_json::json!({"error": "group_id and splits must be provided together"}),
+    )
+    .await;
+    say(&state, "m1", "250 for tacos yesterday").await;
+    assert_eq!(
+        last_create(&executor),
+        serde_json::json!({"amount": 250, "account_id": "a1"})
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_carried_into_the_next_order() {
+    let (state, executor, _) = decision_rig(
+        vec![
+            propose_call(
+                "call_1",
+                serde_json::json!({"amount": 250, "date": "2026-10-16"}),
+            ),
+            CompletionOutput::Final("Which account?".into()),
+            propose_call(
+                "call_2",
+                serde_json::json!({"amount": 250, "account_id": "a1"}),
+            ),
+        ],
+        resolved_preview(),
+    )
+    .await;
+    assert_eq!(
+        say(&state, "m1", "250 for tacos").await["text"],
+        "Which account?"
+    );
+    say(&state, "m2", "the main one").await;
+    assert_eq!(
+        last_create(&executor),
+        serde_json::json!({"amount": 250, "account_id": "a1"})
+    );
+}
