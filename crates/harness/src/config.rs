@@ -139,6 +139,8 @@ pub struct Config {
     /// Append a note naming numbers in a final answer that no tool result or
     /// user message contains (SPEC §11 #20).
     pub number_guard: bool,
+    /// The user's zone: the dates the model is told (SPEC §11 #28).
+    pub timezone: chrono_tz::Tz,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +190,7 @@ impl Config {
             log_verify_on_boot: parsed("LOG_VERIFY_ON_BOOT", Some(false))?,
             tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
             number_guard: parsed("NUMBER_GUARD", Some(true))?,
+            timezone: parsed("HARNESS_TIMEZONE", Some(chrono_tz::UTC))?,
         })
     }
 }
@@ -197,6 +200,7 @@ impl Config {
 const KNOWN_VARS: &[&str] = &[
     "HARNESS_API_BIND",
     "HARNESS_API_CLIENT_TOKENS",
+    "HARNESS_TIMEZONE",
     "OLLAMA_URL",
     "OLLAMA_MODEL",
     "OLLAMA_NUM_CTX",
@@ -581,6 +585,7 @@ mod tests {
             "LOG_KEEP_SEGMENTS",
             "LOG_VERIFY_ON_BOOT",
             "NUMBER_GUARD",
+            "HARNESS_TIMEZONE",
         ]
     }
 
@@ -598,6 +603,7 @@ mod tests {
         assert_eq!(cfg.ollama_top_k, 1);
         assert_eq!(cfg.ollama_num_predict, 400);
         assert!(cfg.number_guard);
+        assert_eq!(cfg.timezone, chrono_tz::UTC);
         assert!(!cfg.router_enabled);
         assert_eq!(cfg.plugins_dir, PathBuf::from("./config/plugins"));
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
@@ -868,6 +874,16 @@ mod tests {
         set("NUMBER_GUARD", "on");
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("NUMBER_GUARD"), "{err}");
+
+        set("NUMBER_GUARD", "true");
+        set("HARNESS_TIMEZONE", "Mars/Base");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("HARNESS_TIMEZONE"), "{err}");
+        set("HARNESS_TIMEZONE", "America/Guatemala");
+        assert_eq!(
+            Config::from_env().unwrap().timezone,
+            chrono_tz::America::Guatemala
+        );
     }
 
     #[test]

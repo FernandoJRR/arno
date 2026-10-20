@@ -294,6 +294,7 @@ fn config(dir: &Path, router_enabled: bool) -> Config {
         log_verify_on_boot: false,
         tool_policy_retry: Duration::from_secs(300),
         number_guard: false,
+        timezone: chrono_tz::UTC,
     }
 }
 

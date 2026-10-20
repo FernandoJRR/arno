@@ -247,7 +247,7 @@ async fn run(
         .and_then(|p| router::offered_tools(set, p, false))
         .unwrap_or_else(unrouted);
 
-    let mut messages = vec![ChatMessage::new(Role::System, system_prompt())];
+    let mut messages = vec![ChatMessage::new(Role::System, system_prompt(cfg.timezone))];
     if let Some(notes) = pick.as_ref().and_then(|p| router::how_notes(set, p, false)) {
         messages.push(ChatMessage::new(Role::System, notes));
     }

@@ -66,6 +66,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         log_verify_on_boot: false,
         tool_policy_retry: Duration::from_secs(300),
         number_guard: true,
+        timezone: chrono_tz::UTC,
     }
 }
 

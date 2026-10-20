@@ -78,11 +78,11 @@ impl ToolExecutor for NoBackends {
 /// other previously-correct ones (e.g. a user-specified `date`) rather than
 /// carrying them forward — even when its own prior attempt, containing the
 /// correct value, is right there in context (`assistant_tool_calls`, above).
-pub fn system_prompt() -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+pub fn system_prompt(tz: chrono_tz::Tz) -> String {
+    let today = date_line(chrono::Utc::now(), tz);
     format!(
         "You are the home-server harness assistant called Arno. \
-         Current date and time: {now}. \
+         {today} \
          You interpret orders and answer with the help of the available tools. \
          Be terse and factual: keep final answers to at most 6 short lines \
          of key facts (amounts, dates, names, outcomes) and offer more \
@@ -95,6 +95,22 @@ pub fn system_prompt() -> String {
          needs approval they are shown an approve or cancel choice. Never tell \
          them to approve, confirm or apply anything in another app or \
          interface, and never mention tool argument names to them."
+    )
+}
+
+/// The user's local date with its neighbours worked out, so a small model
+/// never does date arithmetic (SPEC §11 #28).
+fn date_line(now: chrono::DateTime<chrono::Utc>, tz: chrono_tz::Tz) -> String {
+    let local = now.with_timezone(&tz);
+    let date = local.date_naive();
+    let around = |d: Option<chrono::NaiveDate>| d.map(|d| d.to_string()).unwrap_or_default();
+    format!(
+        "Today is {}, {} local time ({tz}, UTC{}). Yesterday was {}; tomorrow is {}.",
+        local.format("%A %Y-%m-%d"),
+        local.format("%H:%M"),
+        local.format("%:z"),
+        around(date.pred_opt()),
+        around(date.succ_opt()),
     )
 }
 
@@ -707,7 +723,7 @@ fn finish_answer(
 ) -> String {
     let missing = if st.cfg.number_guard && dispatched_tool_calls > 0 {
         let history = st.sessions.snapshot(key);
-        let prompt = system_prompt();
+        let prompt = system_prompt(st.cfg.timezone);
         let mut sources: Vec<&str> = history
             .iter()
             .filter(|m| {
@@ -849,7 +865,7 @@ async fn normal_path_loop(
         let notes = route.as_ref().and_then(|r| {
             crate::plugins::router::how_notes(&plugins, r, dispatched_tool_calls > 0)
         });
-        let prompt = system_prompt();
+        let prompt = system_prompt(st.cfg.timezone);
         // The answer needs room too, or Ollama shifts the window and drops
         // the system prompt (SPEC §11 #20).
         let output_reserve = match st.cfg.ollama_num_predict {
@@ -1633,6 +1649,20 @@ you actually know and explicitly say no action was taken.";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_date_line_is_local_with_its_neighbours() {
+        let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let evening = at("2026-10-20T03:23:00Z");
+        assert_eq!(
+            date_line(evening, chrono_tz::America::Guatemala),
+            "Today is Monday 2026-10-19, 21:23 local time (America/Guatemala, UTC-06:00). \
+             Yesterday was 2026-10-18; tomorrow is 2026-10-20."
+        );
+        assert!(date_line(evening, chrono_tz::UTC).starts_with("Today is Tuesday 2026-10-20"));
+        let summer = date_line(at("2026-07-01T12:00:00Z"), chrono_tz::America::New_York);
+        assert!(summer.contains("UTC-04:00"), "{summer}");
+    }
 
     #[test]
     fn decision_details_come_from_args_and_schema_titles() {
