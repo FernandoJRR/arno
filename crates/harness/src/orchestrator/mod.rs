@@ -731,7 +731,7 @@ fn propose(
     let previewed = preview
         .map(|p| {
             let params = schema.map_or(&serde_json::Value::Null, |s| &s["function"]["parameters"]);
-            card::preview_details(p, args, params)
+            card::preview_details(p, args, params, plugins.card_hide(tool))
         })
         .filter(|rows| !rows.is_empty());
     let text = match &previewed {

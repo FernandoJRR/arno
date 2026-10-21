@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
         // Fail loudly on config problems (AGENTS.md #6).
         anyhow::anyhow!("startup configuration invalid: {e}")
     })?;
+    tracing::info!(timezone = %cfg.timezone, source = ?cfg.timezone_source, "user time zone (SPEC §11 #28)");
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

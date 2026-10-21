@@ -992,6 +992,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "contract",
+ "iana-time-zone",
  "lru",
  "rand",
  "reqwest 0.13.4",

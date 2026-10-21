@@ -295,6 +295,7 @@ fn config(dir: &Path, router_enabled: bool) -> Config {
         tool_policy_retry: Duration::from_secs(300),
         number_guard: false,
         timezone: chrono_tz::UTC,
+        timezone_source: harness::config::TimezoneSource::Default,
     }
 }
 

@@ -77,6 +77,7 @@ pub struct PluginSet {
 impl PluginSet {
     pub fn assemble(executor: Arc<dyn ToolExecutor>, plugins: Vec<Plugin>) -> Self {
         let groups = build_groups(executor.tool_schemas(), &plugins);
+        warn_hidden_params(executor.tool_schemas(), &plugins);
         Self {
             executor,
             plugins,
@@ -139,6 +140,15 @@ impl PluginSet {
             Some(m) => m.tools.attachment_params.iter().any(|a| a == param),
             None => param.ends_with("_ref"),
         }
+    }
+
+    /// Preview keys the tool's manifest leaves off the decision card
+    /// (SPEC §11 #27). Empty for legacy plugins.
+    pub fn card_hide(&self, tool: &str) -> &[String] {
+        namespace(tool)
+            .and_then(|ns| self.plugin(ns))
+            .and_then(|p| p.manifest.as_ref())
+            .map_or(&[], |m| m.tools.card_hide.as_slice())
     }
 
     /// Distinct attachment parameter names across discovered tools, sorted.
@@ -225,6 +235,26 @@ impl PluginRegistry {
 }
 
 /// Namespace of a `<plugin>.<tool>` name.
+/// A `card_hide` key naming a tool parameter has no effect: what the call
+/// sets is always on the card.
+fn warn_hidden_params(schemas: &[serde_json::Value], plugins: &[Plugin]) {
+    for p in plugins {
+        let Some(m) = &p.manifest else { continue };
+        for key in &m.tools.card_hide {
+            let is_param = schemas.iter().any(|s| {
+                s["function"]["name"]
+                    .as_str()
+                    .and_then(namespace)
+                    .is_some_and(|ns| ns == p.id)
+                    && !s["function"]["parameters"]["properties"][key.as_str()].is_null()
+            });
+            if is_param {
+                tracing::warn!(plugin = %p.id, key = %key, "card_hide names a tool parameter; it stays on the card");
+            }
+        }
+    }
+}
+
 pub fn namespace(tool: &str) -> Option<&str> {
     tool.split_once('.').map(|(ns, _)| ns)
 }
@@ -711,6 +741,25 @@ mod tests {
         // A manifest that declares nothing takes no attachments.
         assert!(!set.is_attachment_param("ocr.extract_text", "image_ref"));
         assert!(set.is_attachment_param("old.read", "image_ref"));
+    }
+
+    #[test]
+    fn card_hide_comes_from_the_manifest_by_namespace() {
+        let exec = Arc::new(Schemas(vec![
+            schema("fin.add_tx", &["date"]),
+            schema("old.read", &[]),
+        ]));
+        let fin = manifest("fin", "[tools]\ncard_hide = [\"kind\", \"date\"]\n");
+        let legacy = Plugin {
+            id: "old".into(),
+            manifest: None,
+            hash: None,
+            status: PluginStatus::Ready,
+        };
+        let set = PluginSet::assemble(exec, vec![plugin(fin), legacy]);
+        assert_eq!(set.card_hide("fin.add_tx"), ["kind", "date"]);
+        assert!(set.card_hide("old.read").is_empty());
+        assert!(set.card_hide("nowhere.tool").is_empty());
     }
 
     #[test]

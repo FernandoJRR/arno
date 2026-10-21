@@ -141,6 +141,19 @@ pub struct Config {
     pub number_guard: bool,
     /// The user's zone: the dates the model is told (SPEC §11 #28).
     pub timezone: chrono_tz::Tz,
+    pub timezone_source: TimezoneSource,
+}
+
+/// Where the user's zone came from (SPEC §11 #28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimezoneSource {
+    /// `HARNESS_TIMEZONE`.
+    Override,
+    /// The standard `TZ` variable.
+    Tz,
+    /// The server's own zone (`/etc/localtime`, `/etc/timezone`).
+    System,
+    Default,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +167,7 @@ pub enum ConfigError {
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         reject_unknown()?;
+        let (timezone, timezone_source) = timezone()?;
         Ok(Self {
             bind: socket("HARNESS_API_BIND", "127.0.0.1:8080")?,
             client_tokens: tokens("HARNESS_API_CLIENT_TOKENS")?,
@@ -190,9 +204,42 @@ impl Config {
             log_verify_on_boot: parsed("LOG_VERIFY_ON_BOOT", Some(false))?,
             tool_policy_retry: duration_secs("TOOL_POLICY_RETRY_S", 300)?,
             number_guard: parsed("NUMBER_GUARD", Some(true))?,
-            timezone: parsed("HARNESS_TIMEZONE", Some(chrono_tz::UTC))?,
+            timezone,
+            timezone_source,
         })
     }
+}
+
+/// `HARNESS_TIMEZONE` when set, else `TZ` when it names an IANA zone, else
+/// the server's zone, else UTC. Only the override fails loudly: `TZ` is
+/// not ours and may hold a POSIX rule.
+fn timezone() -> Result<(chrono_tz::Tz, TimezoneSource), ConfigError> {
+    const VAR: &str = "HARNESS_TIMEZONE";
+    if let Some(name) = raw(VAR)?.filter(|v| !v.trim().is_empty()) {
+        return name
+            .trim()
+            .parse()
+            .map(|tz| (tz, TimezoneSource::Override))
+            .map_err(|_| ConfigError::BadValue {
+                var: VAR,
+                problem: format!("cannot parse {name:?}"),
+            });
+    }
+    if let Ok(name) = std::env::var("TZ")
+        && !name.trim().is_empty()
+    {
+        match name.trim().trim_start_matches(':').parse() {
+            Ok(tz) => return Ok((tz, TimezoneSource::Tz)),
+            Err(_) => tracing::warn!(tz = %name, "TZ is not an IANA zone name; ignored"),
+        }
+    }
+    if let Some(tz) = iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|name| name.parse().ok())
+    {
+        return Ok((tz, TimezoneSource::System));
+    }
+    Ok((chrono_tz::UTC, TimezoneSource::Default))
 }
 
 /// Component-owned variable namespaces. Anything set under these prefixes that
@@ -552,6 +599,7 @@ mod tests {
 
     fn base_vars() -> Vec<&'static str> {
         vec![
+            "TZ",
             "HARNESS_API_BIND",
             "HARNESS_API_CLIENT_TOKENS",
             "OLLAMA_URL",
@@ -603,7 +651,11 @@ mod tests {
         assert_eq!(cfg.ollama_top_k, 1);
         assert_eq!(cfg.ollama_num_predict, 400);
         assert!(cfg.number_guard);
-        assert_eq!(cfg.timezone, chrono_tz::UTC);
+        // Unset: the server's zone, or UTC when it has none.
+        assert!(matches!(
+            cfg.timezone_source,
+            TimezoneSource::System | TimezoneSource::Default
+        ));
         assert!(!cfg.router_enabled);
         assert_eq!(cfg.plugins_dir, PathBuf::from("./config/plugins"));
         assert_eq!(cfg.order_budget, Duration::from_secs(180));
@@ -880,10 +932,19 @@ mod tests {
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("HARNESS_TIMEZONE"), "{err}");
         set("HARNESS_TIMEZONE", "America/Guatemala");
-        assert_eq!(
-            Config::from_env().unwrap().timezone,
-            chrono_tz::America::Guatemala
-        );
+        set("TZ", "Europe/Berlin");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.timezone, chrono_tz::America::Guatemala, "override wins");
+        assert_eq!(cfg.timezone_source, TimezoneSource::Override);
+
+        set("HARNESS_TIMEZONE", "");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.timezone, chrono_tz::Europe::Berlin, "empty is unset");
+        assert_eq!(cfg.timezone_source, TimezoneSource::Tz);
+
+        set("TZ", "CST6");
+        let cfg = Config::from_env().expect("a foreign TZ never fails boot");
+        assert_ne!(cfg.timezone_source, TimezoneSource::Tz);
     }
 
     #[test]

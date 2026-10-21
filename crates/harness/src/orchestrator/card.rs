@@ -11,15 +11,26 @@ const MAX_JOINED: usize = 5;
 const DEFAULT_MARK: &str = " (default)";
 
 /// One row per shown leaf of `preview`. A wrapper (the only object, holding
-/// more fields than the rest) is unwrapped and shown first; ids and empty values are dropped. A leaf named like a
-/// tool parameter that `args` does not carry is marked `(default)`: the
-/// backend filled it in. Empty when nothing is worth showing.
-pub fn preview_details(preview: &Value, args: &Value, params: &Value) -> Vec<DecisionDetail> {
+/// more fields than the rest) is unwrapped and shown first; ids and empty
+/// values are dropped. A leaf named like a tool parameter that `args` does
+/// not carry is marked `(default)`: the backend filled it in. Keys in `hide`
+/// (the manifest's `card_hide`) are left out unless they are parameters.
+/// Empty when nothing is worth showing.
+pub fn preview_details(
+    preview: &Value,
+    args: &Value,
+    params: &Value,
+    hide: &[String],
+) -> Vec<DecisionDetail> {
     let Some(top) = preview.as_object() else {
         return Vec::new();
     };
-    let mark = |key: &str| {
-        !params["properties"][key].is_null() && args.get(key).is_none_or(Value::is_null)
+    let is_param = |key: &str| !params["properties"][key].is_null();
+    let mark = |key: &str| is_param(key) && args.get(key).is_none_or(Value::is_null);
+    let hidden = |key: &str| !is_param(key) && hide.iter().any(|h| h == key);
+    let view = View {
+        mark: &mark,
+        hidden: &hidden,
     };
     let mut rows = Vec::new();
     let mut wrappers = top.iter().filter(|(_, v)| v.is_object());
@@ -27,29 +38,39 @@ pub fn preview_details(preview: &Value, args: &Value, params: &Value) -> Vec<Dec
         (Some((key, inner)), None)
             if inner.as_object().map_or(0, serde_json::Map::len) > top.len() - 1 =>
         {
-            walk(inner, &[], &mark, &mut rows);
+            walk(inner, &[], &view, &mut rows);
             let rest: serde_json::Map<String, Value> = top
                 .iter()
                 .filter(|(k, _)| *k != key)
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            walk(&Value::Object(rest), &[], &mark, &mut rows);
+            walk(&Value::Object(rest), &[], &view, &mut rows);
         }
-        _ => walk(preview, &[], &mark, &mut rows),
+        _ => walk(preview, &[], &view, &mut rows),
     }
     rows.truncate(MAX_ROWS);
     rows
 }
 
-fn walk(v: &Value, path: &[&str], mark: &dyn Fn(&str) -> bool, rows: &mut Vec<DecisionDetail>) {
+/// Per-key rules for one card.
+struct View<'a> {
+    /// Filled in by the backend: shown with `(default)`.
+    mark: &'a dyn Fn(&str) -> bool,
+    hidden: &'a dyn Fn(&str) -> bool,
+}
+
+fn walk(v: &Value, path: &[&str], view: &View, rows: &mut Vec<DecisionDetail>) {
     let Some(obj) = v.as_object() else { return };
     for (k, child) in obj {
+        if (view.hidden)(k) {
+            continue;
+        }
         let mut here = path.to_vec();
         here.push(k);
         if child.is_object() {
-            walk(child, &here, mark, rows);
+            walk(child, &here, view, rows);
         } else if let Some(mut value) = render(child) {
-            if mark(k) {
+            if (view.mark)(k) {
                 value.push_str(DEFAULT_MARK);
             }
             rows.push(DecisionDetail {
@@ -101,7 +122,7 @@ mod tests {
     const ID: &str = "d65cf7f5-6fcc-4ba1-a6e6-69fa850c4444";
 
     fn rows(preview: &Value, args: &Value, params: &Value) -> Vec<(String, String)> {
-        preview_details(preview, args, params)
+        preview_details(preview, args, params, &[])
             .into_iter()
             .map(|d| (d.label, d.value))
             .collect()
@@ -154,6 +175,21 @@ mod tests {
         assert!(shown.contains(&("Affected".into(), "0".into())));
         assert!(shown.contains(&("Missing ids".into(), "1".into())));
         assert!(shown.contains(&("Tags".into(), "a, b".into())));
+    }
+
+    #[test]
+    fn hidden_keys_are_dropped_unless_they_are_parameters() {
+        let hide = ["kind".to_owned(), "date".to_owned()];
+        let shown: Vec<String> =
+            preview_details(&create_preview(), &json!({}), &create_params(), &hide)
+                .into_iter()
+                .map(|d| d.label)
+                .collect();
+        assert!(!shown.contains(&"Kind".to_owned()), "{shown:?}");
+        assert!(
+            shown.contains(&"Date".to_owned()),
+            "a parameter stays: {shown:?}"
+        );
     }
 
     #[test]

@@ -31,7 +31,9 @@ services:
       PLUGINS_DIR: /config/plugins
       PLUGINS_REPORT_PATH: /data/arno-plugins-report.json
       ROUTER_ENABLED: ${ROUTER_ENABLED:-false}
-      HARNESS_TIMEZONE: ${HARNESS_TIMEZONE:-UTC}
+      # The user's zone (SPEC §11 #28): override, else the server's TZ.
+      HARNESS_TIMEZONE: ${HARNESS_TIMEZONE:-}
+      TZ: ${TZ:-}
       # Non-owned name on purpose: anything HARNESS_*-prefixed is rejected by
       # the harness's own strict env validator (SPEC §5.7), even if unread.
       HEALTHCHECK_PORT: ${HARNESS_API_PORT:-8080}

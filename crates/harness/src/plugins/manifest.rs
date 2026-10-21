@@ -84,6 +84,10 @@ pub struct Tools {
     /// Parameters that take an attachment handle (SPEC §4.4).
     #[serde(default)]
     pub attachment_params: Vec<String>,
+    /// Preview keys left off the decision card (SPEC §11 #27); a key that
+    /// is a parameter of the tool is always shown.
+    #[serde(default)]
+    pub card_hide: Vec<String>,
 }
 
 impl Default for Tools {
@@ -91,6 +95,7 @@ impl Default for Tools {
         Self {
             enabled: all_tools(),
             attachment_params: Vec::new(),
+            card_hide: Vec::new(),
         }
     }
 }

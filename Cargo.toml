@@ -27,6 +27,7 @@ teloxide = { version = "0.17", default-features = false, features = ["macros", "
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
 arc-swap = "1.9"
 

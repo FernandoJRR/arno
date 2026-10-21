@@ -16,6 +16,10 @@ auth = { kind = "bearer", secret = "SECURO_MCP_AUTH" }
 egress = ["server.tail338c0b.ts.net:3130"]
 secrets = ["SECURO_MCP_AUTH"]
 
+[tools]
+# Preview keys that tell the user nothing on the decision card (SPEC §11 #27).
+card_hide = ["apply_endpoint", "kind"]
+
 [[groups]]
 id = "transactions"
 when = "Log, list, find or categorize expenses and income"

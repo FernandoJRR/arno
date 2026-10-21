@@ -67,6 +67,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         tool_policy_retry: Duration::from_secs(300),
         number_guard: true,
         timezone: chrono_tz::UTC,
+        timezone_source: harness::config::TimezoneSource::Default,
     }
 }
 
@@ -2201,5 +2202,49 @@ async fn other_requests_after_a_cancel_are_not_amendments() {
     assert!(
         again["decision"].is_object(),
         "re-show still works: {again}"
+    );
+}
+
+// ---- manifest `card_hide` (SPEC §11 #27) ----
+
+#[tokio::test]
+async fn card_hide_leaves_backend_noise_off_the_card() {
+    let (provider, _) = PromptLogProvider::new(vec![propose_call("call_1", tacos())]);
+    let inner = RecordingExecutor::new(ExecBehavior::Ok(resolved_preview()));
+    let executor: Arc<dyn ToolExecutor> = Arc::new(SchemaExecutor {
+        inner,
+        schemas: create_tx_schemas(),
+    });
+    let state = build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(600)),
+        Arc::new(provider),
+        executor.clone(),
+    );
+    let manifest = harness::plugins::manifest::Manifest::parse(
+        "arno_manifest = 1\nid = \"securo\"\nname = \"Finance\"\nversion = \"1\"\n\
+         provenance = \"first-party\"\n[server]\nkind = \"remote\"\nurl = \"http://x/mcp\"\n\
+         [tools]\ncard_hide = [\"kind\", \"date\"]\n",
+        "securo.toml",
+    )
+    .expect("manifest parses");
+    state.plugins.store(harness::plugins::PluginSet::assemble(
+        executor,
+        vec![harness::plugins::Plugin {
+            id: "securo".into(),
+            manifest: Some(manifest),
+            hash: None,
+            status: harness::plugins::PluginStatus::Ready,
+        }],
+    ));
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+    let body = say(&state, "m1", "250 for tacos").await;
+    let labels: Vec<String> = rows(&body["decision"])
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert!(!labels.contains(&"Kind".to_owned()), "{labels:?}");
+    assert!(
+        labels.contains(&"Date".to_owned()),
+        "a parameter is never hidden"
     );
 }
