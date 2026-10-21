@@ -94,9 +94,52 @@ pub fn asks_for_decision(text: &str) -> bool {
         && (go_ahead || words.iter().any(|w| INTENT.contains(w)))
 }
 
+/// Longer messages are new requests, not changes to a proposal.
+const MAX_AMEND_WORDS: usize = 12;
+
+/// The parameters a short message names by their stem ("add a category" →
+/// `category_id`): a change to the cancelled proposal (SPEC §11 #26).
+pub fn amend_targets<'a>(text: &str, params: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || words.len() > MAX_AMEND_WORDS {
+        return Vec::new();
+    }
+    params
+        .filter(|p| super::args::stem(p).is_some_and(|s| words.iter().any(|w| w.starts_with(s))))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PARAMS: [&str; 5] = ["amount", "account_id", "category_id", "date", "apply"];
+
+    fn targets(text: &str) -> Vec<String> {
+        amend_targets(text, PARAMS.into_iter())
+    }
+
+    #[test]
+    fn short_messages_naming_a_parameter_are_amendments() {
+        assert_eq!(targets("Add a category"), ["category_id"]);
+        assert_eq!(targets("change the date to the 16th"), ["date"]);
+        assert_eq!(targets("ponle categoría"), ["category_id"]);
+    }
+
+    #[test]
+    fn new_requests_and_chatter_are_not() {
+        assert!(
+            targets("I want to add a 181 gtq expense for Pollo Campero today with a category")
+                .is_empty()
+        );
+        assert!(targets("hello").is_empty());
+        assert!(targets("").is_empty());
+    }
 
     #[test]
     fn short_requests_for_the_buttons_match() {

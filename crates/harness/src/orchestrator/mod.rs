@@ -245,6 +245,76 @@ fn record_cancelled(
 
 /// Decision state for the model (SPEC §11 #26): system-role and terse, so
 /// it is read as state rather than copied as a reply.
+/// A change to the last unapproved payload (SPEC §11 #26): offered only its
+/// tool and lookups, with the payload's arguments carried into the call.
+struct Amend {
+    tool: String,
+    /// The payload without its acting argument, so the call is a preview.
+    args: serde_json::Value,
+}
+
+/// The amendment `text` asks for, if it names a parameter of `action`'s
+/// tool. Notes the change for the model, with lookup results for the named
+/// parameters attached.
+async fn amendment(
+    st: &Arc<AppState>,
+    client_id: &str,
+    session_id: &str,
+    action: &crate::stores::pending::PendingAction,
+    text: &str,
+) -> Option<Amend> {
+    let plugins = st.plugins.snapshot();
+    let schema = plugins
+        .tool_schemas()
+        .iter()
+        .find(|s| s["function"]["name"] == action.tool.as_str())?;
+    let args = st
+        .policy
+        .preview_args(&action.tool, &action.args)
+        .unwrap_or_else(|| action.args.clone());
+    // The acting argument is the harness's to set, never a target.
+    let acting: Vec<&String> = action
+        .args
+        .as_object()
+        .map(|o| o.keys().filter(|k| args.get(k).is_none()).collect())
+        .unwrap_or_default();
+    let params = schema["function"]["parameters"]["properties"].as_object()?;
+    let targets = intent::amend_targets(
+        text,
+        params
+            .keys()
+            .filter(|k| !acting.contains(k))
+            .map(String::as_str),
+    );
+    if targets.is_empty() {
+        return None;
+    }
+    tracing::info!(tool = %action.tool, targets = ?targets, "amending the unapproved proposal");
+    let tool = &action.tool;
+    let mut text = format!(
+        "The user is changing the proposal they did not approve: `{tool}` {args}. \
+         Call `{tool}` with only the change they ask for; every other argument is kept."
+    );
+    let results = run_lookups(st, &plugins, &targets).await;
+    let tools = lookup_tools(st, &plugins);
+    for param in &targets {
+        if let Some((lookup, result)) =
+            lookup_for(param, &tools).and_then(|l| results.get(&l).map(|r| (l, r)))
+        {
+            text.push_str(&format!(
+                " `{param}` takes the id of an existing entry; choices from `{lookup}`: \
+                 {result}. If the user named none, pick the entry that best fits the \
+                 proposal."
+            ));
+        }
+    }
+    note(st, client_id, session_id, text);
+    Some(Amend {
+        tool: tool.clone(),
+        args,
+    })
+}
+
 fn note(st: &Arc<AppState>, client_id: &str, session_id: &str, text: String) {
     st.sessions.append(
         &(client_id.to_owned(), session_id.to_owned()),
@@ -416,9 +486,29 @@ async fn normal_path(
     // manifest tells the model a handle exists without naming any tool
     // (AGENTS.md #1 — the core stays backend-agnostic). Cleaned up on every
     // return path below, success or failure alike.
+    // SPEC §11 #26: a short order naming a parameter of the cancelled
+    // payload changes it rather than starting over.
+    let amend = match st
+        .pending
+        .recent(client_id, &order.session_id, st.cfg.confirm_ttl)
+    {
+        Some(action) if order.attachments.is_empty() => {
+            amendment(st, client_id, &order.session_id, &action, &order.text).await
+        }
+        _ => None,
+    };
     let handles = attachments::persist(&order, &st.cfg.attach_dir, st.cfg.attach_max_bytes);
     let manifest = attachment_manifest(&st.plugins.snapshot(), &handles);
-    let result = normal_path_loop(st, client_id, &order, key, manifest.as_deref(), &handles).await;
+    let result = normal_path_loop(
+        st,
+        client_id,
+        &order,
+        key,
+        manifest.as_deref(),
+        &handles,
+        amend.as_ref(),
+    )
+    .await;
     attachments::cleanup(&st.cfg.attach_dir, &handles);
     result
 }
@@ -798,6 +888,7 @@ async fn normal_path_loop(
     key: crate::stores::sessions::SessionKey,
     manifest: Option<&str>,
     handles: &[attachments::AttachmentHandle],
+    amend: Option<&Amend>,
 ) -> Result<Response, ApiError> {
     let deadline = Instant::now() + st.cfg.order_budget;
     // One plugin view for the whole order (SPEC §11 #24).
@@ -845,6 +936,9 @@ async fn normal_path_loop(
     // (SPEC §11 #26); order-scoped.
     let mut carried: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
+    if let Some(a) = amend {
+        carried.insert(a.tool.clone(), a.args.clone());
+    }
 
     loop {
         if Instant::now() >= deadline {
@@ -911,6 +1005,19 @@ async fn normal_path_loop(
         // tools that accept one (a `*_ref` parameter, SPEC §4.1): with the
         // full catalogue small models answer "I can't see the file" instead.
         let tools = match (routed, manifest) {
+            // An amendment offers its tool and the lookups only (SPEC §11 #26).
+            _ if amend.is_some() => {
+                let lookups = lookup_tools(st, &plugins);
+                schemas
+                    .iter()
+                    .filter(|s| {
+                        s["function"]["name"].as_str().is_some_and(|n| {
+                            amend.is_some_and(|a| a.tool == n) || lookups.contains(&n)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            }
             (Some(routed), _) => routed,
             (None, Some(_)) if dispatched_tool_calls == 0 => {
                 let narrowed = attachment_tools(&plugins, schemas);
@@ -946,20 +1053,22 @@ async fn normal_path_loop(
                     tracing::info!(tool = %call.name, "rescued text tool call");
                     let mut calls = vec![call];
                     repair_attachment_refs(&plugins, &mut calls, handles);
-                    let missing = clean_calls(&plugins, &mut calls, &mut carried);
+                    let mut missing = clean_calls(&plugins, &mut calls, &mut carried);
+                    let lookups =
+                        resolve_missing(st, &plugins, &mut calls, &mut missing, &mut carried).await;
                     dispatched_tool_calls += calls.len() as u32;
                     st.sessions.append(
                         &key,
                         crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
                     );
-                    for (call, missing) in calls.into_iter().zip(missing) {
+                    for ((call, missing), lookups) in calls.into_iter().zip(missing).zip(lookups) {
                         match dispatch_call(
                             st,
                             client_id,
                             order,
                             &plugins,
                             call,
-                            &missing,
+                            (&missing, &lookups),
                             &mut checks,
                         )
                         .await
@@ -1078,7 +1187,9 @@ async fn normal_path_loop(
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
                 repair_attachment_refs(&plugins, &mut calls, handles);
-                let missing = clean_calls(&plugins, &mut calls, &mut carried);
+                let mut missing = clean_calls(&plugins, &mut calls, &mut carried);
+                let lookups =
+                    resolve_missing(st, &plugins, &mut calls, &mut missing, &mut carried).await;
                 dispatched_tool_calls += calls.len() as u32;
                 // The model's own request, remembered — without this the next
                 // completion (even later in this same loop) sees only an
@@ -1087,9 +1198,17 @@ async fn normal_path_loop(
                     &key,
                     crate::model::ChatMessage::assistant_tool_calls(calls.clone()),
                 );
-                for (call, missing) in calls.into_iter().zip(missing) {
-                    match dispatch_call(st, client_id, order, &plugins, call, &missing, &mut checks)
-                        .await
+                for ((call, missing), lookups) in calls.into_iter().zip(missing).zip(lookups) {
+                    match dispatch_call(
+                        st,
+                        client_id,
+                        order,
+                        &plugins,
+                        call,
+                        (&missing, &lookups),
+                        &mut checks,
+                    )
+                    .await
                     {
                         Step::Done(response) => return Ok(*response),
                         Step::Continue { failed } => last_failed = failed,
@@ -1117,7 +1236,7 @@ async fn dispatch_call(
     order: &contract::Order,
     plugins: &PluginSet,
     call: crate::model::ToolCall,
-    missing: &[String],
+    (missing, lookups): (&[String], &Lookups),
     checks: &mut Vec<String>,
 ) -> Step {
     let key = (client_id.to_owned(), order.session_id.clone());
@@ -1137,7 +1256,7 @@ async fn dispatch_call(
     let result = if !missing.is_empty() {
         // A call that can only fail is never dispatched or proposed.
         tracing::info!(tool = %call.name, count = missing.len(), "required arguments empty; not dispatched");
-        missing_arguments(st, plugins, &call.name, missing).await
+        missing_message(&call.name, missing, lookups)
     } else if st.policy.is_destructive(&call.name, &call.args) {
         // Classification is model-authored ahead of time, never ahead of
         // this order (SPEC §4.2). Freeze the exact payload; NEVER dispatch
@@ -1254,17 +1373,14 @@ fn clean_calls(
         .collect()
 }
 
-/// Synthetic tool error for a call with empty required arguments. Matching
-/// read-only lookup tools that take no required argument are run here and
-/// their results attached, so the model only has to pick a value.
-async fn missing_arguments(
-    st: &Arc<AppState>,
-    plugins: &PluginSet,
-    tool: &str,
-    missing: &[String],
-) -> serde_json::Value {
+/// Lookup results by tool name.
+type Lookups = serde_json::Map<String, serde_json::Value>;
+
+/// Read-only tools that take no required argument: safe for the harness to
+/// run on the model's behalf (SPEC §11 #26).
+fn lookup_tools<'a>(st: &AppState, plugins: &'a PluginSet) -> Vec<&'a str> {
     let empty = serde_json::json!({});
-    let lookups: Vec<&str> = plugins
+    plugins
         .tool_schemas()
         .iter()
         .filter(|s| {
@@ -1276,25 +1392,85 @@ async fn missing_arguments(
         .filter(|n| {
             !st.policy.is_destructive(n, &empty) && st.policy.preview_of(n, &empty).is_none()
         })
-        .collect();
-    let mut results = serde_json::Map::new();
-    for param in missing {
-        let Some(lookup) = args::lookup_hint(param, lookups.iter().copied())
-            .into_iter()
-            .next()
-        else {
+        .collect()
+}
+
+/// The lookup tool for a parameter, if one matches its stem.
+fn lookup_for(param: &str, tools: &[&str]) -> Option<String> {
+    args::lookup_hint(param, tools.iter().copied())
+        .into_iter()
+        .next()
+}
+
+/// Runs the matching lookup of each parameter once.
+async fn run_lookups(st: &AppState, plugins: &PluginSet, params: &[String]) -> Lookups {
+    let tools = lookup_tools(st, plugins);
+    let mut results = Lookups::new();
+    for param in params {
+        let Some(lookup) = lookup_for(param, &tools) else {
             continue;
         };
         if results.contains_key(&lookup) {
             continue;
         }
-        if let Ok(result) = plugins.execute(&lookup, &empty).await
+        if let Ok(result) = plugins.execute(&lookup, &serde_json::json!({})).await
             && !looks_like_error(&result)
         {
             tracing::info!(tool = %lookup, "lookup run for a missing argument");
             results.insert(lookup, grounding::strip_checks(&result));
         }
     }
+    results
+}
+
+/// Fills each missing argument whose lookup returned exactly one valid id
+/// (SPEC §11 #26), before anything is logged or dispatched. Returns each
+/// call's lookup results for the arguments still missing.
+async fn resolve_missing(
+    st: &AppState,
+    plugins: &PluginSet,
+    calls: &mut [crate::model::ToolCall],
+    missing: &mut [Vec<String>],
+    carried: &mut std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<Lookups> {
+    let tools = lookup_tools(st, plugins);
+    let mut out = Vec::with_capacity(calls.len());
+    for (call, missing) in calls.iter_mut().zip(missing.iter_mut()) {
+        if missing.is_empty() {
+            out.push(Lookups::new());
+            continue;
+        }
+        let results = run_lookups(st, plugins, missing).await;
+        let params = plugins
+            .tool_schemas()
+            .iter()
+            .find(|s| s["function"]["name"] == call.name.as_str())
+            .map(|s| s["function"]["parameters"]["properties"].clone())
+            .unwrap_or_default();
+        missing.retain(|param| {
+            let id = lookup_for(param, &tools)
+                .and_then(|lookup| results.get(&lookup))
+                .and_then(|result| args::single_id(result, &params[param.as_str()]));
+            match (id, call.args.as_object_mut()) {
+                (Some(id), Some(obj)) => {
+                    tracing::info!(tool = %call.name, param = %param, "filled the only choice");
+                    obj.insert(param.clone(), serde_json::Value::String(id));
+                    false
+                }
+                _ => true,
+            }
+        });
+        if missing.is_empty() {
+            carried.remove(&call.name);
+        }
+        out.push(results);
+    }
+    out
+}
+
+/// Synthetic tool error for a call with empty required arguments, with the
+/// lookup results attached so the model only has to pick a value.
+fn missing_message(tool: &str, missing: &[String], results: &Lookups) -> serde_json::Value {
     let mut message = format!(
         "Required arguments missing, empty or invalid: {}.",
         missing.join(", ")

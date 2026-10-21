@@ -320,17 +320,27 @@ async fn false_claim_delivered_when_budget_exhausts_recovery() {
 struct PromptLogProvider {
     script: std::sync::Mutex<Vec<CompletionOutput>>,
     prompts: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    /// Names of the tools offered on each turn.
+    offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
 impl PromptLogProvider {
     fn new(script: Vec<CompletionOutput>) -> (Self, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let (provider, prompts, _) = Self::with_offered(script);
+        (provider, prompts)
+    }
+
+    fn with_offered(script: Vec<CompletionOutput>) -> (Self, Prompts, Prompts) {
         let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
         (
             Self {
                 script: std::sync::Mutex::new(script),
                 prompts: prompts.clone(),
+                offered: offered.clone(),
             },
             prompts,
+            offered,
         )
     }
 }
@@ -342,6 +352,12 @@ impl ModelProvider for PromptLogProvider {
             .lock()
             .unwrap()
             .push(req.messages.iter().map(|m| m.content.clone()).collect());
+        self.offered.lock().unwrap().push(
+            req.tools
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+                .collect(),
+        );
         let mut q = self.script.lock().unwrap();
         Ok(if q.len() > 1 {
             q.remove(0)
@@ -1591,6 +1607,7 @@ fn create_tx_schemas() -> Vec<serde_json::Value> {
                 "account_id": {"type": "string"},
                 "date": {"type": "string"},
                 "group_id": {"type": "string"},
+                "category_id": {"type": "string"},
                 "splits": {"type": "object",
                     "properties": {"members": {"type": "array", "minItems": 1}},
                     "required": ["members"]},
@@ -1599,6 +1616,13 @@ fn create_tx_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({"type": "function", "function": {
             "name": "securo.list_accounts", "description": "lists accounts",
             "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {
+            "name": "securo.list_categories", "description": "lists categories",
+            "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {
+            "name": "securo.propose_create_category", "description": "creates a category",
+            "parameters": {"type": "object", "properties": {"name": {"type": "string"}},
+                "required": ["name"]}}}),
     ]
 }
 
@@ -1608,7 +1632,16 @@ async fn decision_rig(
     script: Vec<CompletionOutput>,
     result: serde_json::Value,
 ) -> (SharedState, RecordingExecutor, Prompts) {
-    let (provider, prompts) = PromptLogProvider::new(script);
+    let (state, executor, prompts, _) = offered_rig(script, result).await;
+    (state, executor, prompts)
+}
+
+/// `decision_rig`, also logging the tools offered per turn.
+async fn offered_rig(
+    script: Vec<CompletionOutput>,
+    result: serde_json::Value,
+) -> (SharedState, RecordingExecutor, Prompts, Prompts) {
+    let (provider, prompts, offered) = PromptLogProvider::with_offered(script);
     let inner = RecordingExecutor::new(ExecBehavior::Ok(result));
     let state = build_state(
         test_config("http://127.0.0.1:1".into(), Duration::from_secs(600)),
@@ -1620,7 +1653,8 @@ async fn decision_rig(
     );
     pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
     pin_safe(&state, "securo.list_accounts").await;
-    (state, inner, prompts)
+    pin_safe(&state, "securo.list_categories").await;
+    (state, inner, prompts, offered)
 }
 
 async fn say(state: &SharedState, msg_id: &str, text: &str) -> serde_json::Value {
@@ -1649,7 +1683,7 @@ async fn empty_required_argument_is_not_dispatched_and_the_lookup_is_attached() 
             ),
             CompletionOutput::Final("Which account?".into()),
         ],
-        serde_json::json!({"items": [{"id": "acc-1"}]}),
+        serde_json::json!({"items": [{"id": "acc-1"}, {"id": "acc-2"}]}),
     )
     .await;
     let body = say(&state, "m1", "create it").await;
@@ -2056,5 +2090,116 @@ async fn nothing_is_carried_into_the_next_order() {
     assert_eq!(
         last_create(&executor),
         serde_json::json!({"amount": 250, "account_id": "a1"})
+    );
+}
+
+// ---- the only choice, and changing a cancelled proposal (SPEC §11 #26) ----
+
+#[tokio::test]
+async fn the_only_account_is_filled_without_another_model_turn() {
+    let (state, executor, prompts) = decision_rig(
+        vec![propose_call("call_1", serde_json::json!({"amount": 250}))],
+        serde_json::json!({"items": [{"id": "acc-1", "name": "Main"}], "total": 1}),
+    )
+    .await;
+    let body = say(&state, "m1", "250 for tacos, default account").await;
+    assert!(body["decision"].is_object(), "{body}");
+    assert_eq!(
+        executor.calls.lock().unwrap().clone(),
+        vec![
+            ("securo.list_accounts".to_owned(), serde_json::json!({})),
+            (
+                "securo.propose_create_transaction".to_owned(),
+                serde_json::json!({"amount": 250, "account_id": "acc-1"})
+            ),
+        ]
+    );
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "no model turn spent on it"
+    );
+}
+
+/// A cancelled Tacos card in session `s1`.
+async fn cancelled_tacos(
+    script: Vec<CompletionOutput>,
+) -> (SharedState, RecordingExecutor, Prompts, Prompts) {
+    let mut full = vec![propose_call("call_1", tacos())];
+    full.extend(script);
+    let (state, executor, prompts, offered) = offered_rig(full, resolved_preview()).await;
+    let card = say(&state, "m1", "250 for tacos").await;
+    let id = card["decision"]["id"]
+        .as_str()
+        .expect("decision")
+        .to_owned();
+    answer(
+        &state,
+        "m2",
+        serde_json::json!({"id": id, "value": "reject"}),
+    )
+    .await;
+    (state, executor, prompts, offered)
+}
+
+#[tokio::test]
+async fn naming_a_field_changes_the_cancelled_proposal() {
+    let (state, executor, prompts, offered) = cancelled_tacos(vec![propose_call(
+        "call_2",
+        serde_json::json!({"category_id": "c1"}),
+    )])
+    .await;
+    let body = say(&state, "m3", "Add a category").await;
+    assert!(body["decision"].is_object(), "{body}");
+    let mut expected = tacos();
+    expected["category_id"] = "c1".into();
+    let calls = executor.calls.lock().unwrap().clone();
+    assert_eq!(calls.last().unwrap().1, expected, "kept args, no apply");
+    assert!(calls.iter().any(|(t, _)| t == "securo.list_categories"));
+
+    let offered = offered.lock().unwrap();
+    let mut tools = offered.last().unwrap().clone();
+    tools.sort();
+    assert_eq!(
+        tools,
+        [
+            "securo.list_accounts",
+            "securo.list_categories",
+            "securo.propose_create_transaction"
+        ]
+    );
+    let prompts = prompts.lock().unwrap();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("The user is changing the proposal")
+                && m.contains("choices from `securo.list_categories`"))
+    );
+}
+
+#[tokio::test]
+async fn other_requests_after_a_cancel_are_not_amendments() {
+    let (state, _, prompts, offered) =
+        cancelled_tacos(vec![CompletionOutput::Final("Your balance is…".into())]).await;
+    say(&state, "m3", "show my balance").await;
+    assert_eq!(
+        offered.lock().unwrap().last().unwrap().len(),
+        create_tx_schemas().len()
+    );
+    assert!(
+        !prompts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("The user is changing"))
+    );
+    let again = say(&state, "m4", "Approve").await;
+    assert!(
+        again["decision"].is_object(),
+        "re-show still works: {again}"
     );
 }

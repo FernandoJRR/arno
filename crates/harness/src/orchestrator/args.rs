@@ -121,18 +121,47 @@ fn required(schema: &Value) -> Vec<String> {
 /// Tools among `candidates` whose (unnamespaced) name mentions the
 /// parameter's stem: `account_id` → `…list_accounts`.
 pub fn lookup_hint<'a>(param: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let stem = param
-        .strip_suffix("_ids")
-        .or_else(|| param.strip_suffix("_id"))
-        .unwrap_or(param);
-    let stem = stem.strip_suffix(['y', 's']).unwrap_or(stem);
-    if stem.len() < 3 {
+    let Some(stem) = stem(param) else {
         return Vec::new();
-    }
+    };
     candidates
         .filter(|name| name.rsplit('.').next().is_some_and(|n| n.contains(stem)))
         .map(str::to_owned)
         .collect()
+}
+
+/// A parameter's word stem: `category_id` → `categor`, `account_ids` →
+/// `account`, `date` → `date`. `None` below 3 characters.
+pub fn stem(param: &str) -> Option<&str> {
+    let s = param
+        .strip_suffix("_ids")
+        .or_else(|| param.strip_suffix("_id"))
+        .unwrap_or(param);
+    let s = s.strip_suffix(['y', 's']).unwrap_or(s);
+    (s.len() >= 3).then_some(s)
+}
+
+/// The id of the one entry a lookup returned, when it is valid for the
+/// parameter (SPEC §11 #26). The entries are the result itself or its only
+/// array field.
+pub fn single_id(result: &Value, param_schema: &Value) -> Option<String> {
+    let entries = match result {
+        Value::Array(a) => a,
+        Value::Object(o) => {
+            let mut arrays = o.values().filter_map(Value::as_array);
+            match (arrays.next(), arrays.next()) {
+                (Some(a), None) => a,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let [entry] = entries.as_slice() else {
+        return None;
+    };
+    let id = entry["id"].as_str()?;
+    let value = Value::String(id.to_owned());
+    (!is_empty(&value, param_schema) && !breaks_format(&value, param_schema)).then(|| id.to_owned())
 }
 
 #[cfg(test)]
@@ -237,6 +266,31 @@ mod tests {
         let before = args.clone();
         assert!(carry_over(&json!({}), &mut args, &params()).is_empty());
         assert_eq!(args, before);
+    }
+
+    #[test]
+    fn single_id_takes_the_only_valid_entry() {
+        let id = "d65cf7f5-6fcc-4ba1-a6e6-69fa850c4444";
+        let uuid = json!({"type": "string", "format": "uuid"});
+        let one = json!({"items": [{"id": id, "name": "Main"}], "total": 1});
+        assert_eq!(single_id(&one, &uuid).as_deref(), Some(id));
+        assert_eq!(
+            single_id(&json!([{"id": "a1"}]), &json!({})).as_deref(),
+            Some("a1")
+        );
+        let two = json!({"items": [{"id": id}, {"id": id}], "total": 2});
+        assert_eq!(single_id(&two, &uuid), None);
+        assert_eq!(single_id(&json!([{"id": "main"}]), &uuid), None, "format");
+        assert_eq!(single_id(&json!({"total": 1}), &uuid), None);
+        assert_eq!(single_id(&json!({"a": [], "b": []}), &uuid), None);
+    }
+
+    #[test]
+    fn stem_strips_id_suffixes_and_plurals() {
+        assert_eq!(stem("category_id"), Some("categor"));
+        assert_eq!(stem("account_ids"), Some("account"));
+        assert_eq!(stem("date"), Some("date"));
+        assert_eq!(stem("id"), None);
     }
 
     #[test]
