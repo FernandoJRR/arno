@@ -9,7 +9,7 @@
 //!   non-answer order supersedes the old one (`discard_session`).
 //! - The last unapproved action per session is remembered (`recent`) only so
 //!   it can be shown again under a new id (SPEC §11 #26); it is never taken.
-//! - `preview` is shown, never sent: execution dispatches `args` only
+//! - `shown` is displayed, never sent: execution dispatches `args` only
 //!   (SPEC §11 #27).
 
 use rand::TryRng;
@@ -24,9 +24,17 @@ pub struct PendingAction {
     pub args: serde_json::Value,
     /// Option values a `decision_answer` may carry for this decision.
     pub options: Vec<String>,
-    /// Backend preview of `args`, for the decision card only.
-    pub preview: Option<serde_json::Value>,
+    pub shown: Shown,
     pub created: Instant,
+}
+
+/// What the decision card shows beside `args`; never sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Shown {
+    /// The backend's preview of `args` (SPEC §11 #27).
+    pub preview: Option<serde_json::Value>,
+    /// Proposed in an order that read an attachment (SPEC §11 #29).
+    pub from_attachment: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,18 +83,18 @@ impl PendingStore {
         args: serde_json::Value,
         options: Vec<String>,
     ) -> String {
-        self.freeze_with_preview(client_id, session_id, tool, args, options, None)
+        self.freeze_shown(client_id, session_id, tool, args, options, Shown::default())
     }
 
-    /// `freeze`, keeping the backend's preview of `args` for display.
-    pub fn freeze_with_preview(
+    /// `freeze`, keeping what the card shows beside `args`.
+    pub fn freeze_shown(
         &self,
         client_id: &str,
         session_id: &str,
         tool: String,
         args: serde_json::Value,
         options: Vec<String>,
-        preview: Option<serde_json::Value>,
+        shown: Shown,
     ) -> String {
         let token = format!("dcs_{}", mint_token());
         let mut inner = self.0.lock().expect("pending lock");
@@ -99,7 +107,7 @@ impl PendingStore {
                 tool,
                 args,
                 options,
-                preview,
+                shown,
                 created: Instant::now(),
             },
         );
@@ -255,19 +263,20 @@ mod tests {
         let store = PendingStore::new();
         let ttl = Duration::from_secs(10);
         let preview = serde_json::json!({"proposed": {"date": "2026-10-19"}});
-        store.freeze_with_preview(
+        let shown = Shown {
+            preview: Some(preview),
+            from_attachment: true,
+        };
+        store.freeze_shown(
             "cli",
             "s",
             "t".into(),
             serde_json::json!({}),
             opts(),
-            Some(preview.clone()),
+            shown.clone(),
         );
         store.discard_session("cli", "s");
-        assert_eq!(
-            store.recent("cli", "s", ttl).unwrap().preview,
-            Some(preview)
-        );
+        assert_eq!(store.recent("cli", "s", ttl).unwrap().shown, shown);
     }
 
     #[test]
