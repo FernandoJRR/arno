@@ -41,6 +41,7 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         ollama_top_k: 1,
         ollama_num_predict: 400,
         ollama_timeout: Duration::from_secs(5),
+        ready_probe_timeout: Duration::from_secs(1),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
         max_tool_calls: 8,
@@ -154,6 +155,7 @@ fn build_state(
         policy,
         audit: Some(audit),
         transcript: Some(transcript),
+        model_health: Default::default(),
     });
     // Same topology as production main(): a live FIFO worker consumes jobs.
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
@@ -2522,4 +2524,88 @@ async fn a_read_after_a_photo_is_not_filled_and_no_photo_means_no_fill() {
     say(&state, "m3", "110 for pizza").await;
     let previews = calls_to(&executor, "securo.propose_create_transaction");
     assert!(previews[0].get("date").is_none(), "{previews:?}");
+}
+
+// ---- /v1/ready (SPEC §11 #31) ----
+
+/// Answers or times out like a model on CPU; its probe reports `gpu_share`.
+struct OnCpu {
+    gpu_share: Option<f32>,
+    timeout: bool,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for OnCpu {
+    async fn complete(&self, _req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
+        if self.timeout {
+            Err(ModelError::Timeout)
+        } else {
+            Ok(CompletionOutput::Final("ok".into()))
+        }
+    }
+
+    async fn probe(&self) -> harness::model::ModelProbe {
+        harness::model::ModelProbe {
+            reachable: true,
+            gpu_share: self.gpu_share,
+        }
+    }
+}
+
+fn ready_state(provider: OnCpu) -> SharedState {
+    build_state(
+        test_config("http://127.0.0.1:1".into(), Duration::from_secs(10)),
+        Arc::new(provider),
+        Arc::new(harness::orchestrator::NoBackends),
+    )
+}
+
+#[tokio::test]
+async fn ready_requires_auth() {
+    let state = ready_state(OnCpu {
+        gpu_share: None,
+        timeout: false,
+    });
+    let (status, _) = get_json(api_router(state), "/v1/ready", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn ready_is_200_when_nothing_is_wrong() {
+    let state = ready_state(OnCpu {
+        gpu_share: Some(1.0),
+        timeout: false,
+    });
+    let (status, body) = get_json(api_router(state), "/v1/ready", Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["issues"], serde_json::json!([]));
+    assert_eq!(body["model"]["reachable"], true);
+}
+
+#[tokio::test]
+async fn a_model_on_cpu_that_timed_out_is_degraded() {
+    let state = ready_state(OnCpu {
+        gpu_share: Some(0.0),
+        timeout: true,
+    });
+    let body = serde_json::json!({"session_id": "s1", "text": "hi"});
+    let (status, err) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{err}");
+    let (status, body) = get_json(api_router(state), "/v1/ready", Some("tok-cli")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(
+        body["issues"],
+        serde_json::json!(["model_on_cpu", "model_timed_out"])
+    );
+    assert_eq!(body["model"]["last_timed_out"], true);
+    // Parses as the shared wire type adapters read.
+    let parsed: contract::Readiness = serde_json::from_value(body).unwrap();
+    assert_eq!(parsed.status, contract::ReadyStatus::Degraded);
 }

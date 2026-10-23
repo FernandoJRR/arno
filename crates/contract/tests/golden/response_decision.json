@@ -1,0 +1,20 @@
+{
+  "text": "This would run `x.create`: Amount: 110. Approve or cancel it.",
+  "needs_confirmation": true,
+  "confirmation_token": "dcs_1",
+  "structured": [
+    {"tool": "x.list", "args": {"limit": 1}, "result": {"items": []}}
+  ],
+  "decision": {
+    "id": "dcs_1",
+    "kind": "confirm",
+    "prompt": "This would run `x.create`.",
+    "details": [{"label": "Amount", "value": "110"}],
+    "options": [
+      {"value": "approve", "title": "Approve", "style": "primary"},
+      {"value": "reject", "title": "Cancel", "style": "danger"}
+    ],
+    "free_text": true,
+    "expires_at": "2026-10-23T04:00:00Z"
+  }
+}

@@ -14,6 +14,7 @@ use contract::{ErrorCode, Order};
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/ready", get(ready))
         .route("/v1/orders", post(orders))
         .route("/v1/logs/verify", get(logs_verify))
         .with_state(state)
@@ -21,6 +22,17 @@ pub fn router(state: SharedState) -> Router {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Readiness (SPEC §11 #31): 200 when ready, 503 otherwise, same body.
+async fn ready(_auth: AuthedClient, State(state): State<SharedState>) -> impl IntoResponse {
+    let report = crate::api::ready::readiness(&state).await;
+    let code = if report.status == contract::ReadyStatus::Ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(report))
 }
 
 /// Full-chain verification of the audit log and transcript (SPEC §11 decision

@@ -84,6 +84,8 @@ pub struct Config {
     /// answer is marked. 0 = provider default.
     pub ollama_num_predict: u32,
     pub ollama_timeout: Duration,
+    /// Bounds the `/v1/ready` model probe (SPEC §11 #31).
+    pub ready_probe_timeout: Duration,
     pub mcp_tool_timeout: Duration,
     pub order_budget: Duration,
     pub max_tool_calls: u32,
@@ -181,6 +183,7 @@ impl Config {
             ollama_top_k: u32_var("OLLAMA_TOP_K", 1)?,
             ollama_num_predict: u32_var("OLLAMA_NUM_PREDICT", 400)?,
             ollama_timeout: duration_secs("OLLAMA_TIMEOUT_S", 120)?,
+            ready_probe_timeout: duration_secs("READY_PROBE_TIMEOUT_S", 5)?,
             mcp_tool_timeout: duration_secs("MCP_TOOL_TIMEOUT_S", 30)?,
             order_budget: duration_secs("ORDER_BUDGET_S", 180)?,
             max_tool_calls: u32_var("MAX_TOOL_CALLS", 8)?,
@@ -256,6 +259,7 @@ const KNOWN_VARS: &[&str] = &[
     "OLLAMA_TOP_K",
     "OLLAMA_NUM_PREDICT",
     "OLLAMA_TIMEOUT_S",
+    "READY_PROBE_TIMEOUT_S",
     "MCP_TOOL_TIMEOUT_S",
     "MCP_SERVERS",
     "PLUGINS_DIR",
@@ -610,6 +614,7 @@ mod tests {
             "OLLAMA_TOP_K",
             "OLLAMA_NUM_PREDICT",
             "OLLAMA_TIMEOUT_S",
+            "READY_PROBE_TIMEOUT_S",
             "MCP_TOOL_TIMEOUT_S",
             "MCP_SERVERS",
             "PLUGINS_DIR",

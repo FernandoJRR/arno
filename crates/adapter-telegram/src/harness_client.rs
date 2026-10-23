@@ -1,7 +1,7 @@
-//! Thin HTTP client for Contract 1 (SPEC §4.1) — `POST /v1/orders` only,
-//! bearer-authenticated with this adapter's own client token.
+//! Thin HTTP client for Contract 1 (SPEC §4.1) — `POST /v1/orders` and
+//! `GET /v1/ready`, bearer-authenticated with this adapter's own client token.
 
-use contract::{ErrorBody, ErrorCode, Order, Response};
+use contract::{ErrorBody, ErrorCode, Order, Readiness, Response};
 
 pub struct HarnessClient {
     http: reqwest::Client,
@@ -41,6 +41,19 @@ impl HarnessClient {
                 resp.json::<ErrorBody>().await?.error_code,
             ))
         }
+    }
+
+    /// The harness's readiness report (SPEC §11 #31), sent with 200 or 503;
+    /// None when it cannot be read.
+    pub async fn readiness(&self) -> Option<Readiness> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/ready", self.base_url.trim_end_matches('/')))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .ok()?;
+        resp.json::<Readiness>().await.ok()
     }
 }
 
@@ -98,5 +111,31 @@ mod tests {
             OrderOutcome::Rejected(code) => assert_eq!(code, ErrorCode::DuplicateOrder),
             OrderOutcome::Ok(_) => panic!("expected rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_is_read_from_200_and_503_and_garbage_is_none() {
+        let body = serde_json::json!({"status": "degraded", "issues": ["model_on_cpu"],
+            "model": {"name": "m", "reachable": true, "gpu_share": 0.0}});
+        for status in [200, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/ready"))
+                .and(header("authorization", "Bearer tok"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(&body))
+                .mount(&server)
+                .await;
+            let client = HarnessClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+            let report = client.readiness().await.expect("parsed");
+            assert_eq!(report.issues, ["model_on_cpu"]);
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ready"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = HarnessClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+        assert!(client.readiness().await.is_none());
     }
 }

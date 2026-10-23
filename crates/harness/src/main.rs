@@ -40,15 +40,18 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
 
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<queue::Job>(64);
 
-    let provider = Arc::new(OllamaProvider::new(
-        cfg.ollama_url.clone(),
-        cfg.model.clone(),
-        cfg.ollama_timeout,
-        cfg.ollama_think,
-        cfg.ollama_seed,
-        cfg.ollama_top_k,
-        cfg.ollama_num_predict,
-    ));
+    let provider = Arc::new(
+        OllamaProvider::new(
+            cfg.ollama_url.clone(),
+            cfg.model.clone(),
+            cfg.ollama_timeout,
+            cfg.ollama_think,
+            cfg.ollama_seed,
+            cfg.ollama_top_k,
+            cfg.ollama_num_predict,
+        )
+        .with_probe_timeout(cfg.ready_probe_timeout),
+    );
     // Fail fast on manifest errors and unreachable legacy backends; a broken
     // manifest plugin is skipped and reported instead (SPEC §11 #21).
     let plugin_set = harness::plugins::load(&LoadSpec::from_config(&cfg))
@@ -109,7 +112,9 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         policy,
         audit: Some(audit),
         transcript: Some(transcript),
+        model_health: Default::default(),
     });
+    api::ready::log(&api::ready::readiness(&state).await);
     spawn_reload_on_sighup(order_tx.clone());
     drop(order_tx); // router holds its clone; keep only one producer handle alive in state
 

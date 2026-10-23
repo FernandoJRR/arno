@@ -25,6 +25,7 @@ services:
       # Raised from 120s: a cold model load alone can take ~42s, and a real
       # order adds prompt + tool schemas + history on top.
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-180}
+      READY_PROBE_TIMEOUT_S: ${READY_PROBE_TIMEOUT_S:-5}
       # Plugins (SPEC §4.5, §11 #21): one manifest + optional env file per
       # MCP backend in ./config/plugins. Secrets stay in those env files and
       # never enter this environment.

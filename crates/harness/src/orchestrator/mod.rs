@@ -1124,12 +1124,10 @@ async fn normal_path_loop(
             context_tokens: st.cfg.num_ctx,
             format: None,
         };
-        match st
-            .provider
-            .complete(req)
-            .await
-            .map_err(model_error_to_api)?
-        {
+        let started = Instant::now();
+        let output = st.provider.complete(req).await;
+        record_model_call(st, started, &output);
+        match output.map_err(model_error_to_api)? {
             crate::model::CompletionOutput::Final(text) => {
                 // Rescue FIRST (SPEC §11 decision #16): a Final reply whose
                 // body contains exactly one tool-call-shaped JSON object is
@@ -1695,6 +1693,26 @@ fn render_args(args: &serde_json::Value) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         _ => "no arguments".to_owned(),
+    }
+}
+
+/// The last call's timing for `/v1/ready`; a timeout also probes the model
+/// in the background, so the log names the cause (SPEC §11 #31).
+fn record_model_call<T>(
+    st: &Arc<AppState>,
+    started: Instant,
+    output: &Result<T, crate::model::ModelError>,
+) {
+    let timed_out = matches!(output, Err(crate::model::ModelError::Timeout));
+    st.model_health.record(crate::state::LastCall {
+        elapsed_ms: Some(started.elapsed().as_millis() as u64),
+        timed_out,
+    });
+    if timed_out {
+        let st = st.clone();
+        tokio::spawn(async move {
+            crate::api::ready::log(&crate::api::ready::readiness(&st).await);
+        });
     }
 }
 

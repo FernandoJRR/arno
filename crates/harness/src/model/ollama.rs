@@ -7,8 +7,8 @@
 //! Nothing outside this module may speak HTTP to a model provider.
 
 use crate::model::{
-    ChatMessage, CompletionOutput, CompletionRequest, CompletionStats, ModelError, ModelProvider,
-    Role, ToolCall,
+    ChatMessage, CompletionOutput, CompletionRequest, CompletionStats, ModelError, ModelProbe,
+    ModelProvider, Role, ToolCall,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -17,6 +17,9 @@ use std::time::Duration;
 pub struct OllamaProvider {
     http: reqwest::Client,
     chat_url: String,
+    /// `/api/ps`, on its own short-timeout client (SPEC §11 #31).
+    probe_http: reqwest::Client,
+    ps_url: String,
     model: String,
     think: ThinkMode,
     /// 0 = provider default; else fixed seed for deterministic tool
@@ -87,16 +90,24 @@ impl OllamaProvider {
             .timeout(timeout)
             .build()
             .expect("reqwest client builds");
-        let chat_url = format!("{}/api/chat", base_url.to_string().trim_end_matches('/'));
+        let base = base_url.to_string().trim_end_matches('/').to_owned();
         Self {
             http,
-            chat_url,
+            chat_url: format!("{base}/api/chat"),
+            probe_http: probe_client(timeout),
+            ps_url: format!("{base}/api/ps"),
             model: model.into(),
             think,
             seed,
             top_k,
             num_predict,
         }
+    }
+
+    /// Bounds the readiness probe (`READY_PROBE_TIMEOUT_S`).
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.probe_http = probe_client(timeout);
+        self
     }
 
     /// Body construction is pure so the request shape stays unit-testable.
@@ -148,6 +159,23 @@ impl OllamaProvider {
     }
 }
 
+fn probe_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client builds")
+}
+
+/// GPU share of `model` in an `/api/ps` body: `size_vram / size`.
+fn gpu_share(ps: &Value, model: &str) -> Option<f32> {
+    let entry = ps["models"]
+        .as_array()?
+        .iter()
+        .find(|m| m["name"] == model || m["model"] == model)?;
+    let size = entry["size"].as_u64().filter(|s| *s > 0)?;
+    Some((entry["size_vram"].as_u64().unwrap_or(0) as f64 / size as f64) as f32)
+}
+
 /// Low temperature for tool selection (SPEC §5.4); not a timeout/retry knob.
 const TOOL_SELECTION_TEMPERATURE: f32 = 0.2;
 
@@ -158,6 +186,23 @@ const TOOL_SELECTION_REPEAT_PENALTY: f32 = 1.05;
 impl ModelProvider for OllamaProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError> {
         self.complete_with_stats(req).await.map(|(out, _)| out)
+    }
+
+    async fn probe(&self) -> ModelProbe {
+        let ps = match self.probe_http.get(&self.ps_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.ok(),
+            _ => None,
+        };
+        match ps {
+            Some(ps) => ModelProbe {
+                reachable: true,
+                gpu_share: gpu_share(&ps, &self.model),
+            },
+            None => ModelProbe {
+                reachable: false,
+                gpu_share: None,
+            },
+        }
     }
 
     async fn complete_with_stats(
@@ -296,6 +341,60 @@ fn map_transport(e: reqwest::Error) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(url: &str) -> OllamaProvider {
+        OllamaProvider::new(
+            url.parse().unwrap(),
+            "qwen3:4b",
+            Duration::from_secs(5),
+            ThinkMode::Off,
+            0,
+            0,
+            0,
+        )
+        .with_probe_timeout(Duration::from_secs(2))
+    }
+
+    async fn ps_server(body: Value) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn probe_reads_the_gpu_share_of_the_configured_model() {
+        let server = ps_server(json!({"models": [
+            {"name": "other", "size": 10, "size_vram": 10},
+            {"name": "qwen3:4b", "size": 5_109_197_044u64, "size_vram": 0}]}))
+        .await;
+        let probe = provider(&server.uri()).probe().await;
+        assert_eq!(
+            probe,
+            ModelProbe {
+                reachable: true,
+                gpu_share: Some(0.0)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_of_an_unloaded_model_has_no_share() {
+        let server = ps_server(json!({"models": []})).await;
+        let probe = provider(&server.uri()).probe().await;
+        assert!(probe.reachable);
+        assert_eq!(probe.gpu_share, None);
+    }
+
+    #[tokio::test]
+    async fn probe_of_a_down_server_is_unreachable() {
+        let probe = provider("http://127.0.0.1:1").probe().await;
+        assert!(!probe.reachable);
+    }
 
     #[test]
     fn think_mode_parses_documented_values_case_insensitively() {

@@ -1,0 +1,15 @@
+[
+  {"error_code": "unauthorized", "status": 401},
+  {"error_code": "invalid_order", "status": 400},
+  {"error_code": "unknown_session", "status": 404},
+  {"error_code": "duplicate_order", "status": 409},
+  {"error_code": "confirmation_unknown", "status": 404},
+  {"error_code": "confirmation_expired", "status": 410},
+  {"error_code": "confirmation_used", "status": 409},
+  {"error_code": "order_budget_exceeded", "status": 504},
+  {"error_code": "backend_unavailable", "status": 503},
+  {"error_code": "decision_unknown", "status": 404},
+  {"error_code": "decision_expired", "status": 410},
+  {"error_code": "decision_used", "status": 409},
+  {"error_code": "decision_invalid_value", "status": 400}
+]

@@ -4,7 +4,7 @@
 //! Decisions (SPEC §4.3) are answered with `decision_answer`; the adapter
 //! never sends `confirmation_token`.
 
-use contract::{Attachment, DecisionAnswer, ErrorCode, Order};
+use contract::{Attachment, DecisionAnswer, ErrorCode, Order, Readiness, issue};
 
 /// Builds the next `Order` for a chat. `decision_answer` is set only when the
 /// user tapped a decision button or typed the free-text answer.
@@ -70,6 +70,26 @@ pub fn render_error(code: ErrorCode) -> String {
     }
 }
 
+/// Codes a readiness report can explain (SPEC §11 #31).
+pub fn explains_outage(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::BackendUnavailable | ErrorCode::OrderBudgetExceeded
+    )
+}
+
+/// One line for the first readiness issue this adapter knows.
+pub fn outage_reason(report: &Readiness) -> Option<&'static str> {
+    report.issues.iter().find_map(|code| match code.as_str() {
+        issue::MODEL_ON_CPU | issue::MODEL_PARTLY_ON_CPU => {
+            Some("The model server is running without its GPU, so replies are too slow right now.")
+        }
+        issue::MODEL_UNREACHABLE => Some("The model server can't be reached."),
+        issue::PLUGIN_FAILED => Some("A tool backend failed to start."),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +137,40 @@ mod tests {
             };
             assert_eq!(att.decoded_bytes().unwrap(), Some(input.to_vec()));
         }
+    }
+
+    fn report(issues: &[&str]) -> Readiness {
+        Readiness {
+            status: contract::ReadyStatus::Degraded,
+            issues: issues.iter().map(|i| (*i).to_owned()).collect(),
+            model: contract::ModelReadiness {
+                name: "m".into(),
+                reachable: true,
+                gpu_share: Some(0.0),
+                last_elapsed_ms: None,
+                last_timed_out: true,
+            },
+            plugins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn outage_reason_names_the_first_known_issue() {
+        assert_eq!(
+            outage_reason(&report(&[
+                "something_new",
+                "model_on_cpu",
+                "model_timed_out"
+            ])),
+            Some("The model server is running without its GPU, so replies are too slow right now.")
+        );
+        assert_eq!(
+            outage_reason(&report(&["model_unreachable"])),
+            Some("The model server can't be reached.")
+        );
+        assert_eq!(outage_reason(&report(&["model_timed_out"])), None);
+        assert!(explains_outage(ErrorCode::BackendUnavailable));
+        assert!(!explains_outage(ErrorCode::DuplicateOrder));
     }
 
     #[test]

@@ -271,6 +271,7 @@ fn config(dir: &Path, router_enabled: bool) -> Config {
         ollama_top_k: 1,
         ollama_num_predict: 400,
         ollama_timeout: Duration::from_secs(5),
+        ready_probe_timeout: Duration::from_secs(1),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
         max_tool_calls: 8,
@@ -323,6 +324,7 @@ async fn boot(cfg: Config, model: Arc<Model>) -> SharedState {
         policy,
         audit: None,
         transcript: Some(transcript),
+        model_health: Default::default(),
     });
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
     state

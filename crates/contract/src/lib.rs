@@ -280,6 +280,60 @@ pub struct ErrorBody {
     pub error_code: ErrorCode,
 }
 
+/// `GET /v1/ready` body (SPEC §11 #31): whether orders can be served now.
+/// Names and codes only, never payloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Readiness {
+    pub status: ReadyStatus,
+    /// Codes from [`issue`]; adapters ignore codes they do not know.
+    #[serde(default)]
+    pub issues: Vec<String>,
+    pub model: ModelReadiness,
+    #[serde(default)]
+    pub plugins: Vec<PluginReadiness>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyStatus {
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelReadiness {
+    pub name: String,
+    pub reachable: bool,
+    /// Share of the loaded model held on a GPU; absent when unknown or not
+    /// loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_share: Option<f32>,
+    /// The last order's model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub last_timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginReadiness {
+    pub id: String,
+    /// `ready` or `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+}
+
+/// Readiness issue codes (SPEC §11 #31). Additive, never repurposed.
+pub mod issue {
+    pub const MODEL_UNREACHABLE: &str = "model_unreachable";
+    pub const MODEL_ON_CPU: &str = "model_on_cpu";
+    pub const MODEL_PARTLY_ON_CPU: &str = "model_partly_on_cpu";
+    pub const MODEL_TIMED_OUT: &str = "model_timed_out";
+    pub const PLUGIN_FAILED: &str = "plugin_failed";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

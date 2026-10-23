@@ -1,0 +1,12 @@
+{
+  "status": "degraded",
+  "issues": ["model_on_cpu", "model_timed_out"],
+  "model": {
+    "name": "qwen3:4b",
+    "reachable": true,
+    "gpu_share": 0.0,
+    "last_elapsed_ms": 180000,
+    "last_timed_out": true
+  },
+  "plugins": [{"id": "ocr", "status": "ready", "trust": "trusted"}]
+}

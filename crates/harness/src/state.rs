@@ -30,6 +30,28 @@ pub struct AppState {
     /// Persistent conversation/tool-call transcript (SPEC §12.2). Always
     /// present in production; `None` only in tests that don't exercise it.
     pub transcript: Option<TranscriptLog>,
+    /// The last order's model call, for `/v1/ready` (SPEC §11 #31).
+    pub model_health: ModelHealth,
+}
+
+/// In-memory, like every other store (AGENTS.md #7).
+#[derive(Default)]
+pub struct ModelHealth(std::sync::Mutex<LastCall>);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastCall {
+    pub elapsed_ms: Option<u64>,
+    pub timed_out: bool,
+}
+
+impl ModelHealth {
+    pub fn record(&self, call: LastCall) {
+        *self.0.lock().expect("model health lock") = call;
+    }
+
+    pub fn last(&self) -> LastCall {
+        *self.0.lock().expect("model health lock")
+    }
 }
 
 pub type SharedState = std::sync::Arc<AppState>;

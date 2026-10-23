@@ -87,6 +87,14 @@ pub struct CompletionRequest {
     pub format: Option<Value>,
 }
 
+/// What a readiness probe found (SPEC §11 #31).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelProbe {
+    pub reachable: bool,
+    /// Share of the loaded model on a GPU; None when unknown or not loaded.
+    pub gpu_share: Option<f32>,
+}
+
 /// Prompt/latency figures for measurement (the replay tool); never content.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CompletionStats {
@@ -121,6 +129,15 @@ pub enum ModelError {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionOutput, ModelError>;
+
+    /// Readiness probe (SPEC §11 #31), without a completion. Providers that
+    /// cannot tell report reachable with an unknown placement.
+    async fn probe(&self) -> ModelProbe {
+        ModelProbe {
+            reachable: true,
+            gpu_share: None,
+        }
+    }
 
     /// Same as [`Self::complete`], plus stats when the provider reports them.
     async fn complete_with_stats(

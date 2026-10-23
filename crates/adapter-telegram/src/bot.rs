@@ -19,7 +19,7 @@ use teloxide::update_listeners::{AsUpdateStream, Polling};
 use crate::config::Config;
 use crate::decision::{DecisionKeys, Resolved, render_decision};
 use crate::harness_client::{HarnessClient, OrderOutcome};
-use crate::order::{build_order, encode_base64, render_error};
+use crate::order::{build_order, encode_base64, explains_outage, outage_reason, render_error};
 
 /// Telegram always re-encodes `photo`-type sends as JPEG. Must match
 /// `ALLOWED_IMAGE_MIMES` in `crates/harness/src/stores/attachments.rs`
@@ -146,7 +146,7 @@ async fn on_message(
         decision_answer,
     );
     let outcome = client.send_order(&order).await;
-    reply(bot, keys, msg.chat.id, outcome).await;
+    reply(bot, client, keys, msg.chat.id, outcome).await;
 }
 
 async fn on_callback(
@@ -197,22 +197,32 @@ async fn on_callback(
                 }),
             );
             let outcome = client.send_order(&order).await;
-            reply(bot, keys, chat, outcome).await;
+            reply(bot, client, keys, chat, outcome).await;
         }
     }
 }
 
 /// Renders a harness outcome: a decision gets its keyboard, errors get
-/// terse code-derived text.
+/// terse code-derived text, explained by readiness when it can say why.
 async fn reply(
     bot: &Bot,
+    client: &HarnessClient,
     keys: &mut DecisionKeys,
     chat: ChatId,
     outcome: Result<OrderOutcome, reqwest::Error>,
 ) {
     let (text, markup) = match outcome {
         Ok(OrderOutcome::Ok(resp)) => render_response(keys, chat.0, *resp),
-        Ok(OrderOutcome::Rejected(code)) => (render_error(code), None),
+        Ok(OrderOutcome::Rejected(code)) => {
+            let mut text = render_error(code);
+            if explains_outage(code)
+                && let Some(why) = client.readiness().await.as_ref().and_then(outage_reason)
+            {
+                text.push(' ');
+                text.push_str(why);
+            }
+            (text, None)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "harness API request failed");
             (
