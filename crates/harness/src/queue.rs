@@ -51,9 +51,30 @@ pub async fn spawn_worker(state: SharedState, mut rx: tokio::sync::mpsc::Receive
 }
 
 async fn run_order(state: &SharedState, job: OrderJob) {
-    let result = orchestrator::handle(state, &job.client_id, job.order).await;
+    use tracing::Instrument;
+    // SPEC §11 #32: steps published while the order runs carry its id.
+    let order = crate::events::OrderRef {
+        order_id: crate::events::new_order_id(),
+        client_id: job.client_id.clone(),
+        session_id: job.order.session_id.clone(),
+        client_msg_id: job.order.client_msg_id.clone(),
+    };
+    let span = tracing::info_span!("order", order_id = %order.order_id);
+    let result = crate::events::scope(
+        order.clone(),
+        orchestrator::handle(state, &job.client_id, job.order),
+    )
+    .instrument(span)
+    .await;
+    let duplicate = matches!(&result, Err(e) if e.0 == contract::ErrorCode::DuplicateOrder);
+    if !duplicate {
+        crate::events::publish(&state.events, &order, contract::EventKind::Done);
+    }
     let outcome = match result {
-        Ok(response) => Outcome::Ok(Box::new(response)),
+        Ok(mut response) => {
+            response.order_id = Some(order.order_id);
+            Outcome::Ok(Box::new(response))
+        }
         Err(err) => {
             tracing::info!(code = err.0.as_str(), "order rejected");
             Outcome::Err(err)

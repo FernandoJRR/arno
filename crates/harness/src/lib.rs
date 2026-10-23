@@ -7,6 +7,7 @@ pub mod api;
 pub mod audit;
 pub mod chains;
 pub mod config;
+pub mod events;
 pub mod mcp;
 pub mod model;
 pub mod orchestrator;

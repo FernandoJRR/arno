@@ -15,6 +15,7 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
+        .route("/v1/events", get(events))
         .route("/v1/orders", post(orders))
         .route("/v1/logs/verify", get(logs_verify))
         .with_state(state)
@@ -34,6 +35,46 @@ async fn ready(_auth: AuthedClient, State(state): State<SharedState>) -> impl In
     };
     (code, Json(report))
 }
+
+/// This client's events as SSE (SPEC §11 #32). `Last-Event-ID` replays
+/// what is still kept after that id; the stream then goes live.
+async fn events(
+    auth: AuthedClient,
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    use axum::response::sse::{Event as Frame, KeepAlive, Sse};
+    let after = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let (replay, rx) = state.events.subscribe(&auth.0, after);
+    let frame = |p: crate::events::Published| {
+        Frame::default()
+            .id(p.id.to_string())
+            .event(p.event.kind.name())
+            .json_data(&*p.event)
+    };
+    let live = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(p) => return Some((p, rx)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "event subscriber lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    let stream = futures::StreamExt::map(
+        futures::StreamExt::chain(futures::stream::iter(replay), live),
+        frame,
+    );
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+}
+
+/// SSE comment interval: keeps idle proxies from closing the stream.
+const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Full-chain verification of the audit log and transcript (SPEC §11 decision
 /// #15). Bearer-authed like every other route; returns counts and chain heads

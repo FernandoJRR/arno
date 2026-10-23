@@ -32,6 +32,8 @@ pub struct AppState {
     pub transcript: Option<TranscriptLog>,
     /// The last order's model call, for `/v1/ready` (SPEC §11 #31).
     pub model_health: ModelHealth,
+    /// `GET /v1/events` (SPEC §11 #32).
+    pub events: crate::events::EventHub,
 }
 
 /// In-memory, like every other store (AGENTS.md #7).

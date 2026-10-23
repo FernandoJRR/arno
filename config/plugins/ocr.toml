@@ -18,6 +18,7 @@ attachment_params = ["image_ref"]
 [[groups]]
 id = "read"
 when = "Read the text in an attached image, photo, bill or receipt"
+progress = "Reading the image…"
 tools = ["extract_text"]
 # Photo of a bill -> OCR -> record it as an expense.
 related = ["securo.transactions", "securo.accounts"]

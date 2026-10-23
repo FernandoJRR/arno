@@ -5,8 +5,11 @@
 mod bot;
 mod config;
 mod decision;
+mod events;
 mod harness_client;
 mod order;
+mod sse;
+mod status;
 
 use harness_client::HarnessClient;
 use teloxide::prelude::*;

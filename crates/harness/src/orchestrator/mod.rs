@@ -640,6 +640,7 @@ async fn prefill_attachments(
                 Shown::default(),
             )));
         }
+        step(st, plugins, &call.name);
         let result = plugins
             .execute(&call.name, &call.args)
             .await
@@ -1124,6 +1125,7 @@ async fn normal_path_loop(
             context_tokens: st.cfg.num_ctx,
             format: None,
         };
+        crate::events::progress(&st.events, THINKING);
         let started = Instant::now();
         let output = st.provider.complete(req).await;
         record_model_call(st, started, &output);
@@ -1369,12 +1371,13 @@ async fn dispatch_call(
         // acting argument is previewed first (SPEC §11 #27): only the
         // preview runs, and a failing one goes back to the model.
         let preview = match st.policy.preview_args(&call.name, &call.args) {
-            Some(preview_args) => Some(
+            Some(preview_args) => Some({
+                step(st, plugins, &call.name);
                 plugins
                     .execute(&call.name, &preview_args)
                     .await
-                    .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned())),
-            ),
+                    .unwrap_or_else(|code| serde_json::Value::String(code.as_str().to_owned()))
+            }),
             None => None,
         };
         match preview {
@@ -1400,6 +1403,7 @@ async fn dispatch_call(
             }
         }
     } else {
+        step(st, plugins, &call.name);
         plugins
             .execute(&call.name, &call.args)
             .await
@@ -1539,6 +1543,7 @@ async fn run_lookups(st: &AppState, plugins: &PluginSet, params: &[String]) -> L
         if results.contains_key(&lookup) {
             continue;
         }
+        step(st, plugins, &lookup);
         if let Ok(result) = plugins.execute(&lookup, &serde_json::json!({})).await
             && !looks_like_error(&result)
         {
@@ -1694,6 +1699,14 @@ fn render_args(args: &serde_json::Value) -> String {
             .join(", "),
         _ => "no arguments".to_owned(),
     }
+}
+
+/// Shown while the model works (SPEC §11 #32); harness-worded, generic.
+const THINKING: &str = "Thinking…";
+
+/// Publishes the step for a tool about to run (SPEC §11 #32).
+fn step(st: &AppState, plugins: &PluginSet, tool: &str) {
+    crate::events::progress(&st.events, &plugins.progress_label(tool));
 }
 
 /// The last call's timing for `/v1/ready`; a timeout also probes the model

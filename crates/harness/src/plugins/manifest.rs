@@ -12,6 +12,7 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub const WHEN_MAX: usize = 80;
 pub const HOW_MAX: usize = 400;
 pub const NAME_MAX: usize = 80;
+pub const PROGRESS_MAX: usize = 60;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +115,9 @@ pub struct Group {
     pub tools: Vec<String>,
     #[serde(default)]
     pub related: Vec<String>,
+    /// Step shown while one of these tools runs (SPEC §11 #32). Display only.
+    #[serde(default)]
+    pub progress: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +190,7 @@ impl Manifest {
         for g in &mut m.groups {
             g.when = sanitize(&g.when, WHEN_MAX);
             g.how = sanitize(&g.how, HOW_MAX);
+            g.progress = sanitize(&g.progress, PROGRESS_MAX);
         }
         Ok(m)
     }

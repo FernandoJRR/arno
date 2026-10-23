@@ -26,6 +26,8 @@ services:
       # order adds prompt + tool schemas + history on top.
       OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-180}
       READY_PROBE_TIMEOUT_S: ${READY_PROBE_TIMEOUT_S:-5}
+      EVENTS_REPLAY_MAX: ${EVENTS_REPLAY_MAX:-64}
+      EVENTS_REPLAY_S: ${EVENTS_REPLAY_S:-300}
       # Plugins (SPEC §4.5, §11 #21): one manifest + optional env file per
       # MCP backend in ./config/plugins. Secrets stay in those env files and
       # never enter this environment.
@@ -144,6 +146,7 @@ services:
       ALLOWED_CHAT_IDS: ${ALLOWED_CHAT_IDS:?set in .env}
       HARNESS_API_URL: http://harness:${HARNESS_API_PORT:-8080}
       HARNESS_API_TOKEN: "${TELEGRAM_HARNESS_API_TOKEN:?set in .env, matching a telegram: entry in HARNESS_API_CLIENT_TOKENS}"
+      TELEGRAM_EVENTS_RECONNECT_MAX_S: ${TELEGRAM_EVENTS_RECONNECT_MAX_S:-30}
     depends_on:
       harness:
         condition: service_healthy

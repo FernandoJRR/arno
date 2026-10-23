@@ -17,6 +17,8 @@ pub struct Config {
     /// SPEC §5.7 "Adapters set their Harness-API HTTP timeout above
     /// ORDER_BUDGET_S."
     pub http_timeout: Duration,
+    /// Longest wait between event-stream reconnects (SPEC §11 #32).
+    pub events_reconnect_max: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +35,7 @@ const KNOWN_VARS: &[&str] = &[
     "HARNESS_API_URL",
     "HARNESS_API_TOKEN",
     "TELEGRAM_HTTP_TIMEOUT_S",
+    "TELEGRAM_EVENTS_RECONNECT_MAX_S",
 ];
 
 const OWNED_PREFIXES: &[&str] = &["TELEGRAM_", "ALLOWED_CHAT_IDS", "HARNESS_API_"];
@@ -46,6 +49,7 @@ impl Config {
             harness_api_url: required("HARNESS_API_URL")?,
             harness_api_token: required("HARNESS_API_TOKEN")?,
             http_timeout: duration_secs("TELEGRAM_HTTP_TIMEOUT_S", 240)?,
+            events_reconnect_max: duration_secs("TELEGRAM_EVENTS_RECONNECT_MAX_S", 30)?,
         })
     }
 }

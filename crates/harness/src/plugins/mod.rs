@@ -64,6 +64,8 @@ pub struct GroupDef {
     pub tools: Vec<String>,
     /// Qualified ids of existing groups.
     pub related: Vec<String>,
+    /// Manifest `progress`; empty when unset.
+    pub progress: String,
 }
 
 /// One immutable view of every loaded plugin. Orders read a snapshot; a
@@ -149,6 +151,26 @@ impl PluginSet {
             .and_then(|ns| self.plugin(ns))
             .and_then(|p| p.manifest.as_ref())
             .map_or(&[], |m| m.tools.card_hide.as_slice())
+    }
+
+    /// The step shown while `tool` runs (SPEC §11 #32): the `progress` of the
+    /// first group listing it, else its humanized name ("List accounts…").
+    pub fn progress_label(&self, tool: &str) -> String {
+        if let Some(g) = self
+            .groups
+            .iter()
+            .find(|g| !g.progress.is_empty() && g.tools.iter().any(|t| t == tool))
+        {
+            return g.progress.clone();
+        }
+        let bare = tool.split_once('.').map_or(tool, |(_, t)| t);
+        let bare = bare.strip_prefix("propose_").unwrap_or(bare);
+        let words = bare.replace('_', " ");
+        let mut chars = words.chars();
+        match chars.next() {
+            Some(first) => format!("{}{}…", first.to_uppercase(), chars.as_str()),
+            None => "Working…".to_owned(),
+        }
     }
 
     /// Distinct attachment parameter names across discovered tools, sorted.
@@ -556,6 +578,7 @@ fn build_groups(schemas: &[serde_json::Value], plugins: &[Plugin]) -> Vec<GroupD
                 how: g.how.clone(),
                 tools: members,
                 related: Vec::new(),
+                progress: g.progress.clone(),
             });
         }
         let rest: Vec<String> = tools
@@ -578,6 +601,7 @@ fn build_groups(schemas: &[serde_json::Value], plugins: &[Plugin]) -> Vec<GroupD
                 how: String::new(),
                 tools: rest,
                 related: Vec::new(),
+                progress: String::new(),
             });
         } else {
             let other = format!("{}.other", p.id);
@@ -590,6 +614,7 @@ fn build_groups(schemas: &[serde_json::Value], plugins: &[Plugin]) -> Vec<GroupD
                     how: String::new(),
                     tools: rest,
                     related: Vec::new(),
+                    progress: String::new(),
                 }),
             }
         }
@@ -741,6 +766,28 @@ mod tests {
         // A manifest that declares nothing takes no attachments.
         assert!(!set.is_attachment_param("ocr.extract_text", "image_ref"));
         assert!(set.is_attachment_param("old.read", "image_ref"));
+    }
+
+    #[test]
+    fn progress_comes_from_the_group_else_the_tool_name() {
+        let exec = Arc::new(Schemas(vec![
+            schema("fin.list_accounts", &[]),
+            schema("fin.propose_create_transaction", &[]),
+        ]));
+        let fin = manifest(
+            "fin",
+            "[[groups]]\nid = \"accounts\"\nwhen = \"Accounts\"\n\
+             progress = \"Checking your accounts…\"\ntools = [\"list_accounts\"]\n",
+        );
+        let set = PluginSet::assemble(exec, vec![plugin(fin)]);
+        assert_eq!(
+            set.progress_label("fin.list_accounts"),
+            "Checking your accounts…"
+        );
+        assert_eq!(
+            set.progress_label("fin.propose_create_transaction"),
+            "Create transaction…"
+        );
     }
 
     #[test]

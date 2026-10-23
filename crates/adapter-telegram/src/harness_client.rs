@@ -1,10 +1,13 @@
-//! Thin HTTP client for Contract 1 (SPEC §4.1) — `POST /v1/orders` and
-//! `GET /v1/ready`, bearer-authenticated with this adapter's own client token.
+//! Thin HTTP client for Contract 1 (SPEC §4.1) — `POST /v1/orders`,
+//! `GET /v1/ready` and `GET /v1/events`, bearer-authenticated with this
+//! adapter's own client token.
 
 use contract::{ErrorBody, ErrorCode, Order, Readiness, Response};
 
 pub struct HarnessClient {
     http: reqwest::Client,
+    /// No total timeout: the event stream stays open (SPEC §11 #32).
+    stream_http: reqwest::Client,
     base_url: String,
     token: String,
 }
@@ -21,6 +24,7 @@ impl HarnessClient {
     pub fn new(http: reqwest::Client, base_url: String, token: String) -> Self {
         Self {
             http,
+            stream_http: reqwest::Client::new(),
             base_url,
             token,
         }
@@ -41,6 +45,19 @@ impl HarnessClient {
                 resp.json::<ErrorBody>().await?.error_code,
             ))
         }
+    }
+
+    /// Opens the event stream, resuming after `last` (`Last-Event-ID`).
+    pub async fn events(&self, last: Option<u64>) -> Result<reqwest::Response, reqwest::Error> {
+        let mut req = self
+            .stream_http
+            .get(format!("{}/v1/events", self.base_url.trim_end_matches('/')))
+            .bearer_auth(&self.token)
+            .header("accept", "text/event-stream");
+        if let Some(id) = last {
+            req = req.header("last-event-id", id.to_string());
+        }
+        req.send().await
     }
 
     /// The harness's readiness report (SPEC §11 #31), sent with 200 or 503;
@@ -111,6 +128,23 @@ mod tests {
             OrderOutcome::Rejected(code) => assert_eq!(code, ErrorCode::DuplicateOrder),
             OrderOutcome::Ok(_) => panic!("expected rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn events_resume_after_the_last_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header("last-event-id", "41"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("id: 42\ndata: {}\n\n"))
+            .mount(&server)
+            .await;
+        let client = HarnessClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+        let resp = client.events(Some(41)).await.unwrap();
+        assert!(resp.status().is_success());
+        let frames = crate::sse::Parser::default().push(&resp.bytes().await.unwrap());
+        assert_eq!(frames[0].id, Some(42));
     }
 
     #[tokio::test]

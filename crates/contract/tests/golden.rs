@@ -113,8 +113,52 @@ fn response_decision() {
                 free_text: true,
                 expires_at: "2026-10-23T04:00:00Z".into(),
             }),
+            order_id: None,
         },
     );
+}
+
+#[test]
+fn response_order_id() {
+    let mut response = Response::text("hello");
+    response.order_id = Some("ord_1".into());
+    pinned("response_order_id", &response);
+}
+
+#[test]
+fn event_progress() {
+    pinned(
+        "event_progress",
+        &Event {
+            order_id: "ord_1".into(),
+            session_id: "chat:1".into(),
+            client_msg_id: Some("42".into()),
+            kind: EventKind::Progress {
+                step: "Reading the image…".into(),
+            },
+        },
+    );
+}
+
+#[test]
+fn event_done() {
+    pinned(
+        "event_done",
+        &Event {
+            order_id: "ord_1".into(),
+            session_id: "chat:1".into(),
+            client_msg_id: None,
+            kind: EventKind::Done,
+        },
+    );
+}
+
+#[test]
+fn an_unknown_event_type_is_ignored_not_rejected() {
+    let event: Event = serde_json::from_value(serde_json::json!({
+        "order_id": "ord_1", "session_id": "s1", "type": "reminder", "at": "later"}))
+    .unwrap();
+    assert_eq!(event.kind, EventKind::Unknown);
 }
 
 /// Every code: a new variant does not compile until it is listed here.

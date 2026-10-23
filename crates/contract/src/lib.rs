@@ -197,6 +197,9 @@ pub struct Response {
     /// are also set, with `confirmation_token == decision.id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Decision>,
+    /// The order this answers; the same id its [`Event`]s carry (SPEC §11 #32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
 }
 
 impl Response {
@@ -207,6 +210,42 @@ impl Response {
             confirmation_token: None,
             structured: None,
             decision: None,
+            order_id: None,
+        }
+    }
+}
+
+/// One `GET /v1/events` frame's data (SPEC §11 #32). The SSE `id:` is a
+/// harness-wide increasing number; `event:` is the `type`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub order_id: String,
+    pub session_id: String,
+    /// Lets an adapter match an event before it has the order's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
+    #[serde(flatten)]
+    pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventKind {
+    /// A harness-worded step while the order runs.
+    Progress { step: String },
+    /// The order finished; its answer is on the order's own reply.
+    Done,
+    /// A type this adapter does not know yet (additive, SPEC §4.1).
+    #[serde(other)]
+    Unknown,
+}
+
+impl EventKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EventKind::Progress { .. } => "progress",
+            EventKind::Done => "done",
+            EventKind::Unknown => "unknown",
         }
     }
 }

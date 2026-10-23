@@ -272,6 +272,8 @@ fn config(dir: &Path, router_enabled: bool) -> Config {
         ollama_num_predict: 400,
         ollama_timeout: Duration::from_secs(5),
         ready_probe_timeout: Duration::from_secs(1),
+        events_replay_max: 64,
+        events_replay: Duration::from_secs(300),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
         max_tool_calls: 8,
@@ -313,6 +315,7 @@ async fn boot(cfg: Config, model: Arc<Model>) -> SharedState {
     let transcript = harness::transcript::TranscriptLog::open(&cfg.transcript_log_path, 0, 12)
         .expect("transcript opens");
     let (order_tx, order_rx) = tokio::sync::mpsc::channel(16);
+    let events = harness::events::EventHub::new(cfg.events_replay_max, cfg.events_replay);
     let state: SharedState = Arc::new(AppState {
         sessions: harness::stores::sessions::SessionStore::new(),
         dedup: harness::stores::dedup::DedupStore::new(),
@@ -325,6 +328,7 @@ async fn boot(cfg: Config, model: Arc<Model>) -> SharedState {
         audit: None,
         transcript: Some(transcript),
         model_health: Default::default(),
+        events,
     });
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
     state

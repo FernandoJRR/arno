@@ -42,6 +42,8 @@ fn test_config(ollama_url: String, confirm_ttl: Duration) -> Config {
         ollama_num_predict: 400,
         ollama_timeout: Duration::from_secs(5),
         ready_probe_timeout: Duration::from_secs(1),
+        events_replay_max: 64,
+        events_replay: Duration::from_secs(300),
         mcp_tool_timeout: Duration::from_secs(5),
         order_budget: Duration::from_secs(30),
         max_tool_calls: 8,
@@ -144,6 +146,7 @@ fn build_state(
         cfg.log_keep_segments,
     )
     .expect("transcript log opens in tests");
+    let events = harness::events::EventHub::new(cfg.events_replay_max, cfg.events_replay);
     let state: SharedState = Arc::new(AppState {
         sessions: harness::stores::sessions::SessionStore::new(),
         dedup: harness::stores::dedup::DedupStore::new(),
@@ -156,6 +159,7 @@ fn build_state(
         audit: Some(audit),
         transcript: Some(transcript),
         model_health: Default::default(),
+        events,
     });
     // Same topology as production main(): a live FIFO worker consumes jobs.
     tokio::spawn(harness::queue::spawn_worker(state.clone(), order_rx));
@@ -2608,4 +2612,149 @@ async fn a_model_on_cpu_that_timed_out_is_degraded() {
     // Parses as the shared wire type adapters read.
     let parsed: contract::Readiness = serde_json::from_value(body).unwrap();
     assert_eq!(parsed.status, contract::ReadyStatus::Degraded);
+}
+
+// ---- /v1/events (SPEC §11 #32) ----
+
+/// Opens `/v1/events` and returns its body as a byte stream.
+async fn open_events(
+    state: &SharedState,
+    token: Option<&str>,
+    last_id: Option<u64>,
+) -> (
+    StatusCode,
+    impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>>,
+) {
+    let mut req = Request::builder().method("GET").uri("/v1/events").header(
+        "authorization",
+        token.map(|t| format!("Bearer {t}")).unwrap_or_default(),
+    );
+    if let Some(id) = last_id {
+        req = req.header("last-event-id", id.to_string());
+    }
+    let resp = api_router(state.clone())
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    (resp.status(), resp.into_body().into_data_stream())
+}
+
+/// Reads frames until `done` (or a 2 s stall): (id, event, data).
+async fn frames_until_done(
+    body: impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>>,
+) -> Vec<(u64, String, serde_json::Value)> {
+    use futures::StreamExt;
+    let mut body = std::pin::pin!(body);
+    let mut text = String::new();
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok(chunk))) = tokio::time::timeout(Duration::from_secs(2), body.next()).await
+    {
+        text.push_str(std::str::from_utf8(&chunk).unwrap());
+        while let Some(end) = text.find("\n\n") {
+            let block: String = text.drain(..end + 2).collect();
+            let field = |name: &str| {
+                block
+                    .lines()
+                    .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_owned()))
+            };
+            if let (Some(id), Some(event), Some(data)) =
+                (field("id:"), field("event:"), field("data:"))
+            {
+                frames.push((
+                    id.parse().unwrap(),
+                    event,
+                    serde_json::from_str(&data).unwrap(),
+                ));
+            }
+        }
+        if frames.iter().any(|(_, e, _)| e == "done") {
+            break;
+        }
+    }
+    frames
+}
+
+fn list_accounts_call() -> CompletionOutput {
+    CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+        id: "call_0".into(),
+        name: "securo.list_accounts".into(),
+        args: serde_json::json!({}),
+    }])
+}
+
+#[tokio::test]
+async fn events_require_auth() {
+    let (state, _, _) = decision_rig(vec![], serde_json::json!({})).await;
+    let (status, _) = open_events(&state, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_order_streams_its_steps_and_done_under_its_order_id() {
+    let (state, _, _) = decision_rig(
+        vec![
+            list_accounts_call(),
+            CompletionOutput::Final("One account.".into()),
+        ],
+        serde_json::json!({"items": [{"name": "Main"}]}),
+    )
+    .await;
+    let (status, body) = open_events(&state, Some("tok-cli"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = say(&state, "m1", "which accounts do I have?").await;
+    let order_id = response["order_id"].as_str().expect("order_id").to_owned();
+    assert!(order_id.starts_with("ord_"));
+
+    let frames = frames_until_done(body).await;
+    let shown: Vec<String> = frames
+        .iter()
+        .map(|(_, e, d)| d["step"].as_str().unwrap_or(e).to_owned())
+        .collect();
+    assert_eq!(
+        shown,
+        ["Thinking…", "List accounts…", "Thinking…", "done"],
+        "{frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|(_, _, d)| d["order_id"] == order_id.as_str()
+                && d["session_id"] == "s1"
+                && d["client_msg_id"] == "m1")
+    );
+    assert!(frames.windows(2).all(|w| w[0].0 < w[1].0), "ids increase");
+
+    // Another client sees none of it.
+    assert!(state.events.subscribe("other", Some(0)).0.is_empty());
+
+    // A reconnect after the second frame replays only the newer ones.
+    let (_, again) = open_events(&state, Some("tok-cli"), Some(frames[1].0)).await;
+    let replayed = frames_until_done(again).await;
+    assert_eq!(
+        replayed.iter().map(|f| f.0).collect::<Vec<_>>(),
+        frames[2..].iter().map(|f| f.0).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_order_publishes_nothing() {
+    let (state, _, _) = decision_rig(
+        vec![
+            CompletionOutput::Final("hi".into()),
+            CompletionOutput::Final("again".into()),
+        ],
+        serde_json::json!({}),
+    )
+    .await;
+    say(&state, "m1", "hello").await;
+    let before = state.events.subscribe("cli", Some(0)).0.len();
+    let body = serde_json::json!({"session_id": "s1", "text": "hello", "client_msg_id": "m1"});
+    let (status, _) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(state.events.subscribe("cli", Some(0)).0.len(), before);
 }

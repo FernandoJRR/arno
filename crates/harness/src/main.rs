@@ -101,6 +101,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         tracing::warn!("CONFIRM_MODE is deprecated and ignored (SPEC §11 #18)");
     }
 
+    let events = harness::events::EventHub::new(cfg.events_replay_max, cfg.events_replay);
     let state: SharedState = Arc::new(AppState {
         sessions: stores::sessions::SessionStore::new(),
         dedup: stores::dedup::DedupStore::new(),
@@ -113,6 +114,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         audit: Some(audit),
         transcript: Some(transcript),
         model_health: Default::default(),
+        events,
     });
     api::ready::log(&api::ready::readiness(&state).await);
     spawn_reload_on_sighup(order_tx.clone());

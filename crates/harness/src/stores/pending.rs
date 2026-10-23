@@ -218,7 +218,7 @@ impl PendingStore {
 }
 
 /// 128 bits of CSPRNG output, hex-encoded (SPEC §4.3).
-fn mint_token() -> String {
+pub(crate) fn mint_token() -> String {
     let mut bytes = [0_u8; 16];
     // OS entropy is a hard requirement for confirmation tokens; failure to
     // source it is unrecoverable and must not be silently downgraded.

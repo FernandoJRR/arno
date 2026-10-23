@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::decision::{DecisionKeys, Resolved, render_decision};
 use crate::harness_client::{HarnessClient, OrderOutcome};
 use crate::order::{build_order, encode_base64, explains_outage, outage_reason, render_error};
+use crate::status::Status;
 
 /// Telegram always re-encodes `photo`-type sends as JPEG. Must match
 /// `ALLOWED_IMAGE_MIMES` in `crates/harness/src/stores/attachments.rs`
@@ -37,6 +38,14 @@ async fn download_photo(bot: &Bot, file_id: teloxide::types::FileId) -> anyhow::
 }
 
 pub async fn run(bot: Bot, cfg: Config, client: HarnessClient) -> anyhow::Result<()> {
+    let client = std::sync::Arc::new(client);
+    let status = std::sync::Arc::new(Status::default());
+    tokio::spawn(crate::events::listen(
+        bot.clone(),
+        client.clone(),
+        status.clone(),
+        cfg.events_reconnect_max,
+    ));
     // Explicit list: an omitted `allowed_updates` reuses whatever the token
     // was last polled with, which might exclude callback queries.
     let mut listener = Polling::builder(bot.clone())
@@ -59,10 +68,10 @@ pub async fn run(bot: Bot, cfg: Config, client: HarnessClient) -> anyhow::Result
         let client_msg_id = update.id.0.to_string();
         match update.kind {
             UpdateKind::Message(msg) => {
-                on_message(&bot, &cfg, &client, &mut keys, msg, client_msg_id).await
+                on_message(&bot, &cfg, &client, &status, &mut keys, msg, client_msg_id).await
             }
             UpdateKind::CallbackQuery(q) => {
-                on_callback(&bot, &cfg, &client, &mut keys, q, client_msg_id).await
+                on_callback(&bot, &cfg, &client, &status, &mut keys, q, client_msg_id).await
             }
             _ => {}
         }
@@ -75,6 +84,7 @@ async fn on_message(
     bot: &Bot,
     cfg: &Config,
     client: &HarnessClient,
+    status: &Status,
     keys: &mut DecisionKeys,
     msg: Message,
     client_msg_id: String,
@@ -145,14 +155,16 @@ async fn on_message(
         attachments,
         decision_answer,
     );
+    status.begin(msg.chat.id).await;
     let outcome = client.send_order(&order).await;
-    reply(bot, client, keys, msg.chat.id, outcome).await;
+    reply(bot, client, status, keys, msg.chat.id, outcome).await;
 }
 
 async fn on_callback(
     bot: &Bot,
     cfg: &Config,
     client: &HarnessClient,
+    status: &Status,
     keys: &mut DecisionKeys,
     q: CallbackQuery,
     client_msg_id: String,
@@ -196,8 +208,9 @@ async fn on_callback(
                     text: None,
                 }),
             );
+            status.begin(chat).await;
             let outcome = client.send_order(&order).await;
-            reply(bot, client, keys, chat, outcome).await;
+            reply(bot, client, status, keys, chat, outcome).await;
         }
     }
 }
@@ -207,6 +220,7 @@ async fn on_callback(
 async fn reply(
     bot: &Bot,
     client: &HarnessClient,
+    status: &Status,
     keys: &mut DecisionKeys,
     chat: ChatId,
     outcome: Result<OrderOutcome, reqwest::Error>,
@@ -231,7 +245,7 @@ async fn reply(
             )
         }
     };
-    send(bot, chat, text, markup).await;
+    status.finish(bot, chat, text, markup).await;
 }
 
 fn render_response(
@@ -253,7 +267,7 @@ fn render_response(
     )
 }
 
-async fn send(bot: &Bot, chat: ChatId, text: String, markup: Option<InlineKeyboardMarkup>) {
+pub async fn send(bot: &Bot, chat: ChatId, text: String, markup: Option<InlineKeyboardMarkup>) {
     let mut req = bot.send_message(chat, text);
     if let Some(markup) = markup {
         req = req.reply_markup(markup);
