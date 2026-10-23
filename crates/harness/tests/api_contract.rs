@@ -2375,3 +2375,151 @@ async fn a_card_after_a_photo_turn_still_names_its_source() {
     let later = say(&state, "m4", "250 for tacos").await;
     assert!(later["decision"].is_null() || rows(&later["decision"])[0].0 != "Source");
 }
+
+// ---- a photo of a bill ends on a card, with its date (SPEC §11 #26, #30) ----
+
+const BILL: &str = "PIZZA NAPOLI\nDate: 2026-10-19\n1 Soda Q 15.00\nTOTAL Q 110.00";
+
+/// An attachment-reading rig whose every tool returns `{"text": ocr}`.
+async fn photo_rig(
+    ocr: &str,
+    script: Vec<CompletionOutput>,
+) -> (SharedState, RecordingExecutor, Prompts) {
+    let (provider, prompts) = PromptLogProvider::new(script);
+    let inner = RecordingExecutor::new(ExecBehavior::Ok(serde_json::json!({"text": ocr})));
+    let mut schemas = create_tx_schemas();
+    schemas.push(serde_json::json!({"type": "function", "function": {
+        "name": "ocr.extract_text", "description": "reads an image",
+        "parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}},
+            "required": ["image_ref"]}}}));
+    schemas.push(serde_json::json!({"type": "function", "function": {
+        "name": "securo.list_transactions", "description": "lists transactions",
+        "parameters": {"type": "object", "properties": {"date": {"type": "string"}}}}}));
+    let mut cfg = test_config("http://127.0.0.1:1".into(), Duration::from_secs(600));
+    cfg.attach_max_bytes = 1024;
+    let state = build_state(
+        cfg,
+        Arc::new(provider),
+        Arc::new(SchemaExecutor {
+            inner: inner.clone(),
+            schemas,
+        }),
+    );
+    pin_conditional_on_apply(&state, "securo.propose_create_transaction").await;
+    pin_safe(&state, "ocr.extract_text").await;
+    pin_safe(&state, "securo.list_transactions").await;
+    (state, inner, prompts)
+}
+
+async fn send_photo(state: &SharedState) -> serde_json::Value {
+    let body = serde_json::json!({
+        "session_id": "s1",
+        "text": "add this bill as an expense",
+        "attachments": [{"mime": "image/png", "data_b64": "aGVsbG8="}],
+    });
+    let (status, body) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+fn calls_to(executor: &RecordingExecutor, tool: &str) -> Vec<serde_json::Value> {
+    executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| t == tool)
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_photo_order_ends_on_a_card_carrying_the_bill_date() {
+    let (state, executor, prompts) = photo_rig(
+        BILL,
+        vec![
+            CompletionOutput::Final(
+                "I will propose adding this as an expense. Please confirm if you'd like me to proceed."
+                    .into(),
+            ),
+            propose_call("call_1", serde_json::json!({"amount": 110, "account_id": "a1"})),
+        ],
+    )
+    .await;
+    let card = send_photo(&state).await;
+    assert_eq!(rows(&card["decision"])[0].0, "Source", "{card}");
+    let previews = calls_to(&executor, "securo.propose_create_transaction");
+    assert_eq!(previews.len(), 1, "{previews:?}");
+    assert_eq!(previews[0]["date"], "2026-10-19");
+    let prompts = prompts.lock().unwrap();
+    assert!(
+        prompts[1]
+            .iter()
+            .any(|m| m.contains("Nothing is waiting for approval")),
+        "{:?}",
+        prompts[1]
+    );
+}
+
+#[tokio::test]
+async fn a_bill_with_two_dates_fills_none_and_reads_are_never_filled() {
+    let (state, executor, _) = photo_rig(
+        "PIZZA NAPOLI 2026-10-19\nDue 2026-11-01\nTOTAL Q 110.00",
+        vec![
+            CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+                id: "call_0".into(),
+                name: "securo.list_transactions".into(),
+                args: serde_json::json!({}),
+            }]),
+            propose_call(
+                "call_1",
+                serde_json::json!({"amount": 110, "account_id": "a1"}),
+            ),
+        ],
+    )
+    .await;
+    send_photo(&state).await;
+    assert_eq!(
+        calls_to(&executor, "securo.list_transactions"),
+        [serde_json::json!({})]
+    );
+    let previews = calls_to(&executor, "securo.propose_create_transaction");
+    assert!(previews[0].get("date").is_none(), "{previews:?}");
+}
+
+#[tokio::test]
+async fn a_read_after_a_photo_is_not_filled_and_no_photo_means_no_fill() {
+    let (state, executor, _) = photo_rig(
+        BILL,
+        vec![
+            CompletionOutput::ToolCalls(vec![harness::model::ToolCall {
+                id: "call_0".into(),
+                name: "securo.list_transactions".into(),
+                args: serde_json::json!({}),
+            }]),
+            CompletionOutput::Final("No transactions on that day.".into()),
+            CompletionOutput::Final("You're welcome.".into()),
+            propose_call(
+                "call_1",
+                serde_json::json!({"amount": 110, "account_id": "a1"}),
+            ),
+            CompletionOutput::Final("Done.".into()),
+        ],
+    )
+    .await;
+    send_photo(&state).await;
+    assert_eq!(
+        calls_to(&executor, "securo.list_transactions"),
+        [serde_json::json!({})]
+    );
+    // Two turns later the bill is out of reach.
+    say(&state, "m2", "thanks").await;
+    say(&state, "m3", "110 for pizza").await;
+    let previews = calls_to(&executor, "securo.propose_create_transaction");
+    assert!(previews[0].get("date").is_none(), "{previews:?}");
+}

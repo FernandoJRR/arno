@@ -700,17 +700,25 @@ fn reads_attachment(plugins: &PluginSet, tool: &str) -> bool {
         .is_some_and(|s| plugins.takes_attachment(s))
 }
 
-/// Whether the turn before the current user message read an attachment
-/// (its labelled result is in the history): "yes, add it" after a photo.
-fn read_attachment_last_turn(history: &[crate::model::ChatMessage]) -> bool {
+/// The turn before the current user message: "yes, add it" after a photo.
+fn last_turn(history: &[crate::model::ChatMessage]) -> &[crate::model::ChatMessage] {
     use crate::model::Role;
-    history
+    let Some(current) = history.iter().rposition(|m| m.role == Role::User) else {
+        return &[];
+    };
+    let start = history[..current]
         .iter()
-        .rev()
-        .skip_while(|m| m.role != Role::User)
-        .skip(1)
-        .take_while(|m| m.role != Role::User)
-        .any(|m| m.role == Role::Tool && m.content.contains(DATA_NOTE))
+        .rposition(|m| m.role == Role::User)
+        .map_or(0, |i| i + 1);
+    &history[start..current]
+}
+
+/// Labelled attachment results among `msgs` (SPEC §11 #29).
+fn attachment_texts(msgs: &[crate::model::ChatMessage]) -> Vec<String> {
+    msgs.iter()
+        .filter(|m| m.role == crate::model::Role::Tool && m.content.contains(DATA_NOTE))
+        .map(|m| m.content.clone())
+        .collect()
 }
 
 /// The session copy of an attachment tool's result, labelled as data
@@ -978,6 +986,8 @@ async fn normal_path_loop(
         Some(Some(tools)) => tools,
         _ => attachment_tools(&plugins, plugins.tool_schemas()),
     };
+    // Where this order's messages start; the session only grows meanwhile.
+    let turn_start = st.sessions.snapshot(&key).len();
     match prefill_attachments(
         st,
         client_id,
@@ -995,8 +1005,8 @@ async fn normal_path_loop(
     }
     // SPEC §11 #29: a proposal after this point was shaped by attachment
     // text, read in this order or in the turn before it.
-    let mut read_attachment =
-        dispatched_tool_calls > 0 || read_attachment_last_turn(&st.sessions.snapshot(&key));
+    let last_turn_texts = attachment_texts(last_turn(&st.sessions.snapshot(&key)[..turn_start]));
+    let mut read_attachment = dispatched_tool_calls > 0 || !last_turn_texts.is_empty();
     // Fallback when no prefill applied: one nudge per order (SPEC §11 #25).
     let mut attachment_nudged = false;
     // SPEC §11 #26: the latest call failed; one unkept-claim nudge per order.
@@ -1018,6 +1028,15 @@ async fn normal_path_loop(
         }
 
         let history = st.sessions.snapshot(&key);
+        // SPEC §11 #30: the one date the attachment shows, for a write
+        // that left its date out.
+        let bill_date = if read_attachment {
+            let mut texts = last_turn_texts.clone();
+            texts.extend(attachment_texts(&history[turn_start..]));
+            args::attachment_date(&texts.iter().map(String::as_str).collect::<Vec<_>>())
+        } else {
+            None
+        };
         // Budget priority (SPEC §8): schemas → system → attachment manifest
         // (when present, SPEC §4.1) → newest history first. The manifest goes
         // right after the latest user turn: small models ignore it when it
@@ -1123,7 +1142,8 @@ async fn normal_path_loop(
                     tracing::info!(tool = %call.name, "rescued text tool call");
                     let mut calls = vec![call];
                     repair_attachment_refs(&plugins, &mut calls, handles);
-                    let mut missing = clean_calls(&plugins, &mut calls, &mut carried);
+                    let mut missing =
+                        clean_calls(&plugins, &st.policy, &mut calls, &mut carried, bill_date);
                     let lookups =
                         resolve_missing(st, &plugins, &mut calls, &mut missing, &mut carried).await;
                     dispatched_tool_calls += calls.len() as u32;
@@ -1263,7 +1283,8 @@ async fn normal_path_loop(
             }
             crate::model::CompletionOutput::ToolCalls(mut calls) => {
                 repair_attachment_refs(&plugins, &mut calls, handles);
-                let mut missing = clean_calls(&plugins, &mut calls, &mut carried);
+                let mut missing =
+                    clean_calls(&plugins, &st.policy, &mut calls, &mut carried, bill_date);
                 let lookups =
                     resolve_missing(st, &plugins, &mut calls, &mut missing, &mut carried).await;
                 dispatched_tool_calls += calls.len() as u32;
@@ -1435,8 +1456,10 @@ async fn dispatch_call(
 /// before transcript and policy, so what is logged is what is dispatched.
 fn clean_calls(
     plugins: &PluginSet,
+    policy: &crate::policy::ToolPolicy,
     calls: &mut [crate::model::ToolCall],
     carried: &mut std::collections::HashMap<String, serde_json::Value>,
+    bill_date: Option<chrono::NaiveDate>,
 ) -> Vec<Vec<String>> {
     calls
         .iter_mut()
@@ -1452,6 +1475,18 @@ fn clean_calls(
                 if !keys.is_empty() {
                     tracing::info!(tool = %call.name, keys = ?keys, "carried arguments from the missing-argument retry");
                 }
+            }
+            if let Some(date) = bill_date
+                && let Some(param) = args::date_param(params)
+                && (policy.is_destructive(&call.name, &call.args)
+                    || policy.preview_of(&call.name, &call.args).is_some())
+                && let Some(obj) = call.args.as_object_mut()
+                && obj
+                    .get(&param)
+                    .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()))
+            {
+                tracing::info!(tool = %call.name, param = %param, "filled the date from the attachment");
+                obj.insert(param, date.to_string().into());
             }
             let cleaned = args::clean(&call.args, params);
             if !cleaned.missing.is_empty() {
@@ -1784,7 +1819,8 @@ const FALSE_CLAIM_PATTERNS: &[&str] = &[
 ];
 
 /// A change described as waiting for approval (SPEC §11 #26). Observed:
-/// "I prepared a proposal… Please confirm with \"approve\"" with no call.
+/// "I prepared a proposal… Please confirm with \"approve\"" and, after a
+/// photo, "I will propose adding this… Please confirm", with no call.
 const PROPOSAL_CLAIM_PATTERNS: &[&str] = &[
     "prepared a proposal",
     "i prepared",
@@ -1795,6 +1831,13 @@ const PROPOSAL_CLAIM_PATTERNS: &[&str] = &[
     "type \"approve",
     "say \"approve",
     "awaiting approval",
+    "i will propose",
+    "i'll propose",
+    "i will now propose",
+    "here's the proposal",
+    "here is the proposal",
+    "proceed with this addition",
+    "like me to proceed with this",
     "awaiting your approval",
     "must approve",
     "approval is required",
@@ -2217,6 +2260,20 @@ mod tests {
             0
         ));
         assert!(!claims_execution_without_tool("pong", 0));
+    }
+
+    #[test]
+    fn proposals_described_without_a_call_are_caught() {
+        for text in [
+            "I will now propose adding this as an expense. Please confirm if you'd like me to proceed with this transaction.",
+            "I will propose adding this as an expense. Please confirm if you'd like me to proceed with categorizing it under \"Food\" or another category.",
+            "I'll add the Pizza Napoli bill.\n\nHere's the proposal:\n- Amount: $110.00\n\nPlease confirm if you'd like me to proceed with this addition.",
+        ] {
+            assert!(claims_proposal(text), "{text}");
+        }
+        for text in ["Shall I add it?", "Which account should I use?"] {
+            assert!(!claims_proposal(text), "{text}");
+        }
     }
 
     #[test]

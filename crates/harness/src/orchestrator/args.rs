@@ -106,6 +106,71 @@ pub fn is_uuid(s: &str) -> bool {
             .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// The one date parameter of a tool, if it has exactly one: `format: date`,
+/// or a string named `date` / `*_date` (SPEC §11 #30).
+pub fn date_param(params: &Value) -> Option<String> {
+    let props = params["properties"].as_object()?;
+    let mut dates = props.iter().filter(|(k, schema)| {
+        schema["format"] == "date"
+            || (schema["type"] == "string" && (*k == "date" || k.ends_with("_date")))
+    });
+    match (dates.next(), dates.next()) {
+        (Some((k, _)), None) => Some(k.clone()),
+        _ => None,
+    }
+}
+
+/// The one distinct date written in `texts` (SPEC §11 #30): ISO
+/// `YYYY-MM-DD`, or `D/M/YYYY` (also `-` or `.`) when the day and month
+/// cannot be swapped. None when there is no date or more than one.
+pub fn attachment_date(texts: &[&str]) -> Option<chrono::NaiveDate> {
+    let mut found: Vec<chrono::NaiveDate> = Vec::new();
+    for text in texts {
+        let tokens = text.split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '/' | '.')));
+        for token in tokens {
+            if let Some(d) = parse_date(token.trim_matches(|c| matches!(c, '-' | '/' | '.')))
+                && !found.contains(&d)
+            {
+                found.push(d);
+            }
+        }
+    }
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
+fn parse_date(token: &str) -> Option<chrono::NaiveDate> {
+    let sep = token.chars().find(|c| !c.is_ascii_digit())?;
+    let parts: Vec<&str> = token.split(sep).collect();
+    let [a, b, c] = parts.as_slice() else {
+        return None;
+    };
+    if ![a, b, c]
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+    let num = |p: &str| p.parse::<u32>().ok();
+    if a.len() == 4 && sep == '-' {
+        return chrono::NaiveDate::from_ymd_opt(a.parse().ok()?, num(b)?, num(c)?);
+    }
+    if c.len() != 4 || a.len() > 2 || b.len() > 2 {
+        return None;
+    }
+    let year = c.parse().ok()?;
+    let day_first = chrono::NaiveDate::from_ymd_opt(year, num(b)?, num(a)?);
+    let month_first = chrono::NaiveDate::from_ymd_opt(year, num(a)?, num(b)?);
+    match (day_first, month_first) {
+        (Some(d), Some(m)) if d == m => Some(d),
+        (Some(d), None) => Some(d),
+        (None, Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
 fn required(schema: &Value) -> Vec<String> {
     schema["required"]
         .as_array()
@@ -205,6 +270,30 @@ mod tests {
             json!({"description": "Tacos", "amount": 0, "account_id": "a1", "apply": false})
         );
         assert!(c.missing.is_empty());
+    }
+
+    #[test]
+    fn one_date_is_found_in_attachment_text() {
+        let d = |y, m, day| chrono::NaiveDate::from_ymd_opt(y, m, day);
+        let bill = "PIZZA NAPOLI\nDate: 2026-10-19\n1 Soda Q 15.00\nTOTAL Q 110.00";
+        assert_eq!(attachment_date(&[bill]), d(2026, 10, 19));
+        assert_eq!(attachment_date(&[bill, "on 2026-10-19."]), d(2026, 10, 19));
+        assert_eq!(attachment_date(&[bill, "due 2026-11-01"]), None);
+        assert_eq!(attachment_date(&["Fecha 19/10/2026"]), d(2026, 10, 19));
+        assert_eq!(attachment_date(&["05/04/2026"]), None);
+        assert_eq!(attachment_date(&["05.05.2026"]), d(2026, 5, 5));
+        assert_eq!(attachment_date(&["TOTAL Q 110.00", "2026/10"]), None);
+    }
+
+    #[test]
+    fn a_tool_has_a_date_param_only_when_it_has_one() {
+        let one = json!({"properties": {"date": {"type": "string"}, "amount": {}}});
+        assert_eq!(date_param(&one).as_deref(), Some("date"));
+        let fmt = json!({"properties": {"when": {"type": "string", "format": "date"}}});
+        assert_eq!(date_param(&fmt).as_deref(), Some("when"));
+        let range = json!({"properties": {"start_date": {"type": "string"},
+                                          "end_date": {"type": "string"}}});
+        assert_eq!(date_param(&range), None);
     }
 
     #[test]
