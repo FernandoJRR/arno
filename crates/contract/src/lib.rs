@@ -31,6 +31,23 @@ pub struct Order {
     /// `confirmation_token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_answer: Option<DecisionAnswer>,
+    /// `stream`: answer `202` with [`Accepted`] at once; the result arrives on
+    /// `GET /v1/events` (SPEC §11 #32). Absent or `wait`: the POST blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respond: Option<Respond>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Respond {
+    Wait,
+    Stream,
+}
+
+/// `202` body of a `respond: stream` order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accepted {
+    pub order_id: String,
 }
 
 /// Human choice requested by the harness (SPEC §4.3). The core owns the
@@ -217,7 +234,7 @@ impl Response {
 
 /// One `GET /v1/events` frame's data (SPEC §11 #32). The SSE `id:` is a
 /// harness-wide increasing number; `event:` is the `type`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub order_id: String,
     pub session_id: String,
@@ -228,12 +245,16 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     /// A harness-worded step while the order runs.
     Progress { step: String },
-    /// The order finished; its answer is on the order's own reply.
+    /// The answer of a `respond: stream` order.
+    Response { response: Box<Response> },
+    /// The failure of a `respond: stream` order.
+    Error { error_code: ErrorCode },
+    /// The order finished.
     Done,
     /// A type this adapter does not know yet (additive, SPEC §4.1).
     #[serde(other)]
@@ -244,6 +265,8 @@ impl EventKind {
     pub fn name(&self) -> &'static str {
         match self {
             EventKind::Progress { .. } => "progress",
+            EventKind::Response { .. } => "response",
+            EventKind::Error { .. } => "error",
             EventKind::Done => "done",
             EventKind::Unknown => "unknown",
         }
@@ -313,10 +336,13 @@ impl ErrorCode {
     }
 }
 
-/// Non-2xx body shape: `{ "error_code": "..." }`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Non-2xx body shape: `{ "error_code": "..." }`, plus the order's id when
+/// the order was queued (SPEC §11 #32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error_code: ErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
 }
 
 /// `GET /v1/ready` body (SPEC §11 #31): whether orders can be served now.
@@ -386,6 +412,7 @@ mod tests {
             confirmation_token: None,
             attachments: vec![],
             decision_answer: None,
+            respond: None,
         };
         let json = serde_json::to_string(&order).unwrap();
         assert!(!json.contains("confirmation_token"));
@@ -432,6 +459,7 @@ mod tests {
         assert_eq!(ErrorCode::DuplicateOrder.as_str(), "duplicate_order");
         let body = serde_json::to_string(&ErrorBody {
             error_code: ErrorCode::OrderBudgetExceeded,
+            order_id: None,
         })
         .unwrap();
         assert_eq!(body, r#"{"error_code":"order_budget_exceeded"}"#);

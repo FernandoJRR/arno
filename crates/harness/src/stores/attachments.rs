@@ -153,6 +153,7 @@ mod tests {
             confirmation_token: None,
             attachments,
             decision_answer: None,
+            respond: None,
         }
     }
 

@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             confirmation_token: None,
             attachments: Vec::new(),
             decision_answer,
+            respond: None,
         };
 
         let resp = http

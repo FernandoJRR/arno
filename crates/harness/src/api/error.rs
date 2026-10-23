@@ -26,6 +26,13 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status =
             StatusCode::from_u16(self.0.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(ErrorBody { error_code: self.0 })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                error_code: self.0,
+                order_id: None,
+            }),
+        )
+            .into_response()
     }
 }

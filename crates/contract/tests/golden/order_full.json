@@ -7,5 +7,6 @@
     {"mime": "image/png", "data_b64": "aGVsbG8="},
     {"mime": "image/jpeg", "ref": "file_1"}
   ],
-  "decision_answer": {"id": "dcs_1", "value": "approve"}
+  "decision_answer": {"id": "dcs_1", "value": "approve"},
+  "respond": "stream"
 }

@@ -2,7 +2,7 @@
 //! `GET /v1/ready` and `GET /v1/events`, bearer-authenticated with this
 //! adapter's own client token.
 
-use contract::{ErrorBody, ErrorCode, Order, Readiness, Response};
+use contract::{Accepted, ErrorBody, ErrorCode, Order, Readiness, Response};
 
 pub struct HarnessClient {
     http: reqwest::Client,
@@ -17,6 +17,8 @@ pub struct HarnessClient {
 /// distinct from a transport failure.
 pub enum OrderOutcome {
     Ok(Box<Response>),
+    /// `202` for a `respond: stream` order: the answer comes on the stream.
+    Accepted(String),
     Rejected(ErrorCode),
 }
 
@@ -38,7 +40,11 @@ impl HarnessClient {
             .json(order)
             .send()
             .await?;
-        if resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::ACCEPTED {
+            Ok(OrderOutcome::Accepted(
+                resp.json::<Accepted>().await?.order_id,
+            ))
+        } else if resp.status().is_success() {
             Ok(OrderOutcome::Ok(Box::new(resp.json::<Response>().await?)))
         } else {
             Ok(OrderOutcome::Rejected(
@@ -89,6 +95,7 @@ mod tests {
             confirmation_token: None,
             attachments: Vec::new(),
             decision_answer: None,
+            respond: None,
         }
     }
 
@@ -107,7 +114,7 @@ mod tests {
         let outcome = client.send_order(&order()).await.unwrap();
         match outcome {
             OrderOutcome::Ok(resp) => assert_eq!(resp.text, "hello back"),
-            OrderOutcome::Rejected(code) => panic!("unexpected rejection: {code:?}"),
+            _ => panic!("expected an answer"),
         }
     }
 
@@ -118,6 +125,7 @@ mod tests {
             .and(path("/v1/orders"))
             .respond_with(ResponseTemplate::new(409).set_body_json(ErrorBody {
                 error_code: ErrorCode::DuplicateOrder,
+                order_id: None,
             }))
             .mount(&server)
             .await;
@@ -126,7 +134,24 @@ mod tests {
         let outcome = client.send_order(&order()).await.unwrap();
         match outcome {
             OrderOutcome::Rejected(code) => assert_eq!(code, ErrorCode::DuplicateOrder),
-            OrderOutcome::Ok(_) => panic!("expected rejection"),
+            _ => panic!("expected rejection"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_202_is_accepted_with_its_order_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/orders"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(serde_json::json!({"order_id": "ord_1"})),
+            )
+            .mount(&server)
+            .await;
+        let client = HarnessClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+        match client.send_order(&order()).await.unwrap() {
+            OrderOutcome::Accepted(id) => assert_eq!(id, "ord_1"),
+            _ => panic!("expected accepted"),
         }
     }
 

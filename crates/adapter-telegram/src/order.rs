@@ -22,6 +22,7 @@ pub fn build_order(
         confirmation_token: None,
         attachments,
         decision_answer,
+        respond: None,
     }
 }
 

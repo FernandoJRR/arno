@@ -1,29 +1,26 @@
-//! Follows the harness's `GET /v1/events` stream and turns progress steps
-//! into the chat's status message (SPEC §11 #32). Reconnects with backoff,
+//! Follows the harness's `GET /v1/events` stream (SPEC §11 #32): progress
+//! steps drive the chat's status message, and the answers of
+//! `respond: stream` orders are delivered from it. Reconnects with backoff,
 //! resuming after the last event id it saw.
 
-use crate::harness_client::HarnessClient;
+use crate::bot::{App, deliver, fail};
 use crate::sse::Parser;
-use crate::status::Status;
 use contract::{Event, EventKind};
 use futures::StreamExt;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use teloxide::prelude::*;
+use teloxide::types::ChatId;
 
-pub async fn listen(
-    bot: Bot,
-    client: Arc<HarnessClient>,
-    status: Arc<Status>,
-    max_backoff: Duration,
-) {
+pub async fn listen(app: Arc<App>, max_backoff: Duration) {
     let first = Duration::from_secs(1).min(max_backoff);
     let mut backoff = first;
     let mut last: Option<u64> = None;
     loop {
-        match client.events(last).await {
+        match app.client.events(last).await {
             Ok(resp) if resp.status().is_success() => {
                 backoff = first;
+                app.connected.store(true, Ordering::Release);
                 tracing::info!("event stream connected");
                 let mut parser = Parser::default();
                 let mut body = resp.bytes_stream();
@@ -33,10 +30,11 @@ pub async fn listen(
                             last = frame.id;
                         }
                         if let Ok(event) = serde_json::from_str::<Event>(&frame.data) {
-                            on_event(&bot, &status, event).await;
+                            on_event(&app, event).await;
                         }
                     }
                 }
+                app.connected.store(false, Ordering::Release);
                 tracing::info!("event stream ended; reconnecting");
             }
             Ok(resp) => tracing::warn!(status = %resp.status(), "event stream refused"),
@@ -47,12 +45,30 @@ pub async fn listen(
     }
 }
 
-async fn on_event(bot: &Bot, status: &Status, event: Event) {
-    let EventKind::Progress { step } = &event.kind else {
-        return;
-    };
-    // Sessions are chat ids (`build_order`).
-    if let Ok(chat) = event.session_id.parse::<i64>() {
-        status.progress(bot, ChatId(chat), step).await;
+async fn on_event(app: &App, event: Event) {
+    match event.kind {
+        EventKind::Progress { step } => {
+            // Sessions are chat ids (`build_order`).
+            if let Ok(chat) = event.session_id.parse::<i64>() {
+                app.status.progress(&app.bot, ChatId(chat), &step).await;
+            }
+        }
+        // Only answers this adapter is waiting for: a replay or another
+        // order's blocking reply is not one.
+        EventKind::Response { response } => {
+            if let Some(chat) = waiting(app, &event.client_msg_id) {
+                deliver(app, chat, *response).await;
+            }
+        }
+        EventKind::Error { error_code } => {
+            if let Some(chat) = waiting(app, &event.client_msg_id) {
+                fail(app, chat, error_code).await;
+            }
+        }
+        EventKind::Done | EventKind::Unknown => {}
     }
+}
+
+fn waiting(app: &App, client_msg_id: &Option<String>) -> Option<ChatId> {
+    client_msg_id.as_deref().and_then(|k| app.pending.take(k))
 }

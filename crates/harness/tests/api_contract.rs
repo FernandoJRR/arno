@@ -2758,3 +2758,155 @@ async fn a_duplicate_order_publishes_nothing() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(state.events.subscribe("cli", Some(0)).0.len(), before);
 }
+
+// ---- respond: stream (SPEC §11 #32, phase B) ----
+
+async fn post_stream(
+    state: &SharedState,
+    msg_id: &str,
+    text: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({"session_id": "s1", "text": text,
+                                  "client_msg_id": msg_id, "respond": "stream"});
+    post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await
+}
+
+fn types(frames: &[(u64, String, serde_json::Value)]) -> Vec<&str> {
+    frames.iter().map(|(_, e, _)| e.as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_stream_order_is_accepted_and_answered_on_the_stream() {
+    let (state, _, _) = decision_rig(
+        vec![
+            list_accounts_call(),
+            CompletionOutput::Final("One account.".into()),
+        ],
+        serde_json::json!({"items": [{"name": "Main"}]}),
+    )
+    .await;
+    let (_, body) = open_events(&state, Some("tok-cli"), None).await;
+    let (status, accepted) = post_stream(&state, "m1", "which accounts do I have?").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let order_id = accepted["order_id"].as_str().unwrap().to_owned();
+
+    let frames = frames_until_done(body).await;
+    assert_eq!(
+        types(&frames),
+        ["progress", "progress", "progress", "response", "done"]
+    );
+    let response = &frames[3].2["response"];
+    assert_eq!(response["text"], "One account.");
+    assert_eq!(response["order_id"], order_id.as_str());
+    assert!(
+        frames
+            .iter()
+            .all(|(_, _, d)| d["order_id"] == order_id.as_str())
+    );
+    // The turn is in the session like a blocking one.
+    let history = state
+        .sessions
+        .snapshot(&("cli".to_owned(), "s1".to_owned()));
+    assert!(history.iter().any(|m| m.content == "One account."));
+}
+
+#[tokio::test]
+async fn a_failing_stream_order_publishes_its_error() {
+    let state = ready_state(OnCpu {
+        gpu_share: Some(0.0),
+        timeout: true,
+    });
+    let (_, body) = open_events(&state, Some("tok-cli"), None).await;
+    let (status, _) = post_stream(&state, "m1", "hi").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let frames = frames_until_done(body).await;
+    assert_eq!(types(&frames), ["progress", "error", "done"]);
+    assert_eq!(frames[1].2["error_code"], "backend_unavailable");
+}
+
+#[tokio::test]
+async fn a_duplicate_stream_order_gets_an_error_and_no_done() {
+    let (state, _, _) = decision_rig(
+        vec![CompletionOutput::Final("hi".into())],
+        serde_json::json!({}),
+    )
+    .await;
+    post_stream(&state, "m1", "hello").await;
+    let (_, body) = open_events(&state, Some("tok-cli"), None).await;
+    let (status, _) = post_stream(&state, "m1", "hello").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let mut frames = frames_until_done(body).await;
+    // The first order's own events may come first; read on past its `done`.
+    if let Some(last) = frames.last().map(|f| f.0) {
+        let (_, more) = open_events(&state, Some("tok-cli"), Some(last)).await;
+        frames.extend(frames_until_done(more).await);
+    }
+    let dup: Vec<_> = frames
+        .iter()
+        .filter(|(_, e, d)| e == "error" && d["error_code"] == "duplicate_order")
+        .collect();
+    assert_eq!(dup.len(), 1, "{frames:?}");
+    let dup_id = dup[0].2["order_id"].clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|(_, e, d)| e == "done" && d["order_id"] == dup_id)
+    );
+}
+
+#[tokio::test]
+async fn a_blocking_order_names_its_order_in_errors_and_publishes_no_response() {
+    let state = ready_state(OnCpu {
+        gpu_share: None,
+        timeout: true,
+    });
+    let body = serde_json::json!({"session_id": "s1", "text": "hi", "client_msg_id": "m1"});
+    let (status, err) = post_order(
+        api_router(state.clone()),
+        &body.to_string(),
+        Some("tok-cli"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err["error_code"], "backend_unavailable");
+    assert!(err["order_id"].as_str().unwrap().starts_with("ord_"));
+    let (events, _) = state.events.subscribe("cli", Some(0));
+    assert!(events.iter().all(|p| !matches!(
+        p.event.kind,
+        contract::EventKind::Response { .. } | contract::EventKind::Error { .. }
+    )));
+}
+
+#[tokio::test]
+async fn stream_orders_run_in_queue_order() {
+    let (state, _, _) = decision_rig(
+        vec![
+            CompletionOutput::Final("first".into()),
+            CompletionOutput::Final("second".into()),
+        ],
+        serde_json::json!({}),
+    )
+    .await;
+    let (_, body) = open_events(&state, Some("tok-cli"), None).await;
+    let (_, a) = post_stream(&state, "m1", "one").await;
+    let (_, b) = post_stream(&state, "m2", "two").await;
+    let mut frames = frames_until_done(body).await;
+    let (_, more) = open_events(&state, Some("tok-cli"), Some(frames.last().unwrap().0)).await;
+    frames.extend(frames_until_done(more).await);
+    let pos = |id: &serde_json::Value, ty: &str| {
+        frames
+            .iter()
+            .position(|(_, e, d)| e == ty && d["order_id"] == *id)
+            .unwrap()
+    };
+    assert!(pos(&a["order_id"], "done") < pos(&b["order_id"], "response"));
+    assert_eq!(
+        frames[pos(&b["order_id"], "response")].2["response"]["text"],
+        "second"
+    );
+}

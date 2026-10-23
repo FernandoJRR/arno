@@ -8,6 +8,7 @@ mod decision;
 mod events;
 mod harness_client;
 mod order;
+mod pending;
 mod sse;
 mod status;
 

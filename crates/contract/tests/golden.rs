@@ -38,6 +38,7 @@ fn order_minimal() {
             confirmation_token: None,
             attachments: Vec::new(),
             decision_answer: None,
+            respond: None,
         },
     );
 }
@@ -68,6 +69,7 @@ fn order_full() {
                 value: Some("approve".into()),
                 text: None,
             }),
+            respond: Some(Respond::Stream),
         },
     );
 }
@@ -194,7 +196,11 @@ fn error_codes_and_their_status() {
     let actual: Vec<serde_json::Value> = all_codes()
         .into_iter()
         .map(|code| {
-            let mut body = serde_json::to_value(ErrorBody { error_code: code }).unwrap();
+            let mut body = serde_json::to_value(ErrorBody {
+                error_code: code,
+                order_id: None,
+            })
+            .unwrap();
             assert_eq!(body["error_code"], code.as_str());
             body["status"] = code.status_code().into();
             body
@@ -231,6 +237,59 @@ fn readiness() {
                 status: "ready".into(),
                 trust: Some("trusted".into()),
             }],
+        },
+    );
+}
+
+#[test]
+fn accepted() {
+    pinned(
+        "accepted",
+        &Accepted {
+            order_id: "ord_1".into(),
+        },
+    );
+}
+
+#[test]
+fn event_response() {
+    let mut response = Response::text("One account.");
+    response.order_id = Some("ord_1".into());
+    pinned(
+        "event_response",
+        &Event {
+            order_id: "ord_1".into(),
+            session_id: "chat:1".into(),
+            client_msg_id: Some("42".into()),
+            kind: EventKind::Response {
+                response: Box::new(response),
+            },
+        },
+    );
+}
+
+#[test]
+fn event_error() {
+    pinned(
+        "event_error",
+        &Event {
+            order_id: "ord_1".into(),
+            session_id: "chat:1".into(),
+            client_msg_id: Some("42".into()),
+            kind: EventKind::Error {
+                error_code: ErrorCode::BackendUnavailable,
+            },
+        },
+    );
+}
+
+#[test]
+fn error_body_order_id() {
+    pinned(
+        "error_body_order_id",
+        &ErrorBody {
+            error_code: ErrorCode::BackendUnavailable,
+            order_id: Some("ord_1".into()),
         },
     );
 }

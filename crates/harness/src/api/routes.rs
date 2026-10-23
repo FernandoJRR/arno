@@ -140,20 +140,42 @@ async fn orders(
     State(state): State<SharedState>,
     OrderJson(order): OrderJson,
 ) -> Result<axum::response::Response, ApiError> {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let order_id = crate::events::new_order_id();
+    // SPEC §11 #32: a stream order is answered once queued; its result is
+    // published on `/v1/events`.
+    let stream = order.respond == Some(contract::Respond::Stream);
+    let (reply_tx, reply_rx) = if stream {
+        (None, None)
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    };
     state
         .order_tx
         .send(Job::Order(Box::new(OrderJob {
             client_id: auth.0,
             order,
+            order_id: order_id.clone(),
             reply: reply_tx,
         })))
         .await
         .map_err(|_| ApiError(ErrorCode::BackendUnavailable))?; // worker gone = shutting down
 
-    match reply_rx.await {
-        Ok(Outcome::Ok(response)) => Ok((StatusCode::OK, Json(*response)).into_response()),
-        Ok(Outcome::Err(err)) => Err(err),
-        Err(_recv_dropped) => Err(ApiError(ErrorCode::BackendUnavailable)),
-    }
+    let Some(reply_rx) = reply_rx else {
+        return Ok((StatusCode::ACCEPTED, Json(contract::Accepted { order_id })).into_response());
+    };
+    let error = |code: ErrorCode| {
+        let status =
+            StatusCode::from_u16(code.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let body = contract::ErrorBody {
+            error_code: code,
+            order_id: Some(order_id.clone()),
+        };
+        (status, Json(body)).into_response()
+    };
+    Ok(match reply_rx.await {
+        Ok(Outcome::Ok(response)) => (StatusCode::OK, Json(*response)).into_response(),
+        Ok(Outcome::Err(err)) => error(err.0),
+        Err(_recv_dropped) => error(ErrorCode::BackendUnavailable),
+    })
 }

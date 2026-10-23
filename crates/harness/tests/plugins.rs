@@ -356,7 +356,8 @@ async fn send_order(state: &SharedState, order: serde_json::Value) -> contract::
             harness::queue::OrderJob {
                 client_id: "cli".into(),
                 order,
-                reply: tx,
+                order_id: harness::events::new_order_id(),
+                reply: Some(tx),
             },
         )))
         .await

@@ -20,7 +20,11 @@ pub enum Job {
 pub struct OrderJob {
     pub client_id: String,
     pub order: Order,
-    pub reply: tokio::sync::oneshot::Sender<Outcome>,
+    /// Minted at the route, so a `respond: stream` order can be answered
+    /// with it before it runs (SPEC §11 #32).
+    pub order_id: String,
+    /// None for a `respond: stream` order: its result is published instead.
+    pub reply: Option<tokio::sync::oneshot::Sender<Outcome>>,
 }
 
 pub enum Outcome {
@@ -54,7 +58,7 @@ async fn run_order(state: &SharedState, job: OrderJob) {
     use tracing::Instrument;
     // SPEC §11 #32: steps published while the order runs carry its id.
     let order = crate::events::OrderRef {
-        order_id: crate::events::new_order_id(),
+        order_id: job.order_id.clone(),
         client_id: job.client_id.clone(),
         session_id: job.order.session_id.clone(),
         client_msg_id: job.order.client_msg_id.clone(),
@@ -67,20 +71,36 @@ async fn run_order(state: &SharedState, job: OrderJob) {
     .instrument(span)
     .await;
     let duplicate = matches!(&result, Err(e) if e.0 == contract::ErrorCode::DuplicateOrder);
+    let result = result.map(|mut response| {
+        response.order_id = Some(order.order_id.clone());
+        response
+    });
+    if let Err(err) = &result {
+        tracing::info!(code = err.0.as_str(), "order rejected");
+    }
+    match job.reply {
+        Some(reply) => {
+            let outcome = match result {
+                Ok(response) => Outcome::Ok(Box::new(response)),
+                Err(err) => Outcome::Err(err),
+            };
+            if reply.send(outcome).is_err() {
+                tracing::debug!("client abandoned order before reply");
+            }
+        }
+        // SPEC §11 #32: the result of a stream order is its event.
+        None => {
+            let kind = match result {
+                Ok(response) => contract::EventKind::Response {
+                    response: Box::new(response),
+                },
+                Err(err) => contract::EventKind::Error { error_code: err.0 },
+            };
+            crate::events::publish(&state.events, &order, kind);
+        }
+    }
+    // A duplicate never ran: no `done` for it.
     if !duplicate {
         crate::events::publish(&state.events, &order, contract::EventKind::Done);
-    }
-    let outcome = match result {
-        Ok(mut response) => {
-            response.order_id = Some(order.order_id);
-            Outcome::Ok(Box::new(response))
-        }
-        Err(err) => {
-            tracing::info!(code = err.0.as_str(), "order rejected");
-            Outcome::Err(err)
-        }
-    };
-    if job.reply.send(outcome).is_err() {
-        tracing::debug!("client abandoned order before reply");
     }
 }
